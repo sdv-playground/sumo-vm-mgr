@@ -1,0 +1,11 @@
+# OS1 minimal profile — QEMU with network only, no simulators
+# Useful for quick boot testing without the full device stack
+[vm]
+bank_set = "os1"
+ram_mb = 1024
+cpus = 2
+kernel = "Image"
+
+[[devices]]
+type = "network"
+ssh_port = 2222

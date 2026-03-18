@@ -1,0 +1,644 @@
+/// Core types for the NV store bank management system.
+///
+/// Three independent A/B bank sets:
+///   - Hypervisor (QNX)
+///   - OS1 (Linux or QNX VM)
+///   - OS2 (Linux or QNX VM)
+
+/// Identifies which bank is active within a bank set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Bank {
+    A = 0,
+    B = 1,
+}
+
+impl Bank {
+    pub fn other(self) -> Self {
+        match self {
+            Bank::A => Bank::B,
+            Bank::B => Bank::A,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Bank::A),
+            1 => Some(Bank::B),
+            _ => None,
+        }
+    }
+}
+
+/// Identifies which bank set (hypervisor, OS1, OS2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BankSet {
+    Hypervisor = 0,
+    Os1 = 1,
+    Os2 = 2,
+}
+
+impl BankSet {
+    pub fn all() -> [BankSet; NUM_BANK_SETS] {
+        [BankSet::Hypervisor, BankSet::Os1, BankSet::Os2]
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "hyp" | "hypervisor" => Some(BankSet::Hypervisor),
+            "os1" => Some(BankSet::Os1),
+            "os2" => Some(BankSet::Os2),
+            _ => None,
+        }
+    }
+}
+
+pub const NUM_BANK_SETS: usize = 3;
+pub const MAX_TRIAL_BOOTS: u8 = 10;
+
+// NV partition magic numbers (sector validation)
+pub const MAGIC_BOOT: u32 = 0x4E564231; // "NVB1"
+pub const MAGIC_FACTORY: u32 = 0x4E564631; // "NVF1"
+pub const MAGIC_FW_META: u32 = 0x4E564D31; // "NVM1"
+pub const MAGIC_RUNTIME: u32 = 0x4E565231; // "NVR1"
+pub const MAGIC_APP: u32 = 0x4E564131; // "NVA1"
+
+/// Trait for NV records that can be serialized to/from raw sector bytes.
+///
+/// CRC is NOT part of the record — it's a sector-level concern handled by
+/// `read_latest_sector` / `write_next_sector`. Records include magic and
+/// write_seq in their serialization.
+pub trait NvRecord: Sized {
+    const MAGIC: u32;
+
+    /// Serialize this record into `buf`. Caller guarantees `buf.len() >= Self::size()`.
+    /// Writes magic at [0..4] and write_seq at [4..8].
+    fn serialize(&self, buf: &mut [u8]);
+
+    /// Deserialize from `buf`. Returns None if data is invalid.
+    /// Magic already validated by sector reader; write_seq at [4..8].
+    fn deserialize(buf: &[u8]) -> Option<Self>;
+
+    /// Serialized size of this record (excluding sector padding and CRC).
+    fn size() -> usize;
+
+    /// Get the write_seq from this record.
+    fn write_seq(&self) -> u32;
+
+    /// Set the write_seq on this record.
+    fn set_write_seq(&mut self, seq: u32);
+}
+
+// --- Helper functions for serialization ---
+
+fn put_u32_le(buf: &mut [u8], offset: usize, val: u32) {
+    buf[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+fn get_u32_le(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+}
+
+fn put_u16_le(buf: &mut [u8], offset: usize, val: u16) {
+    buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
+}
+
+fn get_u16_le(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([buf[offset], buf[offset + 1]])
+}
+
+fn put_bytes(buf: &mut [u8], offset: usize, src: &[u8]) {
+    buf[offset..offset + src.len()].copy_from_slice(src);
+}
+
+fn get_bytes<const N: usize>(buf: &[u8], offset: usize) -> [u8; N] {
+    let mut arr = [0u8; N];
+    arr.copy_from_slice(&buf[offset..offset + N]);
+    arr
+}
+
+// --- Per-bank-set boot state ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankBootState {
+    pub active_bank: Bank,
+    pub committed: bool,
+    pub boot_count: u8,
+}
+
+impl Default for BankBootState {
+    fn default() -> Self {
+        Self {
+            active_bank: Bank::A,
+            committed: true,
+            boot_count: 0,
+        }
+    }
+}
+
+/// Complete boot state for all bank sets.
+///
+/// Wire format (24 bytes):
+/// ```text
+/// [0..4]   magic (NVB1)
+/// [4..8]   write_seq
+/// [8]      hyp.active_bank
+/// [9]      hyp.committed
+/// [10]     hyp.boot_count
+/// [11]     os1.active_bank
+/// [12]     os1.committed
+/// [13]     os1.boot_count
+/// [14]     os2.active_bank
+/// [15]     os2.committed
+/// [16]     os2.boot_count
+/// [17..20] padding
+/// [20..24] (reserved for sector CRC — NOT part of record)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NvBootState {
+    pub write_seq: u32,
+    pub banks: [BankBootState; NUM_BANK_SETS],
+}
+
+impl Default for NvBootState {
+    fn default() -> Self {
+        Self {
+            write_seq: 0,
+            banks: [
+                BankBootState::default(),
+                BankBootState::default(),
+                BankBootState::default(),
+            ],
+        }
+    }
+}
+
+impl NvRecord for NvBootState {
+    const MAGIC: u32 = MAGIC_BOOT;
+
+    fn size() -> usize {
+        20 // 4 magic + 4 seq + 3*3 banks + 3 padding
+    }
+
+    fn write_seq(&self) -> u32 {
+        self.write_seq
+    }
+
+    fn set_write_seq(&mut self, seq: u32) {
+        self.write_seq = seq;
+    }
+
+    fn serialize(&self, buf: &mut [u8]) {
+        put_u32_le(buf, 0, Self::MAGIC);
+        put_u32_le(buf, 4, self.write_seq);
+        for (i, bs) in self.banks.iter().enumerate() {
+            let off = 8 + i * 3;
+            buf[off] = bs.active_bank as u8;
+            buf[off + 1] = bs.committed as u8;
+            buf[off + 2] = bs.boot_count;
+        }
+        // [17..20] padding stays zero
+    }
+
+    fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::size() {
+            return None;
+        }
+        let write_seq = get_u32_le(buf, 4);
+        let mut banks: [BankBootState; NUM_BANK_SETS] = Default::default();
+        for i in 0..NUM_BANK_SETS {
+            let off = 8 + i * 3;
+            banks[i] = BankBootState {
+                active_bank: Bank::from_u8(buf[off])?,
+                committed: buf[off + 1] != 0,
+                boot_count: buf[off + 2],
+            };
+        }
+        Some(Self {
+            write_seq,
+            banks,
+        })
+    }
+}
+
+/// Factory data — write-once, shared across all banks.
+///
+/// Wire format (200 bytes):
+/// ```text
+/// [0..4]     magic (NVF1)
+/// [4..8]     write_seq
+/// [8..40]    serial_number (32)     F18C
+/// [40..48]   manufacturing_date (8) F18B
+/// [48..65]   vin (17)               F190
+/// [65..97]   ecu_hw_number (32)     F191
+/// [97..129]  supplier_hw_number (32) F192
+/// [129..161] supplier_hw_version (32) F193
+/// [161..193] supplier_id (32)       F18A
+/// [193]      device_type
+/// [194..200] padding
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NvFactory {
+    pub write_seq: u32,
+    pub serial_number: [u8; 32],
+    pub manufacturing_date: [u8; 8],
+    pub vin: [u8; 17],
+    pub ecu_hw_number: [u8; 32],
+    pub supplier_hw_number: [u8; 32],
+    pub supplier_hw_version: [u8; 32],
+    pub supplier_id: [u8; 32],
+    pub device_type: u8,
+}
+
+impl Default for NvFactory {
+    fn default() -> Self {
+        Self {
+            write_seq: 0,
+            serial_number: [0; 32],
+            manufacturing_date: [0; 8],
+            vin: [0; 17],
+            ecu_hw_number: [0; 32],
+            supplier_hw_number: [0; 32],
+            supplier_hw_version: [0; 32],
+            supplier_id: [0; 32],
+            device_type: 0,
+        }
+    }
+}
+
+impl NvRecord for NvFactory {
+    const MAGIC: u32 = MAGIC_FACTORY;
+
+    fn size() -> usize {
+        200
+    }
+
+    fn write_seq(&self) -> u32 {
+        self.write_seq
+    }
+
+    fn set_write_seq(&mut self, seq: u32) {
+        self.write_seq = seq;
+    }
+
+    fn serialize(&self, buf: &mut [u8]) {
+        put_u32_le(buf, 0, Self::MAGIC);
+        put_u32_le(buf, 4, self.write_seq);
+        put_bytes(buf, 8, &self.serial_number);
+        put_bytes(buf, 40, &self.manufacturing_date);
+        put_bytes(buf, 48, &self.vin);
+        put_bytes(buf, 65, &self.ecu_hw_number);
+        put_bytes(buf, 97, &self.supplier_hw_number);
+        put_bytes(buf, 129, &self.supplier_hw_version);
+        put_bytes(buf, 161, &self.supplier_id);
+        buf[193] = self.device_type;
+    }
+
+    fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::size() {
+            return None;
+        }
+        Some(Self {
+            write_seq: get_u32_le(buf, 4),
+            serial_number: get_bytes(buf, 8),
+            manufacturing_date: get_bytes(buf, 40),
+            vin: get_bytes(buf, 48),
+            ecu_hw_number: get_bytes(buf, 65),
+            supplier_hw_number: get_bytes(buf, 97),
+            supplier_hw_version: get_bytes(buf, 129),
+            supplier_id: get_bytes(buf, 161),
+            device_type: buf[193],
+        })
+    }
+}
+
+/// Per-bank firmware metadata — SW identity DIDs.
+///
+/// Wire format (324 bytes):
+/// ```text
+/// [0..4]     magic (NVM1)
+/// [4..8]     write_seq
+/// [8..40]    fw_version (32)           F189
+/// [40..44]   fw_seq
+/// [44..48]   fw_secver
+/// [48..52]   fw_crc
+/// [52..84]   image_sha256 (32)
+/// [84..116]  spare_part_number (32)    F187
+/// [116..148] ecu_sw_number (32)        F188
+/// [148..180] supplier_sw_number (32)   F194
+/// [180..212] supplier_sw_version (32)  F195
+/// [212..244] odx_file_id (32)          F19E
+/// [244..276] system_name (32)          F197
+/// [276..284] programming_date (8)      F199
+/// [284..316] tester_serial (32)        F198
+/// [316..320] min_security_ver
+/// [320..324] padding
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NvFwMeta {
+    pub write_seq: u32,
+    pub fw_version: [u8; 32],
+    pub fw_seq: u32,
+    pub fw_secver: u32,
+    pub fw_crc: u32,
+    pub image_sha256: [u8; 32],
+    pub spare_part_number: [u8; 32],
+    pub ecu_sw_number: [u8; 32],
+    pub supplier_sw_number: [u8; 32],
+    pub supplier_sw_version: [u8; 32],
+    pub odx_file_id: [u8; 32],
+    pub system_name: [u8; 32],
+    pub programming_date: [u8; 8],
+    pub tester_serial: [u8; 32],
+    pub min_security_ver: u32,
+}
+
+impl Default for NvFwMeta {
+    fn default() -> Self {
+        Self {
+            write_seq: 0,
+            fw_version: [0; 32],
+            fw_seq: 0,
+            fw_secver: 0,
+            fw_crc: 0,
+            image_sha256: [0; 32],
+            spare_part_number: [0; 32],
+            ecu_sw_number: [0; 32],
+            supplier_sw_number: [0; 32],
+            supplier_sw_version: [0; 32],
+            odx_file_id: [0; 32],
+            system_name: [0; 32],
+            programming_date: [0; 8],
+            tester_serial: [0; 32],
+            min_security_ver: 0,
+        }
+    }
+}
+
+impl NvRecord for NvFwMeta {
+    const MAGIC: u32 = MAGIC_FW_META;
+
+    fn size() -> usize {
+        324
+    }
+
+    fn write_seq(&self) -> u32 {
+        self.write_seq
+    }
+
+    fn set_write_seq(&mut self, seq: u32) {
+        self.write_seq = seq;
+    }
+
+    fn serialize(&self, buf: &mut [u8]) {
+        put_u32_le(buf, 0, Self::MAGIC);
+        put_u32_le(buf, 4, self.write_seq);
+        put_bytes(buf, 8, &self.fw_version);
+        put_u32_le(buf, 40, self.fw_seq);
+        put_u32_le(buf, 44, self.fw_secver);
+        put_u32_le(buf, 48, self.fw_crc);
+        put_bytes(buf, 52, &self.image_sha256);
+        put_bytes(buf, 84, &self.spare_part_number);
+        put_bytes(buf, 116, &self.ecu_sw_number);
+        put_bytes(buf, 148, &self.supplier_sw_number);
+        put_bytes(buf, 180, &self.supplier_sw_version);
+        put_bytes(buf, 212, &self.odx_file_id);
+        put_bytes(buf, 244, &self.system_name);
+        put_bytes(buf, 276, &self.programming_date);
+        put_bytes(buf, 284, &self.tester_serial);
+        put_u32_le(buf, 316, self.min_security_ver);
+    }
+
+    fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::size() {
+            return None;
+        }
+        Some(Self {
+            write_seq: get_u32_le(buf, 4),
+            fw_version: get_bytes(buf, 8),
+            fw_seq: get_u32_le(buf, 40),
+            fw_secver: get_u32_le(buf, 44),
+            fw_crc: get_u32_le(buf, 48),
+            image_sha256: get_bytes(buf, 52),
+            spare_part_number: get_bytes(buf, 84),
+            ecu_sw_number: get_bytes(buf, 116),
+            supplier_sw_number: get_bytes(buf, 148),
+            supplier_sw_version: get_bytes(buf, 180),
+            odx_file_id: get_bytes(buf, 212),
+            system_name: get_bytes(buf, 244),
+            programming_date: get_bytes(buf, 276),
+            tester_serial: get_bytes(buf, 284),
+            min_security_ver: get_u32_le(buf, 316),
+        })
+    }
+}
+
+/// A single writable DID entry in the runtime partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DidEntry {
+    pub did: u16,
+    pub len: u8,
+    pub data: [u8; 32],
+}
+
+impl Default for DidEntry {
+    fn default() -> Self {
+        Self {
+            did: 0,
+            len: 0,
+            data: [0; 32],
+        }
+    }
+}
+
+impl DidEntry {
+    pub const WIRE_SIZE: usize = 35; // 2 + 1 + 32
+}
+
+/// A single DTC entry in the runtime partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DtcEntry {
+    pub dtc_number: u32,
+    pub status: u8,
+}
+
+impl Default for DtcEntry {
+    fn default() -> Self {
+        Self {
+            dtc_number: 0,
+            status: 0,
+        }
+    }
+}
+
+impl DtcEntry {
+    pub const WIRE_SIZE: usize = 5; // 4 + 1
+}
+
+pub const MAX_DIDS: usize = 20;
+pub const MAX_DTCS: usize = 16;
+
+/// Per-bank runtime data — writable DIDs and DTCs.
+///
+/// Wire format (792 bytes):
+/// ```text
+/// [0..4]     magic (NVR1)
+/// [4..8]     write_seq
+/// [8]        did_count
+/// [9..709]   dids[20] (20 * 35 = 700 bytes)
+/// [709]      dtc_count
+/// [710..790] dtcs[16] (16 * 5 = 80 bytes)
+/// [790..792] padding
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NvRuntime {
+    pub write_seq: u32,
+    pub did_count: u8,
+    pub dids: [DidEntry; MAX_DIDS],
+    pub dtc_count: u8,
+    pub dtcs: [DtcEntry; MAX_DTCS],
+}
+
+impl Default for NvRuntime {
+    fn default() -> Self {
+        Self {
+            write_seq: 0,
+            did_count: 0,
+            dids: std::array::from_fn(|_| DidEntry::default()),
+            dtc_count: 0,
+            dtcs: std::array::from_fn(|_| DtcEntry::default()),
+        }
+    }
+}
+
+impl NvRecord for NvRuntime {
+    const MAGIC: u32 = MAGIC_RUNTIME;
+
+    fn size() -> usize {
+        792
+    }
+
+    fn write_seq(&self) -> u32 {
+        self.write_seq
+    }
+
+    fn set_write_seq(&mut self, seq: u32) {
+        self.write_seq = seq;
+    }
+
+    fn serialize(&self, buf: &mut [u8]) {
+        put_u32_le(buf, 0, Self::MAGIC);
+        put_u32_le(buf, 4, self.write_seq);
+        buf[8] = self.did_count;
+        for (i, did) in self.dids.iter().enumerate() {
+            let off = 9 + i * DidEntry::WIRE_SIZE;
+            put_u16_le(buf, off, did.did);
+            buf[off + 2] = did.len;
+            put_bytes(buf, off + 3, &did.data);
+        }
+        let dtc_count_off = 9 + MAX_DIDS * DidEntry::WIRE_SIZE;
+        buf[dtc_count_off] = self.dtc_count;
+        for (i, dtc) in self.dtcs.iter().enumerate() {
+            let off = dtc_count_off + 1 + i * DtcEntry::WIRE_SIZE;
+            put_u32_le(buf, off, dtc.dtc_number);
+            buf[off + 4] = dtc.status;
+        }
+    }
+
+    fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::size() {
+            return None;
+        }
+        let write_seq = get_u32_le(buf, 4);
+        let did_count = buf[8];
+        if did_count as usize > MAX_DIDS {
+            return None;
+        }
+        let mut dids: [DidEntry; MAX_DIDS] = std::array::from_fn(|_| DidEntry::default());
+        for i in 0..MAX_DIDS {
+            let off = 9 + i * DidEntry::WIRE_SIZE;
+            dids[i] = DidEntry {
+                did: get_u16_le(buf, off),
+                len: buf[off + 2],
+                data: get_bytes(buf, off + 3),
+            };
+        }
+        let dtc_count_off = 9 + MAX_DIDS * DidEntry::WIRE_SIZE;
+        let dtc_count = buf[dtc_count_off];
+        if dtc_count as usize > MAX_DTCS {
+            return None;
+        }
+        let mut dtcs: [DtcEntry; MAX_DTCS] = std::array::from_fn(|_| DtcEntry::default());
+        for i in 0..MAX_DTCS {
+            let off = dtc_count_off + 1 + i * DtcEntry::WIRE_SIZE;
+            dtcs[i] = DtcEntry {
+                dtc_number: get_u32_le(buf, off),
+                status: buf[off + 4],
+            };
+        }
+        Some(Self {
+            write_seq,
+            did_count,
+            dids,
+            dtc_count,
+            dtcs,
+        })
+    }
+}
+
+/// Shared application data — cert revocation, timestamps, config.
+///
+/// Wire format (2060 bytes):
+/// ```text
+/// [0..4]      magic (NVA1)
+/// [4..8]      write_seq
+/// [8..2056]   data (2048 bytes)
+/// [2056..2060] padding
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NvApp {
+    pub write_seq: u32,
+    pub data: [u8; 2048],
+}
+
+impl Default for NvApp {
+    fn default() -> Self {
+        Self {
+            write_seq: 0,
+            data: [0; 2048],
+        }
+    }
+}
+
+impl NvRecord for NvApp {
+    const MAGIC: u32 = MAGIC_APP;
+
+    fn size() -> usize {
+        2060
+    }
+
+    fn write_seq(&self) -> u32 {
+        self.write_seq
+    }
+
+    fn set_write_seq(&mut self, seq: u32) {
+        self.write_seq = seq;
+    }
+
+    fn serialize(&self, buf: &mut [u8]) {
+        put_u32_le(buf, 0, Self::MAGIC);
+        put_u32_le(buf, 4, self.write_seq);
+        put_bytes(buf, 8, &self.data);
+    }
+
+    fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::size() {
+            return None;
+        }
+        Some(Self {
+            write_seq: get_u32_le(buf, 4),
+            data: get_bytes(buf, 8),
+        })
+    }
+}

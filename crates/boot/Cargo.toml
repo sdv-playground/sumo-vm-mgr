@@ -1,0 +1,20 @@
+[package]
+name = "vm-boot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nv-store = { path = "../nv-store" }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+libc = "0.2"
+ctrlc = "3"
+
+[[bin]]
+name = "vm-boot"
+path = "src/main.rs"
+
+[[bin]]
+name = "vm-runner"
+path = "src/bin/runner.rs"

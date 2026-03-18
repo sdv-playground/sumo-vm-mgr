@@ -1,0 +1,9 @@
+[package]
+name = "vm-diagserver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nv-store = { path = "../nv-store" }
+sha2 = "0.10"
+crc32fast = "1"
