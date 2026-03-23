@@ -63,6 +63,9 @@ Release build, stripped: **~1.8 MB total** (vm-boot 440K + vm-diagserver 431K + 
 
 ## Related Projects
 
+- **[SOVDd](https://github.com/sdv-playground/SOVDd)** — SOVD diagnostic server. Translates ASAM SOVD REST API into UDS commands over SocketCAN/DoIP. Multi-ECU gateway, flash/OTA lifecycle, SSE streaming, CLI tool.
+- **[SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer)** — Tauri 2 desktop GUI for automotive ECU diagnostics via the SOVD protocol. Parameter read/write, fault display, firmware flashing with two-phase commit, and OIDC-secured security access.
+
 ## License
 
 MIT
