@@ -3,6 +3,7 @@ use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
 use vm_diagserver::did;
+use vm_diagserver::manifest::{self, FirmwareBundle, FirmwareManifest, FactoryManifest};
 use vm_diagserver::ota;
 
 use std::path::PathBuf;
@@ -13,11 +14,14 @@ fn usage() -> ! {
     eprintln!("Commands:");
     eprintln!("  status <set>                     Show bank status (hyp|os1|os2)");
     eprintln!("  install <set> <image-path> <ver> <secver>  Install OTA image");
+    eprintln!("  install-bundle <bundle-path>     Install from VMFB bundle");
     eprintln!("  commit <set>                     Commit trial bank");
     eprintln!("  rollback <set>                   Rollback to previous bank");
     eprintln!("  read-did <set> <did-hex>         Read a DID (e.g. F189)");
     eprintln!("  write-did <set> <did-hex> <val>  Write a runtime DID");
     eprintln!("  provision <serial> <vin>         Write factory data (once)");
+    eprintln!("  factory-init <dir> [--runner-path <path>]  Initialize from manifests");
+    eprintln!("  pack <manifest> <image> <output> Create VMFB bundle");
     std::process::exit(1);
 }
 
@@ -48,6 +52,37 @@ fn bank_letter(b: Bank) -> &'static str {
     }
 }
 
+fn cmd_pack(args: &[String]) {
+    if args.len() < 6 {
+        eprintln!("Usage: vm-diagserver <ignored> pack <manifest.yaml> <image> <output.vmfb>");
+        std::process::exit(1);
+    }
+    let manifest_path = PathBuf::from(&args[3]);
+    let image_path = PathBuf::from(&args[4]);
+    let output_path = PathBuf::from(&args[5]);
+
+    let manifest = FirmwareManifest::from_file(&manifest_path).unwrap_or_else(|e| {
+        eprintln!("[diag] {e}");
+        std::process::exit(1);
+    });
+    let image = std::fs::read(&image_path).unwrap_or_else(|e| {
+        eprintln!("[diag] failed to read image: {e}");
+        std::process::exit(1);
+    });
+
+    let bundle = FirmwareBundle::pack(&manifest, &image);
+    std::fs::write(&output_path, &bundle).unwrap_or_else(|e| {
+        eprintln!("[diag] failed to write bundle: {e}");
+        std::process::exit(1);
+    });
+    println!("[diag] packed {} ({} bytes manifest + {} bytes image = {} bytes total)",
+        output_path.display(),
+        bundle.len() - image.len() - manifest::HEADER_SIZE,
+        image.len(),
+        bundle.len(),
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -56,6 +91,12 @@ fn main() {
 
     let nv_path = PathBuf::from(&args[1]);
     let cmd = &args[2];
+
+    // Commands that don't need NV store
+    if cmd == "pack" {
+        cmd_pack(&args);
+        return;
+    }
 
     let dev = if nv_path.exists() {
         FileBlockDevice::open(&nv_path)
@@ -233,6 +274,148 @@ fn main() {
 
             nv.write_factory(&mut factory).unwrap();
             println!("[diag] factory provisioned: serial={serial} vin={vin}");
+        }
+
+        "install-bundle" => {
+            if args.len() < 4 {
+                eprintln!("Usage: install-bundle <bundle-path>");
+                std::process::exit(1);
+            }
+            let bundle_path = PathBuf::from(&args[3]);
+            let bundle = FirmwareBundle::from_file(&bundle_path).unwrap_or_else(|e| {
+                eprintln!("[diag] {e}");
+                std::process::exit(1);
+            });
+            let set = bundle.manifest.resolve_bank_set().unwrap_or_else(|| {
+                eprintln!("[diag] cannot resolve bank set from component_id: {:?}", bundle.manifest.component_id);
+                std::process::exit(1);
+            });
+            let meta = bundle.manifest.to_image_meta();
+            match ota::install(&mut nv, set, &bundle.image, &meta) {
+                Ok(result) => {
+                    println!("[diag] installed {:?} to bank {}", set, bank_letter(result.target_bank));
+                    println!("[diag] version: {}", bundle.manifest.version);
+                    println!("[diag] SHA-256: {}", hex(&result.image_sha256));
+                    println!("[diag] reboot to activate (trial mode)");
+                }
+                Err(e) => {
+                    eprintln!("[diag] install failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        "factory-init" => {
+            if args.len() < 4 {
+                eprintln!("Usage: factory-init <manifest-dir> [--runner-path <path>]");
+                std::process::exit(1);
+            }
+            let dir = PathBuf::from(&args[3]);
+            let mut runner_path: Option<PathBuf> = None;
+            let mut i = 4;
+            while i < args.len() {
+                if args[i] == "--runner-path" && i + 1 < args.len() {
+                    runner_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Provision factory data
+            let factory_yaml = dir.join("factory.yaml");
+            if factory_yaml.exists() {
+                if nv.read_factory().is_some() {
+                    eprintln!("[factory] factory data already provisioned, skipping");
+                } else {
+                    let fm = FactoryManifest::from_file(&factory_yaml).unwrap_or_else(|e| {
+                        eprintln!("[factory] {e}");
+                        std::process::exit(1);
+                    });
+                    let mut nv_factory = fm.to_nv_factory();
+                    nv.write_factory(&mut nv_factory).unwrap();
+                    println!("[factory] provisioned: serial={} vin={}", fm.serial_number, fm.vin);
+                }
+            }
+
+            // Write FW meta for each bank set with a manifest
+            for name in ["hyp", "os1", "os2"] {
+                let manifest_file = dir.join(format!("{name}.yaml"));
+                if !manifest_file.exists() {
+                    continue;
+                }
+                let manifest = FirmwareManifest::from_file(&manifest_file).unwrap_or_else(|e| {
+                    eprintln!("[factory] {e}");
+                    std::process::exit(1);
+                });
+                let set = manifest.resolve_bank_set().unwrap_or_else(|| {
+                    eprintln!("[factory] cannot resolve bank set from {name}.yaml");
+                    std::process::exit(1);
+                });
+
+                // Get image data for hashing
+                let image_sha256: [u8; 32];
+                let fw_crc: u32;
+
+                if name == "hyp" {
+                    if let Some(ref rp) = runner_path {
+                        let data = std::fs::read(rp).unwrap_or_else(|e| {
+                            eprintln!("[factory] failed to read runner binary: {e}");
+                            std::process::exit(1);
+                        });
+                        use sha2::{Sha256, Digest};
+                        image_sha256 = Sha256::digest(&data).into();
+                        fw_crc = crc32fast::hash(&data);
+                        println!("[factory] {name}: hashed runner binary ({} bytes)", data.len());
+                    } else {
+                        // No runner binary — use zero hash
+                        image_sha256 = [0; 32];
+                        fw_crc = 0;
+                        println!("[factory] {name}: no --runner-path, skipping image hash");
+                    }
+                } else {
+                    // Look for {name}.img in the manifest dir
+                    let img_path = dir.join(format!("{name}.img"));
+                    if img_path.exists() {
+                        let data = std::fs::read(&img_path).unwrap_or_else(|e| {
+                            eprintln!("[factory] failed to read {}: {e}", img_path.display());
+                            std::process::exit(1);
+                        });
+                        use sha2::{Sha256, Digest};
+                        image_sha256 = Sha256::digest(&data).into();
+                        fw_crc = crc32fast::hash(&data);
+                        println!("[factory] {name}: hashed image ({} bytes)", data.len());
+                    } else {
+                        image_sha256 = [0; 32];
+                        fw_crc = 0;
+                        println!("[factory] {name}: no image file, skipping hash");
+                    }
+                }
+
+                let meta = manifest.to_image_meta();
+                let mut fw_meta = NvFwMeta {
+                    write_seq: 0,
+                    fw_version: meta.fw_version,
+                    fw_seq: meta.fw_seq,
+                    fw_secver: meta.fw_secver,
+                    fw_crc,
+                    image_sha256,
+                    spare_part_number: meta.spare_part_number,
+                    ecu_sw_number: meta.ecu_sw_number,
+                    supplier_sw_number: meta.supplier_sw_number,
+                    supplier_sw_version: meta.supplier_sw_version,
+                    odx_file_id: meta.odx_file_id,
+                    system_name: meta.system_name,
+                    programming_date: meta.programming_date,
+                    tester_serial: meta.tester_serial,
+                    min_security_ver: 0,
+                };
+                // Write directly to bank A (factory state, no trial mode)
+                nv.write_fw_meta(set, Bank::A, &mut fw_meta).unwrap();
+                println!("[factory] {name}: wrote FW meta bank A (version: {})", manifest.version);
+            }
+
+            println!("[factory] initialization complete");
         }
 
         _ => {
