@@ -1,0 +1,8 @@
+serial_number: "SN-VM-MGR-001"
+vin: "W0VM000000TEST001"
+manufacturing_date: "20260323"
+ecu_hw_number: "HW-ECU-001"
+supplier_hw_number: "SUP-HW-001"
+supplier_hw_version: "1.0"
+supplier_id: "SDV-PLAYGROUND"
+device_type: 1
