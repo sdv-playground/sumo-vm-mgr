@@ -28,10 +28,13 @@ vm-mgr/
 +-- profiles/
 |   +-- os1-dev.toml            # QEMU profile: full device stack (CAN, HSM, health, time)
 |   +-- os1-minimal.toml        # QEMU profile: network only, quick boot testing
-+-- firmware/
-|   +-- factory.yaml            # Factory provisioning manifest (serial, VIN, HW IDs)
-|   +-- hyp.yaml                # Hypervisor firmware manifest (version, DIDs)
-|   +-- os1.yaml                # OS1 firmware manifest (version, DIDs)
++-- example/
+|   +-- factory/                # Example factory provisioning manifests
+|   |   +-- factory.yaml        # Serial, VIN, HW IDs
+|   |   +-- hyp.yaml            # Hypervisor firmware manifest (version, DIDs)
+|   |   +-- os1.yaml            # OS1 firmware manifest (version, DIDs)
+|   +-- keys/                   # Generated SUIT signing keys
+|   +-- output/                 # Generated SUIT envelopes (os1-v1, os1-v2, os2-v1, os2-v2)
 +-- specs/
 |   +-- disk-layout.md          # GPT partition table specification
 |   +-- nv-store-format.md      # NV partition internal layout & wire formats
@@ -113,7 +116,7 @@ graph TB
         NVP["NV Partition<br/>(file or block device)"]
         SIM["Simulators<br/>(CAN, Health, Time, HSM)"]
         HTTP["HTTP Clients<br/>(curl, SOVD Explorer)"]
-        YAML["YAML Manifests<br/>(firmware/, factory)"]
+        YAML["YAML Manifests<br/>(example/factory/)"]
     end
 
     VMB --> BM
@@ -545,12 +548,12 @@ sequenceDiagram
     participant NV as NvStore
 
     S->>S: cargo build
-    S->>D: factory-init firmware/ --runner-path target/debug/vm-runner
+    S->>D: factory-init example/factory/ --runner-path target/debug/vm-runner
 
     D->>NV: Open/create NV file
     D->>NV: Ensure boot state exists
 
-    D->>D: Parse firmware/factory.yaml
+    D->>D: Parse example/factory/factory.yaml
     D->>NV: write_factory(serial, VIN, HW IDs)
 
     loop For each {hyp, os1, os2}.yaml

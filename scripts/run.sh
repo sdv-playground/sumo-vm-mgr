@@ -22,7 +22,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-FIRMWARE_DIR="$ROOT_DIR/firmware"
+FIRMWARE_DIR="$ROOT_DIR/example/factory"
 NV_PATH="${VM_MGR_NV:-/tmp/vm-mgr-nv.bin}"
 KEYS_DIR="$ROOT_DIR/example/keys"
 TRUST_ANCHOR="$KEYS_DIR/signing.pub"
