@@ -38,6 +38,17 @@ pub fn create_router<D: BlockDevice + Send + Sync + 'static>(state: AppState<D>)
             get(handlers::list_faults::<D>)
                 .delete(handlers::clear_faults::<D>),
         )
+        // Modes: session and security
+        .route(
+            "/vehicle/v1/components/{component_id}/modes/session",
+            get(handlers::get_session_mode::<D>)
+                .put(handlers::put_session_mode::<D>),
+        )
+        .route(
+            "/vehicle/v1/components/{component_id}/modes/security",
+            get(handlers::get_security_mode::<D>)
+                .put(handlers::put_security_mode::<D>),
+        )
         // Flash: file upload and verification
         .route(
             "/vehicle/v1/components/{component_id}/files",

@@ -11,7 +11,8 @@ use nv_store::types::*;
 
 use crate::ota;
 use crate::sovd::router::create_router;
-use crate::sovd::state::{AppState, UploadStore};
+use crate::sovd::security::TestSecurityProvider;
+use crate::sovd::state::{AppState, ModeStore, UploadStore};
 use crate::manifest_provider::ManifestProvider;
 use crate::suit_provider::SuitProvider;
 
@@ -57,6 +58,20 @@ fn test_provider(keys: &TestKeys) -> Arc<dyn crate::manifest_provider::ManifestP
     Arc::new(SuitProvider::new(keys.trust_anchor.clone()))
 }
 
+fn test_state(
+    nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
+    uploads: Arc<Mutex<UploadStore>>,
+    keys: &TestKeys,
+) -> AppState<MemBlockDevice> {
+    AppState {
+        nv,
+        uploads,
+        manifest_provider: test_provider(keys),
+        modes: Arc::new(Mutex::new(ModeStore::new())),
+        security_provider: Arc::new(TestSecurityProvider),
+    }
+}
+
 // --- App constructors ---
 
 fn make_app() -> axum::Router {
@@ -65,12 +80,8 @@ fn make_app() -> axum::Router {
     let mut nv = NvStore::new(dev);
     let mut state = NvBootState::default();
     nv.write_boot_state(&mut state).unwrap();
-    let app_state = AppState {
-        nv: Arc::new(Mutex::new(nv)),
-        uploads: Arc::new(Mutex::new(UploadStore::new())),
-        manifest_provider: test_provider(&keys),
-    };
-    create_router(app_state)
+    let nv = Arc::new(Mutex::new(nv));
+    create_router(test_state(nv, Arc::new(Mutex::new(UploadStore::new())), &keys))
 }
 
 fn make_app_with_nv() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>) {
@@ -80,41 +91,75 @@ fn make_app_with_nv() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>) {
     let mut state = NvBootState::default();
     nv.write_boot_state(&mut state).unwrap();
     let nv = Arc::new(Mutex::new(nv));
-    let provider = test_provider(&keys);
-    let app_state = AppState {
-        nv: nv.clone(),
-        uploads: Arc::new(Mutex::new(UploadStore::new())),
-        manifest_provider: provider,
-    };
+    let app_state = test_state(nv.clone(), Arc::new(Mutex::new(UploadStore::new())), &keys);
     (create_router(app_state), nv)
 }
 
-fn make_app_with_keys() -> (
-    axum::Router,
-    Arc<Mutex<NvStore<MemBlockDevice>>>,
-    Arc<Mutex<UploadStore>>,
-    TestKeys,
-    Arc<dyn crate::manifest_provider::ManifestProvider>,
-) {
+fn make_app_with_keys() -> (AppState<MemBlockDevice>, TestKeys) {
     let keys = generate_test_keys();
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
     let mut nv = NvStore::new(dev);
-    let mut state = NvBootState::default();
-    nv.write_boot_state(&mut state).unwrap();
+    let mut boot = NvBootState::default();
+    nv.write_boot_state(&mut boot).unwrap();
     let nv = Arc::new(Mutex::new(nv));
     let uploads = Arc::new(Mutex::new(UploadStore::new()));
-    let provider = test_provider(&keys);
-    (
-        create_router(AppState {
-            nv: nv.clone(),
-            uploads: uploads.clone(),
-            manifest_provider: provider.clone(),
-        }),
-        nv,
-        uploads,
-        keys,
-        provider,
-    )
+    let state = test_state(nv, uploads, &keys);
+    (state, keys)
+}
+
+/// Put component into programming+unlocked state for flash tests.
+async fn unlock_for_flash(state: &AppState<MemBlockDevice>, component: &str) {
+    // Switch to programming
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::put(&format!("/vehicle/v1/components/{component}/modes/session"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"value":"programming"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Request seed
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::put(&format!("/vehicle/v1/components/{component}/modes/security"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"value":"level1_requestseed"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let seed_str = body["seed"]["Request_Seed"].as_str().unwrap();
+
+    // Parse seed and compute key (XOR 0xFF)
+    let seed_bytes: Vec<u8> = seed_str
+        .split_whitespace()
+        .map(|s| u8::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
+        .collect();
+    let key_bytes: Vec<u8> = seed_bytes.iter().map(|b| b ^ 0xFF).collect();
+    let key_hex: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+    // Send key
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::put(&format!("/vehicle/v1/components/{component}/modes/security"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"value": "level1", "key": key_hex}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // --- HTTP helpers ---
@@ -299,13 +344,7 @@ async fn write_runtime_did() {
     let mut state = NvBootState::default();
     nv.write_boot_state(&mut state).unwrap();
     let nv = Arc::new(Mutex::new(nv));
-    let provider = test_provider(&keys);
-
-    let mk_state = || AppState {
-        nv: nv.clone(),
-        uploads: Arc::new(Mutex::new(UploadStore::new())),
-        manifest_provider: provider.clone(),
-    };
+    let mk_state = || test_state(nv.clone(), Arc::new(Mutex::new(UploadStore::new())), &keys);
 
     let (status, json) = put_json(
         create_router(mk_state()),
@@ -352,11 +391,7 @@ async fn list_parameters_includes_runtime_dids() {
     let provider = test_provider(&keys);
 
     let (status, json) = get(
-        create_router(AppState {
-            nv: nv.clone(),
-            uploads: Arc::new(Mutex::new(UploadStore::new())),
-            manifest_provider: provider,
-        }),
+        create_router(test_state(nv.clone(), Arc::new(Mutex::new(UploadStore::new())), &keys)),
         "/vehicle/v1/components/os1/data",
     )
     .await;
@@ -380,13 +415,7 @@ async fn different_bank_sets_are_independent() {
     crate::did::write_did(&mut nv, BankSet::Os1, 0xFD10, b"os1val").unwrap();
 
     let nv = Arc::new(Mutex::new(nv));
-    let provider = test_provider(&keys);
-
-    let mk_state = || AppState {
-        nv: nv.clone(),
-        uploads: Arc::new(Mutex::new(UploadStore::new())),
-        manifest_provider: provider.clone(),
-    };
+    let mk_state = || test_state(nv.clone(), Arc::new(Mutex::new(UploadStore::new())), &keys);
 
     // os1 should have the DID
     let (status, json) = get(
@@ -437,13 +466,7 @@ async fn faults_and_clear() {
     nv.write_runtime(BankSet::Os1, active, &mut runtime).unwrap();
 
     let nv = Arc::new(Mutex::new(nv));
-    let provider = test_provider(&keys);
-
-    let mk_state = || AppState {
-        nv: nv.clone(),
-        uploads: Arc::new(Mutex::new(UploadStore::new())),
-        manifest_provider: provider.clone(),
-    };
+    let mk_state = || test_state(nv.clone(), Arc::new(Mutex::new(UploadStore::new())), &keys);
 
     let (status, json) = get(
         create_router(mk_state()),
@@ -529,13 +552,7 @@ async fn full_ota_commit_via_sovd() {
     ota::install(&mut nv, BankSet::Os1, image, &meta).unwrap();
 
     let nv = Arc::new(Mutex::new(nv));
-    let provider = test_provider(&keys);
-
-    let mk_state = || AppState {
-        nv: nv.clone(),
-        uploads: Arc::new(Mutex::new(UploadStore::new())),
-        manifest_provider: provider.clone(),
-    };
+    let mk_state = || test_state(nv.clone(), Arc::new(Mutex::new(UploadStore::new())), &keys);
 
     // Check activation shows trial
     let (status, json) = get(
@@ -583,13 +600,7 @@ async fn full_ota_rollback_via_sovd() {
     ota::install(&mut nv, BankSet::Os1, image, &meta).unwrap();
 
     let nv = Arc::new(Mutex::new(nv));
-    let provider = test_provider(&keys);
-
-    let mk_state = || AppState {
-        nv: nv.clone(),
-        uploads: Arc::new(Mutex::new(UploadStore::new())),
-        manifest_provider: provider.clone(),
-    };
+    let mk_state = || test_state(nv.clone(), Arc::new(Mutex::new(UploadStore::new())), &keys);
 
     // Active bank should now be B
     let (_, json) = get(
@@ -640,11 +651,7 @@ async fn read_fw_version_after_install() {
     let provider = test_provider(&keys);
 
     let (status, json) = get(
-        create_router(AppState {
-            nv: nv.clone(),
-            uploads: Arc::new(Mutex::new(UploadStore::new())),
-            manifest_provider: provider,
-        }),
+        create_router(test_state(nv.clone(), Arc::new(Mutex::new(UploadStore::new())), &keys)),
         "/vehicle/v1/components/os1/data/fw_version",
     )
     .await;
@@ -672,15 +679,10 @@ async fn cors_headers_present() {
 
 #[tokio::test]
 async fn flash_upload_suit_envelope() {
-    let (_, nv, uploads, keys, provider) = make_app_with_keys();
+    let (state, keys) = make_app_with_keys();
+    unlock_for_flash(&state, "os1").await;
     let image = vec![0xAA; 1024];
     let envelope = make_test_suit_envelope(&keys, "os1", 2, &image);
-
-    let state = AppState {
-        nv: nv.clone(),
-        uploads: uploads.clone(),
-        manifest_provider: provider.clone(),
-    };
 
     // Upload
     let app = create_router(state.clone());
@@ -702,15 +704,10 @@ async fn flash_upload_suit_envelope() {
 
 #[tokio::test]
 async fn flash_full_suit_flow() {
-    let (_, nv, uploads, keys, provider) = make_app_with_keys();
+    let (state, keys) = make_app_with_keys();
+    unlock_for_flash(&state, "os1").await;
     let image = vec![0xBB; 2048];
     let envelope = make_test_suit_envelope(&keys, "os1", 2, &image);
-
-    let state = AppState {
-        nv: nv.clone(),
-        uploads: uploads.clone(),
-        manifest_provider: provider.clone(),
-    };
 
     // 1. Upload
     let app = create_router(state.clone());
@@ -828,7 +825,9 @@ async fn flash_full_suit_flow() {
 
 #[tokio::test]
 async fn flash_upload_bad_envelope() {
-    let app = make_app();
+    let (state, _keys) = make_app_with_keys();
+    unlock_for_flash(&state, "os1").await;
+    let app = create_router(state.clone());
     let resp = app
         .oneshot(
             Request::post("/vehicle/v1/components/os1/files")
@@ -843,18 +842,13 @@ async fn flash_upload_bad_envelope() {
 
 #[tokio::test]
 async fn flash_upload_wrong_component_rejected() {
-    let (_, nv, uploads, keys, provider) = make_app_with_keys();
+    let (state, keys) = make_app_with_keys();
+    unlock_for_flash(&state, "os1").await;
     let image = vec![0xCC; 512];
     // Envelope says "os2" but we upload to "os1"
     let envelope = make_test_suit_envelope(&keys, "os2", 1, &image);
 
-    let state = AppState {
-        nv: nv.clone(),
-        uploads: uploads.clone(),
-        manifest_provider: provider.clone(),
-    };
-
-    let app = create_router(state);
+    let app = create_router(state.clone());
     let resp = app
         .oneshot(
             Request::post("/vehicle/v1/components/os1/files")
@@ -924,4 +918,256 @@ fn suit_provider_maps_component_to_bank_set() {
         let result = provider.validate(&envelope, 0).unwrap();
         assert_eq!(result.bank_set, expected);
     }
+}
+
+// ============================================================
+// Session / Security modes
+// ============================================================
+
+#[tokio::test]
+async fn session_default_initially() {
+    let (status, json) = get(make_app(), "/vehicle/v1/components/os1/modes/session").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["id"], "session");
+    assert_eq!(json["value"], "default");
+}
+
+#[tokio::test]
+async fn session_switch_to_programming() {
+    let (state, _keys) = make_app_with_keys();
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::put("/vehicle/v1/components/os1/modes/session")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"value":"programming"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["value"], "programming");
+
+    // Verify GET reflects the change
+    let (status, json) = get(
+        create_router(state.clone()),
+        "/vehicle/v1/components/os1/modes/session",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["value"], "programming");
+}
+
+#[tokio::test]
+async fn security_locked_initially() {
+    let (status, json) = get(make_app(), "/vehicle/v1/components/os1/modes/security").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["id"], "security");
+    assert_eq!(json["value"], "locked");
+}
+
+#[tokio::test]
+async fn security_seed_key_flow() {
+    let (state, _keys) = make_app_with_keys();
+
+    // Switch to programming first
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::put("/vehicle/v1/components/os1/modes/session")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"value":"programming"}"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Request seed
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::put("/vehicle/v1/components/os1/modes/security")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"value":"level1_requestseed"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(body["seed"]["Request_Seed"].as_str().is_some());
+
+    // Parse seed, compute key (XOR 0xFF)
+    let seed_str = body["seed"]["Request_Seed"].as_str().unwrap();
+    let seed_bytes: Vec<u8> = seed_str
+        .split_whitespace()
+        .map(|s| u8::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
+        .collect();
+    let key_hex: String = seed_bytes.iter().map(|b| format!("{:02x}", b ^ 0xFF)).collect();
+
+    // Send key
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::put("/vehicle/v1/components/os1/modes/security")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"value": "level1", "key": key_hex}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["value"], "level1");
+
+    // GET should show unlocked
+    let (status, json) = get(
+        create_router(state.clone()),
+        "/vehicle/v1/components/os1/modes/security",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["value"], "level1");
+}
+
+#[tokio::test]
+async fn security_wrong_key_rejected() {
+    let (state, _keys) = make_app_with_keys();
+
+    // Programming session
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::put("/vehicle/v1/components/os1/modes/session")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"value":"programming"}"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Request seed
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::put("/vehicle/v1/components/os1/modes/security")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"value":"level1_requestseed"}"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Send wrong key
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::put("/vehicle/v1/components/os1/modes/security")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"value":"level1","key":"deadbeef"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn session_change_resets_security() {
+    let (state, _keys) = make_app_with_keys();
+    unlock_for_flash(&state, "os1").await;
+
+    // Verify unlocked
+    let (_, json) = get(
+        create_router(state.clone()),
+        "/vehicle/v1/components/os1/modes/security",
+    )
+    .await;
+    assert_eq!(json["value"], "level1");
+
+    // Switch session back to default
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::put("/vehicle/v1/components/os1/modes/session")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"value":"default"}"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Security should be locked again
+    let (_, json) = get(
+        create_router(state.clone()),
+        "/vehicle/v1/components/os1/modes/security",
+    )
+    .await;
+    assert_eq!(json["value"], "locked");
+}
+
+// ============================================================
+// Flash gating
+// ============================================================
+
+#[tokio::test]
+async fn flash_upload_rejected_in_default_session() {
+    let (state, keys) = make_app_with_keys();
+    let image = vec![0xAA; 256];
+    let envelope = make_test_suit_envelope(&keys, "os1", 1, &image);
+
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::post("/vehicle/v1/components/os1/files")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(envelope))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // 409 — programming session required
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn flash_upload_rejected_when_locked() {
+    let (state, keys) = make_app_with_keys();
+
+    // Switch to programming but don't unlock
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::put("/vehicle/v1/components/os1/modes/session")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"value":"programming"}"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let image = vec![0xAA; 256];
+    let envelope = make_test_suit_envelope(&keys, "os1", 1, &image);
+
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::post("/vehicle/v1/components/os1/files")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(envelope))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // 403 — security unlock required
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn capabilities_show_sessions_and_security() {
+    let (status, json) = get(make_app(), "/vehicle/v1/components/os1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["capabilities"]["sessions"].as_bool().unwrap());
+    assert!(json["capabilities"]["security"].as_bool().unwrap());
 }

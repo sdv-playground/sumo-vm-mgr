@@ -31,7 +31,7 @@ impl Bank {
 }
 
 /// Identifies which bank set (hypervisor, OS1, OS2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum BankSet {
     Hypervisor = 0,

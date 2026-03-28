@@ -29,8 +29,8 @@ impl Capabilities {
             clear_faults: true,
             software_update: true,
             io_control: false,
-            sessions: false,
-            security: false,
+            sessions: true,
+            security: true,
             sub_entities: false,
             subscriptions: false,
             logs: false,
@@ -190,6 +190,51 @@ pub struct FinalizeResponse {
 pub struct HealthResponse {
     pub status: String,
     pub components: usize,
+}
+
+// --- Session / security models ---
+
+#[derive(Deserialize)]
+pub struct SessionModeRequest {
+    pub value: String,
+}
+
+#[derive(Serialize)]
+pub struct SessionModeResponse {
+    pub id: String,
+    pub value: String,
+}
+
+#[derive(Deserialize)]
+pub struct SecurityModeRequest {
+    pub value: String,
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SecurityModeGetResponse {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SecuritySeedResponse {
+    pub id: String,
+    pub seed: SovdSeed,
+}
+
+#[derive(Serialize)]
+pub struct SovdSeed {
+    #[serde(rename = "Request_Seed")]
+    pub request_seed: String,
+}
+
+#[derive(Serialize)]
+pub struct SecurityKeyResponse {
+    pub id: String,
+    pub value: String,
 }
 
 // --- DID parameter registry ---

@@ -10,7 +10,9 @@ use crate::did;
 use crate::ota;
 use crate::sovd::error::ApiError;
 use crate::sovd::models::*;
-use crate::sovd::state::{AppState, TransferPhase, TransferState, UploadEntry, UploadPhase};
+use crate::sovd::state::{
+    AppState, SecurityPhase, SessionState, TransferPhase, TransferState, UploadEntry, UploadPhase,
+};
 
 // --- Helpers ---
 
@@ -76,6 +78,27 @@ fn all_components() -> Vec<ComponentInfo> {
         component_info("os1", "OS1", "Primary OS VM A/B bank set"),
         component_info("os2", "OS2", "Secondary OS VM A/B bank set"),
     ]
+}
+
+// --- Flash access gating ---
+
+fn require_flash_access<D: BlockDevice>(
+    state: &AppState<D>,
+    set: BankSet,
+) -> Result<(), ApiError> {
+    let modes = state.modes.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
+    let mode = modes.get(set);
+    if mode.session != SessionState::Programming {
+        return Err(ApiError::Conflict(
+            "programming session required — PUT /modes/session {\"value\":\"programming\"}".into(),
+        ));
+    }
+    if mode.security.phase != SecurityPhase::Unlocked {
+        return Err(ApiError::Forbidden(
+            "security unlock required — PUT /modes/security {\"value\":\"level1_requestseed\"}".into(),
+        ));
+    }
+    Ok(())
 }
 
 // --- Health ---
@@ -352,6 +375,7 @@ pub async fn upload_file<D: BlockDevice + Send + 'static>(
     body: Bytes,
 ) -> Result<Json<FileUploadResponse>, ApiError> {
     let set = resolve_component(&component_id)?;
+    require_flash_access(&state, set)?;
 
     // Look up current min_security_ver for anti-rollback validation
     let min_security_ver = {
@@ -417,8 +441,11 @@ pub async fn get_upload_status<D: BlockDevice + Send + 'static>(
 
 pub async fn verify_file<D: BlockDevice + Send + 'static>(
     State(state): State<AppState<D>>,
-    Path((_component_id, upload_id)): Path<(String, String)>,
+    Path((component_id, upload_id)): Path<(String, String)>,
 ) -> Result<Json<VerifyResponse>, ApiError> {
+    let set = resolve_component(&component_id)?;
+    require_flash_access(&state, set)?;
+
     let mut uploads = state.uploads.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
     let entry = uploads
         .files
@@ -447,6 +474,7 @@ pub async fn start_transfer<D: BlockDevice + Send + 'static>(
     Json(body): Json<TransferRequest>,
 ) -> Result<Json<TransferResponse>, ApiError> {
     let set = resolve_component(&component_id)?;
+    require_flash_access(&state, set)?;
 
     // Extract what we need from the upload, then drop the lock
     let (meta, version, image_data) = {
@@ -530,3 +558,154 @@ pub async fn finalize_transfer<D: BlockDevice + Send + 'static>(
         ),
     }))
 }
+
+// --- Session / Security modes ---
+
+pub async fn get_session_mode<D: BlockDevice + Send + 'static>(
+    State(state): State<AppState<D>>,
+    Path(component_id): Path<String>,
+) -> Result<Json<SessionModeResponse>, ApiError> {
+    let set = resolve_component(&component_id)?;
+    let modes = state.modes.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
+    let mode = modes.get(set);
+    Ok(Json(SessionModeResponse {
+        id: "session".to_string(),
+        value: mode.session.as_str().to_string(),
+    }))
+}
+
+pub async fn put_session_mode<D: BlockDevice + Send + 'static>(
+    State(state): State<AppState<D>>,
+    Path(component_id): Path<String>,
+    Json(body): Json<SessionModeRequest>,
+) -> Result<Json<SessionModeResponse>, ApiError> {
+    let set = resolve_component(&component_id)?;
+    let session = SessionState::from_str(&body.value).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "unknown session: {}. Use: default, programming",
+            body.value
+        ))
+    })?;
+    let mut modes = state.modes.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
+    modes.set_session(set, session);
+    Ok(Json(SessionModeResponse {
+        id: "session".to_string(),
+        value: session.as_str().to_string(),
+    }))
+}
+
+pub async fn get_security_mode<D: BlockDevice + Send + 'static>(
+    State(state): State<AppState<D>>,
+    Path(component_id): Path<String>,
+) -> Result<Json<SecurityModeGetResponse>, ApiError> {
+    let set = resolve_component(&component_id)?;
+    let modes = state.modes.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
+    let sec = &modes.get(set).security;
+    let value = match sec.phase {
+        SecurityPhase::Locked => Some("locked".to_string()),
+        SecurityPhase::SeedAvailable => Some(format!("level{}_seedavailable", sec.level)),
+        SecurityPhase::Unlocked => Some(format!("level{}", sec.level)),
+    };
+    Ok(Json(SecurityModeGetResponse {
+        id: "security".to_string(),
+        value,
+    }))
+}
+
+pub async fn put_security_mode<D: BlockDevice + Send + 'static>(
+    State(state): State<AppState<D>>,
+    Path(component_id): Path<String>,
+    Json(body): Json<SecurityModeRequest>,
+) -> Result<axum::response::Response, ApiError> {
+    let set = resolve_component(&component_id)?;
+    let value_lower = body.value.to_lowercase();
+
+    if value_lower.ends_with("_requestseed") {
+        // Step 1: Request seed
+        let level_str = value_lower.trim_end_matches("_requestseed");
+        let level = parse_security_level(level_str)?;
+
+        let seed = state.security_provider.generate_seed(set, level);
+
+        let mut modes = state.modes.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
+        let sec = &mut modes.get_mut(set).security;
+        sec.phase = SecurityPhase::SeedAvailable;
+        sec.level = level;
+        sec.pending_seed = Some(seed.clone());
+
+        let seed_hex = seed.iter().map(|b| format!("0x{b:02x}")).collect::<Vec<_>>().join(" ");
+        let resp = SecuritySeedResponse {
+            id: "security".to_string(),
+            seed: SovdSeed { request_seed: seed_hex },
+        };
+        Ok(axum::Json(resp).into_response())
+    } else {
+        // Step 2: Send key
+        let level = parse_security_level(&value_lower)?;
+        let key_hex = body.key.ok_or_else(|| {
+            ApiError::BadRequest("missing 'key' field — required when sending key".into())
+        })?;
+        let key_bytes = hex_decode(&key_hex).map_err(|e| {
+            ApiError::BadRequest(format!("invalid hex key: {e}"))
+        })?;
+
+        // Get the pending seed
+        let pending_seed = {
+            let modes = state.modes.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
+            let sec = &modes.get(set).security;
+            if sec.phase != SecurityPhase::SeedAvailable || sec.level != level {
+                return Err(ApiError::Conflict(
+                    "no pending seed — call requestseed first".into(),
+                ));
+            }
+            sec.pending_seed.clone().ok_or_else(|| {
+                ApiError::Internal("seed state inconsistency".into())
+            })?
+        };
+
+        // Validate key (provider call outside lock)
+        if !state.security_provider.validate_key(set, level, &pending_seed, &key_bytes) {
+            // Reset to locked on failed key attempt
+            let mut modes = state.modes.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
+            let sec = &mut modes.get_mut(set).security;
+            sec.phase = SecurityPhase::Locked;
+            sec.pending_seed = None;
+            return Err(ApiError::Forbidden("security key rejected".into()));
+        }
+
+        // Unlock
+        let mut modes = state.modes.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
+        let sec = &mut modes.get_mut(set).security;
+        sec.phase = SecurityPhase::Unlocked;
+        sec.pending_seed = None;
+
+        let resp = SecurityKeyResponse {
+            id: "security".to_string(),
+            value: format!("level{level}"),
+        };
+        Ok(axum::Json(resp).into_response())
+    }
+}
+
+fn parse_security_level(s: &str) -> Result<u8, ApiError> {
+    let digits = s.trim_start_matches("level");
+    digits.parse::<u8>().map_err(|_| {
+        ApiError::BadRequest(format!("invalid security level: {s}. Use: level1, level3, etc."))
+    })
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err("odd-length hex string".to_string());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|e| format!("invalid hex at position {i}: {e}"))
+        })
+        .collect()
+}
+
+use axum::response::IntoResponse;

@@ -6,7 +6,8 @@ use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::NvBootState;
 
 use vm_diagserver::sovd::router::create_router;
-use vm_diagserver::sovd::state::{AppState, UploadStore};
+use vm_diagserver::sovd::security::TestSecurityProvider;
+use vm_diagserver::sovd::state::{AppState, ModeStore, UploadStore};
 use vm_diagserver::suit_provider::SuitProvider;
 
 #[tokio::main]
@@ -63,6 +64,8 @@ async fn main() {
         nv: Arc::new(Mutex::new(nv)),
         uploads: Arc::new(Mutex::new(UploadStore::new())),
         manifest_provider,
+        modes: Arc::new(Mutex::new(ModeStore::new())),
+        security_provider: Arc::new(TestSecurityProvider),
     };
     let router = create_router(state);
 

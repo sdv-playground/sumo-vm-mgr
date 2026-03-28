@@ -15,6 +15,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_yaml = "0.9"
+getrandom = "0.2"
 sumo-onboard = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 sumo-crypto = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 sumo-codec = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }

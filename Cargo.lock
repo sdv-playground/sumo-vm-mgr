@@ -1526,6 +1526,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "crc32fast",
+ "getrandom 0.2.17",
  "http-body-util",
  "hyper",
  "nv-store",
