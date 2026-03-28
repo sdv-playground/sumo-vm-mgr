@@ -7,7 +7,6 @@ use nv_store::block::BlockDevice;
 use nv_store::types::*;
 
 use crate::did;
-use crate::manifest::FirmwareBundle;
 use crate::ota;
 use crate::sovd::error::ApiError;
 use crate::sovd::models::*;
@@ -354,8 +353,30 @@ pub async fn upload_file<D: BlockDevice + Send + 'static>(
 ) -> Result<Json<FileUploadResponse>, ApiError> {
     let set = resolve_component(&component_id)?;
 
-    let bundle = FirmwareBundle::unpack(&body)
-        .map_err(|e| ApiError::BadRequest(format!("Invalid firmware bundle: {e}")))?;
+    // Look up current min_security_ver for anti-rollback validation
+    let min_security_ver = {
+        let nv = state.nv.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
+        let boot = nv.read_boot_state();
+        boot.and_then(|bs| {
+            let active = bs.banks[set as usize].active_bank;
+            nv.read_fw_meta(set, active).map(|m| m.min_security_ver)
+        })
+        .unwrap_or(0)
+    };
+
+    // Validate envelope via the pluggable manifest provider
+    let validated = state
+        .manifest_provider
+        .validate(&body, min_security_ver)
+        .map_err(|e| ApiError::BadRequest(format!("Manifest validation failed: {e}")))?;
+
+    // Verify the resolved component matches the URL
+    if validated.bank_set != set {
+        return Err(ApiError::BadRequest(format!(
+            "Manifest component resolves to {:?}, but uploaded to {component_id}",
+            validated.bank_set
+        )));
+    }
 
     let mut uploads = state.uploads.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
     let id = uploads.next_id();
@@ -366,7 +387,7 @@ pub async fn upload_file<D: BlockDevice + Send + 'static>(
             id: id.clone(),
             component: set,
             state: UploadPhase::Uploaded,
-            bundle,
+            validated,
         },
     );
 
@@ -389,8 +410,8 @@ pub async fn get_upload_status<D: BlockDevice + Send + 'static>(
     Ok(Json(FileStatusResponse {
         upload_id: entry.id.clone(),
         state: entry.state.as_str().to_string(),
-        version: Some(entry.bundle.manifest.version.clone()),
-        component: entry.bundle.manifest.component_id.last().cloned(),
+        version: Some(entry.validated.version_display.clone()),
+        component: Some(format!("{:?}", entry.validated.bank_set)),
     }))
 }
 
@@ -404,27 +425,10 @@ pub async fn verify_file<D: BlockDevice + Send + 'static>(
         .get_mut(&upload_id)
         .ok_or_else(|| ApiError::NotFound(format!("Upload not found: {upload_id}")))?;
 
-    let hash: [u8; 32] = Sha256::digest(&entry.bundle.image).into();
-    let size = entry.bundle.image.len() as u64;
-
-    // If manifest specifies a hash, verify it matches
-    if let Some(ref expected_hex) = entry.bundle.manifest.image_sha256 {
-        let actual_hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        if actual_hex != expected_hex.to_lowercase() {
-            return Err(ApiError::Conflict(format!(
-                "Image hash mismatch: expected {expected_hex}, got {actual_hex}"
-            )));
-        }
-    }
-
-    // If manifest specifies size, verify
-    if let Some(expected_size) = entry.bundle.manifest.image_size {
-        if size != expected_size {
-            return Err(ApiError::Conflict(format!(
-                "Image size mismatch: expected {expected_size}, got {size}"
-            )));
-        }
-    }
+    // Signature and digest were already verified during upload by the ManifestProvider.
+    // Recompute hash for the response.
+    let hash: [u8; 32] = Sha256::digest(&entry.validated.image_data).into();
+    let size = entry.validated.image_data.len() as u64;
 
     entry.state = UploadPhase::Verified;
 
@@ -452,9 +456,9 @@ pub async fn start_transfer<D: BlockDevice + Send + 'static>(
             .get(&body.file_id)
             .ok_or_else(|| ApiError::NotFound(format!("Upload not found: {}", body.file_id)))?;
         (
-            entry.bundle.manifest.to_image_meta(),
-            entry.bundle.manifest.version.clone(),
-            entry.bundle.image.clone(),
+            entry.validated.image_meta.clone(),
+            entry.validated.version_display.clone(),
+            entry.validated.image_data.clone(),
         )
     };
 

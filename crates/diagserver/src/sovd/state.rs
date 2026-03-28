@@ -5,11 +5,12 @@ use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
 use nv_store::types::BankSet;
 
-use crate::manifest::FirmwareBundle;
+use crate::manifest_provider::{ManifestProvider, ValidatedFirmware};
 
 pub struct AppState<D: BlockDevice> {
     pub nv: Arc<Mutex<NvStore<D>>>,
     pub uploads: Arc<Mutex<UploadStore>>,
+    pub manifest_provider: Arc<dyn ManifestProvider>,
 }
 
 // Manual Clone — Arc<Mutex<..>> is always Clone regardless of D.
@@ -18,6 +19,7 @@ impl<D: BlockDevice> Clone for AppState<D> {
         Self {
             nv: self.nv.clone(),
             uploads: self.uploads.clone(),
+            manifest_provider: self.manifest_provider.clone(),
         }
     }
 }
@@ -48,7 +50,7 @@ pub struct UploadEntry {
     pub id: String,
     pub component: BankSet,
     pub state: UploadPhase,
-    pub bundle: FirmwareBundle,
+    pub validated: ValidatedFirmware,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

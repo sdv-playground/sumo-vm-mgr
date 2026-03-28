@@ -15,11 +15,15 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_yaml = "0.9"
+sumo-onboard = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-crypto = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-codec = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 hyper = "1"
+sumo-offboard = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 
 [[bin]]
 name = "vm-diagserver"
@@ -28,3 +32,7 @@ path = "src/main.rs"
 [[bin]]
 name = "vm-sovd"
 path = "src/sovd_main.rs"
+
+[[example]]
+name = "build"
+path = "../../example/build.rs"

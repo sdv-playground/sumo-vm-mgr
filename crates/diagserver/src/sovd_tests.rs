@@ -12,8 +12,55 @@ use nv_store::types::*;
 use crate::ota;
 use crate::sovd::router::create_router;
 use crate::sovd::state::{AppState, UploadStore};
+use crate::manifest_provider::ManifestProvider;
+use crate::suit_provider::SuitProvider;
+
+// --- Test SUIT helpers ---
+
+use sumo_crypto::{CryptoBackend, RustCryptoBackend};
+use sumo_offboard::keygen;
+use sumo_offboard::ImageManifestBuilder;
+
+struct TestKeys {
+    signing_key: sumo_offboard::CoseKey,
+    trust_anchor: Vec<u8>,
+}
+
+fn generate_test_keys() -> TestKeys {
+    let signing_key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let trust_anchor = signing_key.public_key_bytes();
+    TestKeys {
+        signing_key,
+        trust_anchor,
+    }
+}
+
+fn make_test_suit_envelope(
+    keys: &TestKeys,
+    component: &str,
+    seq: u64,
+    image: &[u8],
+) -> Vec<u8> {
+    let crypto = RustCryptoBackend::new();
+    let digest = crypto.sha256(image);
+
+    ImageManifestBuilder::new()
+        .component_id(vec![component.to_string()])
+        .sequence_number(seq)
+        .payload_digest(&digest, image.len() as u64)
+        .integrated_payload("#firmware".to_string(), image.to_vec())
+        .build(&keys.signing_key)
+        .unwrap()
+}
+
+fn test_provider(keys: &TestKeys) -> Arc<dyn crate::manifest_provider::ManifestProvider> {
+    Arc::new(SuitProvider::new(keys.trust_anchor.clone()))
+}
+
+// --- App constructors ---
 
 fn make_app() -> axum::Router {
+    let keys = generate_test_keys();
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
     let mut nv = NvStore::new(dev);
     let mut state = NvBootState::default();
@@ -21,19 +68,56 @@ fn make_app() -> axum::Router {
     let app_state = AppState {
         nv: Arc::new(Mutex::new(nv)),
         uploads: Arc::new(Mutex::new(UploadStore::new())),
+        manifest_provider: test_provider(&keys),
     };
     create_router(app_state)
 }
 
 fn make_app_with_nv() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>) {
+    let keys = generate_test_keys();
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
     let mut nv = NvStore::new(dev);
     let mut state = NvBootState::default();
     nv.write_boot_state(&mut state).unwrap();
     let nv = Arc::new(Mutex::new(nv));
-    let app_state = AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) };
+    let provider = test_provider(&keys);
+    let app_state = AppState {
+        nv: nv.clone(),
+        uploads: Arc::new(Mutex::new(UploadStore::new())),
+        manifest_provider: provider,
+    };
     (create_router(app_state), nv)
 }
+
+fn make_app_with_keys() -> (
+    axum::Router,
+    Arc<Mutex<NvStore<MemBlockDevice>>>,
+    Arc<Mutex<UploadStore>>,
+    TestKeys,
+    Arc<dyn crate::manifest_provider::ManifestProvider>,
+) {
+    let keys = generate_test_keys();
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    let mut state = NvBootState::default();
+    nv.write_boot_state(&mut state).unwrap();
+    let nv = Arc::new(Mutex::new(nv));
+    let uploads = Arc::new(Mutex::new(UploadStore::new()));
+    let provider = test_provider(&keys);
+    (
+        create_router(AppState {
+            nv: nv.clone(),
+            uploads: uploads.clone(),
+            manifest_provider: provider.clone(),
+        }),
+        nv,
+        uploads,
+        keys,
+        provider,
+    )
+}
+
+// --- HTTP helpers ---
 
 async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
     let resp = app
@@ -209,9 +293,22 @@ async fn read_parameter_not_found() {
 
 #[tokio::test]
 async fn write_runtime_did() {
-    let (_, nv) = make_app_with_nv();
+    let keys = generate_test_keys();
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    let mut state = NvBootState::default();
+    nv.write_boot_state(&mut state).unwrap();
+    let nv = Arc::new(Mutex::new(nv));
+    let provider = test_provider(&keys);
+
+    let mk_state = || AppState {
+        nv: nv.clone(),
+        uploads: Arc::new(Mutex::new(UploadStore::new())),
+        manifest_provider: provider.clone(),
+    };
+
     let (status, json) = put_json(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/data/FD10",
         serde_json::json!({"value": "hello"}),
     )
@@ -221,7 +318,7 @@ async fn write_runtime_did() {
 
     // Read it back
     let (status, json) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/data/FD10",
     )
     .await;
@@ -243,14 +340,23 @@ async fn write_readonly_did_forbidden() {
 
 #[tokio::test]
 async fn list_parameters_includes_runtime_dids() {
-    let (_, nv) = make_app_with_nv();
+    let keys = generate_test_keys();
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    let mut state = NvBootState::default();
+    nv.write_boot_state(&mut state).unwrap();
     // Write a runtime DID
-    {
-        let mut nv = nv.lock().unwrap();
-        crate::did::write_did(&mut *nv, BankSet::Os1, 0xFD10, b"val").unwrap();
-    }
+    crate::did::write_did(&mut nv, BankSet::Os1, 0xFD10, b"val").unwrap();
+
+    let nv = Arc::new(Mutex::new(nv));
+    let provider = test_provider(&keys);
+
     let (status, json) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(AppState {
+            nv: nv.clone(),
+            uploads: Arc::new(Mutex::new(UploadStore::new())),
+            manifest_provider: provider,
+        }),
         "/vehicle/v1/components/os1/data",
     )
     .await;
@@ -266,14 +372,25 @@ async fn list_parameters_includes_runtime_dids() {
 
 #[tokio::test]
 async fn different_bank_sets_are_independent() {
-    let (_, nv) = make_app_with_nv();
-    {
-        let mut nv = nv.lock().unwrap();
-        crate::did::write_did(&mut *nv, BankSet::Os1, 0xFD10, b"os1val").unwrap();
-    }
+    let keys = generate_test_keys();
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    let mut state = NvBootState::default();
+    nv.write_boot_state(&mut state).unwrap();
+    crate::did::write_did(&mut nv, BankSet::Os1, 0xFD10, b"os1val").unwrap();
+
+    let nv = Arc::new(Mutex::new(nv));
+    let provider = test_provider(&keys);
+
+    let mk_state = || AppState {
+        nv: nv.clone(),
+        uploads: Arc::new(Mutex::new(UploadStore::new())),
+        manifest_provider: provider.clone(),
+    };
+
     // os1 should have the DID
     let (status, json) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/data/FD10",
     )
     .await;
@@ -282,7 +399,7 @@ async fn different_bank_sets_are_independent() {
 
     // os2 should not
     let (status, _) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os2/data/FD10",
     )
     .await;
@@ -303,23 +420,33 @@ async fn faults_empty_initially() {
 
 #[tokio::test]
 async fn faults_and_clear() {
-    let (_, nv) = make_app_with_nv();
+    let keys = generate_test_keys();
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    let mut state = NvBootState::default();
+    nv.write_boot_state(&mut state).unwrap();
     // Write a DTC directly
-    {
-        let mut nv = nv.lock().unwrap();
-        let bs = nv.read_boot_state().unwrap();
-        let active = bs.banks[BankSet::Os1 as usize].active_bank;
-        let mut runtime = nv.read_runtime(BankSet::Os1, active).unwrap_or_default();
-        runtime.dtc_count = 1;
-        runtime.dtcs[0] = DtcEntry {
-            dtc_number: 0x00A301,
-            status: 0x01,
-        };
-        nv.write_runtime(BankSet::Os1, active, &mut runtime).unwrap();
-    }
+    let bs = nv.read_boot_state().unwrap();
+    let active = bs.banks[BankSet::Os1 as usize].active_bank;
+    let mut runtime = nv.read_runtime(BankSet::Os1, active).unwrap_or_default();
+    runtime.dtc_count = 1;
+    runtime.dtcs[0] = DtcEntry {
+        dtc_number: 0x00A301,
+        status: 0x01,
+    };
+    nv.write_runtime(BankSet::Os1, active, &mut runtime).unwrap();
+
+    let nv = Arc::new(Mutex::new(nv));
+    let provider = test_provider(&keys);
+
+    let mk_state = || AppState {
+        nv: nv.clone(),
+        uploads: Arc::new(Mutex::new(UploadStore::new())),
+        manifest_provider: provider.clone(),
+    };
 
     let (status, json) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/faults",
     )
     .await;
@@ -330,7 +457,7 @@ async fn faults_and_clear() {
 
     // Clear
     let (status, json) = delete(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/faults",
     )
     .await;
@@ -339,7 +466,7 @@ async fn faults_and_clear() {
 
     // Verify cleared
     let (status, json) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/faults",
     )
     .await;
@@ -387,22 +514,32 @@ async fn rollback_when_committed_is_conflict() {
 
 #[tokio::test]
 async fn full_ota_commit_via_sovd() {
-    let (_, nv) = make_app_with_nv();
+    let keys = generate_test_keys();
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    let mut boot_state = NvBootState::default();
+    nv.write_boot_state(&mut boot_state).unwrap();
 
     // Install OTA via library (puts os1 in trial mode)
-    {
-        let mut nv = nv.lock().unwrap();
-        let image = b"test-image-data";
-        let mut meta = ota::ImageMeta::default();
-        meta.fw_version[..5].copy_from_slice(b"2.0.0");
-        meta.fw_secver = 1;
-        meta.fw_seq = 1;
-        ota::install(&mut *nv, BankSet::Os1, image, &meta).unwrap();
-    }
+    let image = b"test-image-data";
+    let mut meta = ota::ImageMeta::default();
+    meta.fw_version[..5].copy_from_slice(b"2.0.0");
+    meta.fw_secver = 1;
+    meta.fw_seq = 1;
+    ota::install(&mut nv, BankSet::Os1, image, &meta).unwrap();
+
+    let nv = Arc::new(Mutex::new(nv));
+    let provider = test_provider(&keys);
+
+    let mk_state = || AppState {
+        nv: nv.clone(),
+        uploads: Arc::new(Mutex::new(UploadStore::new())),
+        manifest_provider: provider.clone(),
+    };
 
     // Check activation shows trial
     let (status, json) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/flash/activation",
     )
     .await;
@@ -412,7 +549,7 @@ async fn full_ota_commit_via_sovd() {
 
     // Commit via SOVD endpoint
     let (status, json) = post(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/flash/commit",
     )
     .await;
@@ -421,7 +558,7 @@ async fn full_ota_commit_via_sovd() {
 
     // Verify committed
     let (status, json) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/flash/activation",
     )
     .await;
@@ -431,22 +568,32 @@ async fn full_ota_commit_via_sovd() {
 
 #[tokio::test]
 async fn full_ota_rollback_via_sovd() {
-    let (_, nv) = make_app_with_nv();
+    let keys = generate_test_keys();
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    let mut boot_state = NvBootState::default();
+    nv.write_boot_state(&mut boot_state).unwrap();
 
     // Install OTA
-    {
-        let mut nv = nv.lock().unwrap();
-        let image = b"test-image-data";
-        let mut meta = ota::ImageMeta::default();
-        meta.fw_version[..5].copy_from_slice(b"2.0.0");
-        meta.fw_secver = 1;
-        meta.fw_seq = 1;
-        ota::install(&mut *nv, BankSet::Os1, image, &meta).unwrap();
-    }
+    let image = b"test-image-data";
+    let mut meta = ota::ImageMeta::default();
+    meta.fw_version[..5].copy_from_slice(b"2.0.0");
+    meta.fw_secver = 1;
+    meta.fw_seq = 1;
+    ota::install(&mut nv, BankSet::Os1, image, &meta).unwrap();
+
+    let nv = Arc::new(Mutex::new(nv));
+    let provider = test_provider(&keys);
+
+    let mk_state = || AppState {
+        nv: nv.clone(),
+        uploads: Arc::new(Mutex::new(UploadStore::new())),
+        manifest_provider: provider.clone(),
+    };
 
     // Active bank should now be B
     let (_, json) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/data/active_bank",
     )
     .await;
@@ -454,7 +601,7 @@ async fn full_ota_rollback_via_sovd() {
 
     // Rollback via SOVD
     let (status, json) = post(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/flash/rollback",
     )
     .await;
@@ -463,7 +610,7 @@ async fn full_ota_rollback_via_sovd() {
 
     // Active bank should be back to A
     let (_, json) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(mk_state()),
         "/vehicle/v1/components/os1/data/active_bank",
     )
     .await;
@@ -476,19 +623,28 @@ async fn full_ota_rollback_via_sovd() {
 
 #[tokio::test]
 async fn read_fw_version_after_install() {
-    let (_, nv) = make_app_with_nv();
-    {
-        let mut nv = nv.lock().unwrap();
-        let image = b"img";
-        let mut meta = ota::ImageMeta::default();
-        meta.fw_version[..5].copy_from_slice(b"3.1.0");
-        meta.fw_secver = 1;
-        meta.fw_seq = 1;
-        ota::install(&mut *nv, BankSet::Os1, image, &meta).unwrap();
-    }
+    let keys = generate_test_keys();
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    let mut boot_state = NvBootState::default();
+    nv.write_boot_state(&mut boot_state).unwrap();
+
+    let image = b"img";
+    let mut meta = ota::ImageMeta::default();
+    meta.fw_version[..5].copy_from_slice(b"3.1.0");
+    meta.fw_secver = 1;
+    meta.fw_seq = 1;
+    ota::install(&mut nv, BankSet::Os1, image, &meta).unwrap();
+
+    let nv = Arc::new(Mutex::new(nv));
+    let provider = test_provider(&keys);
 
     let (status, json) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
+        create_router(AppState {
+            nv: nv.clone(),
+            uploads: Arc::new(Mutex::new(UploadStore::new())),
+            manifest_provider: provider,
+        }),
         "/vehicle/v1/components/os1/data/fw_version",
     )
     .await;
@@ -511,38 +667,28 @@ async fn cors_headers_present() {
 }
 
 // ============================================================
-// Flash file upload/transfer
+// Flash file upload/transfer (SUIT envelopes)
 // ============================================================
 
-use crate::manifest::{FirmwareBundle, FirmwareManifest};
-
-fn make_test_bundle(component: &str, version: &str) -> Vec<u8> {
-    let yaml = format!(
-        r#"
-component_id: ["{component}"]
-sequence_number: 2
-version: "{version}"
-spare_part_number: "SP-TEST"
-ecu_sw_number: "SW-TEST"
-system_name: "TEST-{component}"
-"#
-    );
-    let manifest = FirmwareManifest::from_yaml(&yaml).unwrap();
-    let image = vec![0xAA; 1024]; // 1KB test image
-    FirmwareBundle::pack(&manifest, &image)
-}
-
 #[tokio::test]
-async fn flash_upload_and_status() {
-    let (app, nv) = make_app_with_nv();
-    let bundle = make_test_bundle("os1", "2.0.0");
+async fn flash_upload_suit_envelope() {
+    let (_, nv, uploads, keys, provider) = make_app_with_keys();
+    let image = vec![0xAA; 1024];
+    let envelope = make_test_suit_envelope(&keys, "os1", 2, &image);
+
+    let state = AppState {
+        nv: nv.clone(),
+        uploads: uploads.clone(),
+        manifest_provider: provider.clone(),
+    };
 
     // Upload
+    let app = create_router(state.clone());
     let resp = app
         .oneshot(
             Request::post("/vehicle/v1/components/os1/files")
                 .header("content-type", "application/octet-stream")
-                .body(Body::from(bundle))
+                .body(Body::from(envelope))
                 .unwrap(),
         )
         .await
@@ -551,32 +697,20 @@ async fn flash_upload_and_status() {
     let body: serde_json::Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["state"], "uploaded");
-    let upload_id = body["upload_id"].as_str().unwrap().to_string();
-
-    // Status
-    let (status, _) = get(
-        create_router(AppState { nv: nv.clone(), uploads: Arc::new(Mutex::new(UploadStore::new())) }),
-        &format!("/vehicle/v1/components/os1/files/{upload_id}"),
-    )
-    .await;
-    // This uses a fresh router so it won't have the upload — expect 404
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["upload_id"].as_str().is_some());
 }
 
 #[tokio::test]
-async fn flash_full_flow() {
-    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
-    let mut nv = NvStore::new(dev);
-    let mut boot_state = NvBootState::default();
-    nv.write_boot_state(&mut boot_state).unwrap();
-    let nv = Arc::new(Mutex::new(nv));
-    let uploads = Arc::new(Mutex::new(UploadStore::new()));
+async fn flash_full_suit_flow() {
+    let (_, nv, uploads, keys, provider) = make_app_with_keys();
+    let image = vec![0xBB; 2048];
+    let envelope = make_test_suit_envelope(&keys, "os1", 2, &image);
+
     let state = AppState {
         nv: nv.clone(),
         uploads: uploads.clone(),
+        manifest_provider: provider.clone(),
     };
-
-    let bundle = make_test_bundle("os1", "2.0.0");
 
     // 1. Upload
     let app = create_router(state.clone());
@@ -584,7 +718,7 @@ async fn flash_full_flow() {
         .oneshot(
             Request::post("/vehicle/v1/components/os1/files")
                 .header("content-type", "application/octet-stream")
-                .body(Body::from(bundle))
+                .body(Body::from(envelope))
                 .unwrap(),
         )
         .await
@@ -612,6 +746,7 @@ async fn flash_full_flow() {
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["state"], "verified");
     assert!(body["image_sha256"].as_str().unwrap().len() == 64);
+    assert_eq!(body["image_size"], 2048);
 
     // 3. Start transfer
     let app = create_router(state.clone());
@@ -663,7 +798,6 @@ async fn flash_full_flow() {
     let body: serde_json::Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["state"], "trial");
-    assert_eq!(body["active_version"], "2.0.0");
 
     // 6. Commit
     let app = create_router(state.clone());
@@ -693,7 +827,7 @@ async fn flash_full_flow() {
 }
 
 #[tokio::test]
-async fn flash_upload_bad_bundle() {
+async fn flash_upload_bad_envelope() {
     let app = make_app();
     let resp = app
         .oneshot(
@@ -705,4 +839,89 @@ async fn flash_upload_bad_bundle() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn flash_upload_wrong_component_rejected() {
+    let (_, nv, uploads, keys, provider) = make_app_with_keys();
+    let image = vec![0xCC; 512];
+    // Envelope says "os2" but we upload to "os1"
+    let envelope = make_test_suit_envelope(&keys, "os2", 1, &image);
+
+    let state = AppState {
+        nv: nv.clone(),
+        uploads: uploads.clone(),
+        manifest_provider: provider.clone(),
+    };
+
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::post("/vehicle/v1/components/os1/files")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(envelope))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ============================================================
+// SUIT provider unit tests
+// ============================================================
+
+#[test]
+fn suit_provider_validates_good_envelope() {
+    let keys = generate_test_keys();
+    let provider = SuitProvider::new(keys.trust_anchor.clone());
+    let image = vec![0xDD; 4096];
+    let envelope = make_test_suit_envelope(&keys, "os1", 5, &image);
+
+    let result = provider.validate(&envelope, 0).unwrap();
+    assert_eq!(result.bank_set, BankSet::Os1);
+    assert_eq!(result.image_meta.fw_seq, 5);
+    assert_eq!(result.image_meta.fw_secver, 5);
+    assert_eq!(result.image_data, image);
+}
+
+#[test]
+fn suit_provider_rejects_wrong_key() {
+    let keys = generate_test_keys();
+    let other_keys = generate_test_keys(); // different key pair
+    let provider = SuitProvider::new(other_keys.trust_anchor.clone());
+    let image = vec![0xEE; 256];
+    let envelope = make_test_suit_envelope(&keys, "os1", 1, &image);
+
+    let result = provider.validate(&envelope, 0);
+    assert!(result.is_err());
+}
+
+#[test]
+fn suit_provider_rejects_rollback() {
+    let keys = generate_test_keys();
+    let provider = SuitProvider::new(keys.trust_anchor.clone());
+    let image = vec![0xFF; 256];
+    let envelope = make_test_suit_envelope(&keys, "os1", 3, &image);
+
+    // min_security_ver=5 should reject seq=3
+    let result = provider.validate(&envelope, 5);
+    assert!(result.is_err());
+}
+
+#[test]
+fn suit_provider_maps_component_to_bank_set() {
+    let keys = generate_test_keys();
+    let provider = SuitProvider::new(keys.trust_anchor.clone());
+
+    for (comp, expected) in [
+        ("hyp", BankSet::Hypervisor),
+        ("os1", BankSet::Os1),
+        ("os2", BankSet::Os2),
+    ] {
+        let image = vec![0x42; 128];
+        let envelope = make_test_suit_envelope(&keys, comp, 1, &image);
+        let result = provider.validate(&envelope, 0).unwrap();
+        assert_eq!(result.bank_set, expected);
+    }
 }

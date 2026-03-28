@@ -1,14 +1,7 @@
-/// SUIT-inspired firmware manifest and bundle format.
+/// YAML manifests for factory provisioning and initial FW metadata.
 ///
-/// Manifest: YAML file describing a firmware image (version, DIDs, etc.)
-/// Bundle: manifest + image packed into a single uploadable blob.
-///
-/// Bundle wire format:
-///   [0..4]   magic "VMFB"
-///   [4..8]   version (u32 LE, currently 1)
-///   [8..12]  manifest YAML length N (u32 LE)
-///   [12..12+N] manifest YAML (UTF-8)
-///   [12+N..] image bytes
+/// OTA manifests use SUIT envelopes via [`SuitProvider`](crate::suit_provider).
+/// These YAML types are only used for factory-init (offline provisioning).
 
 use crate::ota::ImageMeta;
 use nv_store::types::BankSet;
@@ -172,87 +165,6 @@ impl FactoryManifest {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Firmware bundle (VMFB)
-// ---------------------------------------------------------------------------
-
-pub const BUNDLE_MAGIC: [u8; 4] = *b"VMFB";
-pub const BUNDLE_VERSION: u32 = 1;
-pub const HEADER_SIZE: usize = 12;
-
-#[derive(Debug)]
-pub enum BundleError {
-    TooSmall,
-    BadMagic,
-    BadVersion(u32),
-    ManifestTruncated,
-    Yaml(String),
-}
-
-impl std::fmt::Display for BundleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BundleError::TooSmall => write!(f, "bundle too small (< 12 bytes)"),
-            BundleError::BadMagic => write!(f, "bad bundle magic (expected VMFB)"),
-            BundleError::BadVersion(v) => write!(f, "unsupported bundle version {v}"),
-            BundleError::ManifestTruncated => write!(f, "manifest extends past bundle end"),
-            BundleError::Yaml(e) => write!(f, "manifest YAML: {e}"),
-        }
-    }
-}
-
-pub struct FirmwareBundle {
-    pub manifest: FirmwareManifest,
-    pub image: Vec<u8>,
-}
-
-impl FirmwareBundle {
-    /// Pack a manifest + image into the VMFB wire format.
-    pub fn pack(manifest: &FirmwareManifest, image: &[u8]) -> Vec<u8> {
-        let yaml = serde_yaml::to_string(manifest).expect("manifest serialization");
-        let yaml_bytes = yaml.as_bytes();
-        let mut buf = Vec::with_capacity(HEADER_SIZE + yaml_bytes.len() + image.len());
-        buf.extend_from_slice(&BUNDLE_MAGIC);
-        buf.extend_from_slice(&BUNDLE_VERSION.to_le_bytes());
-        buf.extend_from_slice(&(yaml_bytes.len() as u32).to_le_bytes());
-        buf.extend_from_slice(yaml_bytes);
-        buf.extend_from_slice(image);
-        buf
-    }
-
-    /// Unpack a VMFB bundle from raw bytes.
-    pub fn unpack(data: &[u8]) -> Result<Self, BundleError> {
-        if data.len() < HEADER_SIZE {
-            return Err(BundleError::TooSmall);
-        }
-        if data[0..4] != BUNDLE_MAGIC {
-            return Err(BundleError::BadMagic);
-        }
-        let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        if version != BUNDLE_VERSION {
-            return Err(BundleError::BadVersion(version));
-        }
-        let manifest_len =
-            u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-        let manifest_end = HEADER_SIZE + manifest_len;
-        if manifest_end > data.len() {
-            return Err(BundleError::ManifestTruncated);
-        }
-        let yaml_str = std::str::from_utf8(&data[HEADER_SIZE..manifest_end])
-            .map_err(|e| BundleError::Yaml(e.to_string()))?;
-        let manifest =
-            FirmwareManifest::from_yaml(yaml_str).map_err(BundleError::Yaml)?;
-        let image = data[manifest_end..].to_vec();
-        Ok(FirmwareBundle { manifest, image })
-    }
-
-    /// Unpack from a file path.
-    pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
-        let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Self::unpack(&data).map_err(|e| e.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,55 +236,4 @@ device_type: 1
         assert_eq!(&nv.vin[..17], b"WBALI00000TEST001");
     }
 
-    #[test]
-    fn bundle_pack_unpack_roundtrip() {
-        let yaml = r#"
-component_id: ["os1"]
-sequence_number: 1
-version: "1.0.0"
-"#;
-        let manifest = FirmwareManifest::from_yaml(yaml).unwrap();
-        let image = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03];
-        let packed = FirmwareBundle::pack(&manifest, &image);
-
-        // Check header
-        assert_eq!(&packed[0..4], b"VMFB");
-        assert_eq!(u32::from_le_bytes([packed[4], packed[5], packed[6], packed[7]]), 1);
-
-        // Unpack
-        let bundle = FirmwareBundle::unpack(&packed).unwrap();
-        assert_eq!(bundle.manifest.version, "1.0.0");
-        assert_eq!(bundle.manifest.sequence_number, 1);
-        assert_eq!(bundle.image, image);
-    }
-
-    #[test]
-    fn bundle_unpack_bad_magic() {
-        let data = b"BAAD\x01\x00\x00\x00\x00\x00\x00\x00";
-        assert!(matches!(
-            FirmwareBundle::unpack(data),
-            Err(BundleError::BadMagic)
-        ));
-    }
-
-    #[test]
-    fn bundle_unpack_too_small() {
-        assert!(matches!(
-            FirmwareBundle::unpack(b"VMFB"),
-            Err(BundleError::TooSmall)
-        ));
-    }
-
-    #[test]
-    fn bundle_unpack_truncated_manifest() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VMFB");
-        data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&999u32.to_le_bytes()); // claims 999 bytes of YAML
-        data.extend_from_slice(b"short");
-        assert!(matches!(
-            FirmwareBundle::unpack(&data),
-            Err(BundleError::ManifestTruncated)
-        ));
-    }
 }

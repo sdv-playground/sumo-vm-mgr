@@ -3,7 +3,7 @@ use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
 use vm_diagserver::did;
-use vm_diagserver::manifest::{self, FirmwareBundle, FirmwareManifest, FactoryManifest};
+use vm_diagserver::manifest::{FirmwareManifest, FactoryManifest};
 use vm_diagserver::ota;
 
 use std::path::PathBuf;
@@ -14,14 +14,12 @@ fn usage() -> ! {
     eprintln!("Commands:");
     eprintln!("  status <set>                     Show bank status (hyp|os1|os2)");
     eprintln!("  install <set> <image-path> <ver> <secver>  Install OTA image");
-    eprintln!("  install-bundle <bundle-path>     Install from VMFB bundle");
     eprintln!("  commit <set>                     Commit trial bank");
     eprintln!("  rollback <set>                   Rollback to previous bank");
     eprintln!("  read-did <set> <did-hex>         Read a DID (e.g. F189)");
     eprintln!("  write-did <set> <did-hex> <val>  Write a runtime DID");
     eprintln!("  provision <serial> <vin>         Write factory data (once)");
     eprintln!("  factory-init <dir> [--runner-path <path>]  Initialize from manifests");
-    eprintln!("  pack <manifest> <image> <output> Create VMFB bundle");
     std::process::exit(1);
 }
 
@@ -52,37 +50,6 @@ fn bank_letter(b: Bank) -> &'static str {
     }
 }
 
-fn cmd_pack(args: &[String]) {
-    if args.len() < 6 {
-        eprintln!("Usage: vm-diagserver <ignored> pack <manifest.yaml> <image> <output.vmfb>");
-        std::process::exit(1);
-    }
-    let manifest_path = PathBuf::from(&args[3]);
-    let image_path = PathBuf::from(&args[4]);
-    let output_path = PathBuf::from(&args[5]);
-
-    let manifest = FirmwareManifest::from_file(&manifest_path).unwrap_or_else(|e| {
-        eprintln!("[diag] {e}");
-        std::process::exit(1);
-    });
-    let image = std::fs::read(&image_path).unwrap_or_else(|e| {
-        eprintln!("[diag] failed to read image: {e}");
-        std::process::exit(1);
-    });
-
-    let bundle = FirmwareBundle::pack(&manifest, &image);
-    std::fs::write(&output_path, &bundle).unwrap_or_else(|e| {
-        eprintln!("[diag] failed to write bundle: {e}");
-        std::process::exit(1);
-    });
-    println!("[diag] packed {} ({} bytes manifest + {} bytes image = {} bytes total)",
-        output_path.display(),
-        bundle.len() - image.len() - manifest::HEADER_SIZE,
-        image.len(),
-        bundle.len(),
-    );
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -91,12 +58,6 @@ fn main() {
 
     let nv_path = PathBuf::from(&args[1]);
     let cmd = &args[2];
-
-    // Commands that don't need NV store
-    if cmd == "pack" {
-        cmd_pack(&args);
-        return;
-    }
 
     let dev = if nv_path.exists() {
         FileBlockDevice::open(&nv_path)
@@ -274,35 +235,6 @@ fn main() {
 
             nv.write_factory(&mut factory).unwrap();
             println!("[diag] factory provisioned: serial={serial} vin={vin}");
-        }
-
-        "install-bundle" => {
-            if args.len() < 4 {
-                eprintln!("Usage: install-bundle <bundle-path>");
-                std::process::exit(1);
-            }
-            let bundle_path = PathBuf::from(&args[3]);
-            let bundle = FirmwareBundle::from_file(&bundle_path).unwrap_or_else(|e| {
-                eprintln!("[diag] {e}");
-                std::process::exit(1);
-            });
-            let set = bundle.manifest.resolve_bank_set().unwrap_or_else(|| {
-                eprintln!("[diag] cannot resolve bank set from component_id: {:?}", bundle.manifest.component_id);
-                std::process::exit(1);
-            });
-            let meta = bundle.manifest.to_image_meta();
-            match ota::install(&mut nv, set, &bundle.image, &meta) {
-                Ok(result) => {
-                    println!("[diag] installed {:?} to bank {}", set, bank_letter(result.target_bank));
-                    println!("[diag] version: {}", bundle.manifest.version);
-                    println!("[diag] SHA-256: {}", hex(&result.image_sha256));
-                    println!("[diag] reboot to activate (trial mode)");
-                }
-                Err(e) => {
-                    eprintln!("[diag] install failed: {e}");
-                    std::process::exit(1);
-                }
-            }
         }
 
         "factory-init" => {
