@@ -1,32 +1,36 @@
-# Example: SUIT Firmware Envelope
+# Example: SUIT Firmware Envelopes
 
-Generate demo artifacts (signing keys + signed SUIT envelope with 1MB dummy firmware):
+Generate demo artifacts (signing keys + signed SUIT envelopes with 1MB dummy firmware):
 
 ```bash
 cargo run --example build
 ```
 
-Start the SOVD server with the generated trust anchor:
+This creates:
+
+| File | Component | Sequence | Use case |
+|------|-----------|----------|----------|
+| `output/os1-v1.suit` | os1 | 1 | Initial flash |
+| `output/os1-v2.suit` | os1 | 2 | Upgrade |
+| `output/os2-v1.suit` | os2 | 1 | Initial flash |
+| `output/os2-v2.suit` | os2 | 2 | Upgrade |
+
+## Quick start
 
 ```bash
-cargo run --bin vm-sovd -- /tmp/vm-mgr-nv.bin example/keys/signing.pub
+# Start SOVD server (generates keys on first run):
+./scripts/run.sh
+
+# Or fresh start:
+./scripts/run.sh --fresh
 ```
 
-Upload, verify, transfer, and commit:
+Then open SOVD Explorer and connect to `http://localhost:4000`.
 
-```bash
-# Upload SUIT envelope
-curl -X POST http://localhost:8080/vehicle/v1/components/os1/files \
-  -H 'Content-Type: application/octet-stream' \
-  --data-binary @example/output/os1.suit
+## Simulate upgrade flow
 
-# Verify
-curl -X POST http://localhost:8080/vehicle/v1/components/os1/files/1/verify
+1. Upload `os1-v1.suit` via the Software tab → verify → transfer → commit
+2. Upload `os1-v2.suit` → verify → transfer → commit (upgrade)
+3. Try uploading `os1-v1.suit` again → should be rejected (anti-rollback)
 
-# Flash
-curl -X POST http://localhost:8080/vehicle/v1/components/os1/flash/transfer \
-  -H 'Content-Type: application/json' -d '{"file_id": "1"}'
-
-# Commit
-curl -X POST http://localhost:8080/vehicle/v1/components/os1/flash/commit
-```
+Same flow works for os2 independently.
