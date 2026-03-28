@@ -7,16 +7,16 @@
 # The SOVD REST API defaults to http://0.0.0.0:4000 (SOVD Explorer default).
 #
 # Usage:
-#   ./scripts/run.sh                        # factory-init + SOVD server only
-#   ./scripts/run.sh --profile <p> --images <dir>  # full boot loop + SOVD
+#   ./example/run.sh                        # factory-init + SOVD server only
+#   ./example/run.sh --profile <p> --images <dir>  # full boot loop + SOVD
 #
 # Examples:
 #   # SOVD API for SOVD Explorer testing:
-#   Terminal 1: ./scripts/run.sh
+#   Terminal 1: ./example/run.sh
 #   Terminal 2: open SOVD Explorer -> connect to http://localhost:4000
 #
 #   # Full boot loop:
-#   Terminal 1: ./scripts/run.sh --profile profiles/os1-minimal.toml --images /path/to/output
+#   Terminal 1: ./example/run.sh --profile example/profiles/os1-minimal.toml --images /path/to/output
 
 set -euo pipefail
 

@@ -19,10 +19,10 @@ This creates:
 
 ```bash
 # Start SOVD server (generates keys on first run):
-./scripts/run.sh
+./example/run.sh
 
 # Or fresh start:
-./scripts/run.sh --fresh
+./example/run.sh --fresh
 ```
 
 Then open SOVD Explorer and connect to `http://localhost:4000`.

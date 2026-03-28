@@ -25,7 +25,7 @@ vm-mgr/
 +-- scripts/
 |   +-- run.sh                  # Boot loop launcher (builds, factory-init, starts SOVD + vm-runner)
 |   +-- mkbundle.sh             # Creates VMFB firmware bundle from manifest + image
-+-- profiles/
++-- example/profiles/
 |   +-- os1-dev.toml            # QEMU profile: full device stack (CAN, HSM, health, time)
 |   +-- os1-minimal.toml        # QEMU profile: network only, quick boot testing
 +-- example/
@@ -643,10 +643,10 @@ sequenceDiagram
 
 | Command | Description |
 |---------|-------------|
-| `./scripts/run.sh` | Build, factory-init, start SOVD server on :4000 |
-| `./scripts/run.sh --profile <toml> --images <dir>` | Full boot loop + SOVD server |
-| `./scripts/run.sh --no-init` | Skip factory initialization |
-| `./scripts/run.sh --addr <host:port>` | Custom SOVD bind address |
+| `./example/run.sh` | Build, factory-init, start SOVD server on :4000 |
+| `./example/run.sh --profile <toml> --images <dir>` | Full boot loop + SOVD server |
+| `./example/run.sh --no-init` | Skip factory initialization |
+| `./example/run.sh --addr <host:port>` | Custom SOVD bind address |
 
 ### Script: mkbundle.sh
 

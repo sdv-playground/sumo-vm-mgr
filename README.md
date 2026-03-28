@@ -30,7 +30,7 @@ cargo build
 cargo test   # 101 tests
 
 # Run the boot loop + SOVD server
-./scripts/run.sh --profile profiles/os1-minimal.toml --images /path/to/output
+./example/run.sh --profile example/profiles/os1-minimal.toml --images /path/to/output
 
 # From another terminal — SOVD REST API
 curl http://localhost:8080/vehicle/v1/components
@@ -94,7 +94,7 @@ The server can be used standalone or proxied through SOVDd via its `sovd-proxy` 
 
 ## Profiles
 
-VM profiles are TOML files in `profiles/` that define QEMU parameters (RAM, CPUs, kernel, devices). Two are included:
+VM profiles are TOML files in `example/profiles/` that define QEMU parameters (RAM, CPUs, kernel, devices). Two are included:
 
 - `os1-minimal.toml` — minimal QEMU config with network only
 - `os1-dev.toml` — full dev config with additional devices
