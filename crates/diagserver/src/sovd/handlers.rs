@@ -373,7 +373,7 @@ pub async fn upload_file<D: BlockDevice + Send + 'static>(
     State(state): State<AppState<D>>,
     Path(component_id): Path<String>,
     body: Bytes,
-) -> Result<Json<FileUploadResponse>, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     let set = resolve_component(&component_id)?;
     require_flash_access(&state, set)?;
 
@@ -404,6 +404,7 @@ pub async fn upload_file<D: BlockDevice + Send + 'static>(
 
     let mut uploads = state.uploads.lock().map_err(|_| ApiError::Internal("lock poisoned".into()))?;
     let id = uploads.next_id();
+    let size = validated.image_data.len();
 
     uploads.files.insert(
         id.clone(),
@@ -415,10 +416,14 @@ pub async fn upload_file<D: BlockDevice + Send + 'static>(
         },
     );
 
-    Ok(Json(FileUploadResponse {
-        upload_id: id,
-        state: "uploaded".to_string(),
-    }))
+    let resp = FileUploadResponse {
+        file_id: id.clone(),
+        upload_id: Some(id.clone()),
+        size,
+        verify_url: format!("/vehicle/v1/components/{component_id}/files/{id}/verify"),
+        href: format!("/vehicle/v1/components/{component_id}/files/{id}"),
+    };
+    Ok((axum::http::StatusCode::CREATED, Json(resp)).into_response())
 }
 
 pub async fn get_upload_status<D: BlockDevice + Send + 'static>(

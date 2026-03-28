@@ -695,11 +695,10 @@ async fn flash_upload_suit_envelope() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::CREATED);
     let body: serde_json::Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(body["state"], "uploaded");
-    assert!(body["upload_id"].as_str().is_some());
+    assert!(body["file_id"].as_str().is_some());
 }
 
 #[tokio::test]
@@ -720,10 +719,10 @@ async fn flash_full_suit_flow() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::CREATED);
     let body: serde_json::Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    let upload_id = body["upload_id"].as_str().unwrap().to_string();
+    let upload_id = body["file_id"].as_str().unwrap().to_string();
 
     // 2. Verify
     let app = create_router(state.clone());

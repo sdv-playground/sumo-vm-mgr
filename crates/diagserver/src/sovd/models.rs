@@ -136,8 +136,12 @@ pub struct CommitRollbackResponse {
 
 #[derive(Serialize)]
 pub struct FileUploadResponse {
-    pub upload_id: String,
-    pub state: String,
+    pub file_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_id: Option<String>,
+    pub size: usize,
+    pub verify_url: String,
+    pub href: String,
 }
 
 #[derive(Serialize)]
