@@ -137,7 +137,7 @@ if [ -n "$HELPER_BIN" ]; then
     echo "[vm-mgr] starting security helper on port $HELPER_PORT..."
     "$HELPER_BIN" \
         --port "$HELPER_PORT" \
-        --secrets "$SECRETS_CONFIG" \
+        --config "$SECRETS_CONFIG" \
         --token "$HELPER_TOKEN" \
         > /tmp/vm-mgr-helper.log 2>&1 &
     HELPER_PID=$!
