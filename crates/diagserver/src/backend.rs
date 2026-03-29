@@ -542,14 +542,21 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn get_activation_state(&self) -> BackendResult<ActivationState> {
+        // If a flash transfer is in progress, report its state
+        // (AwaitingReset blocks until ecu_reset is called)
+        let flash_state = {
+            let ft = self.flash_transfer.lock().unwrap();
+            ft.as_ref().map(|t| t.state)
+        };
+
         let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
         let status = ota::status(&*nv, self.bank_set)
             .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
 
-        let state = if status.committed {
-            FlashState::Committed
-        } else {
-            FlashState::Activated
+        let state = match flash_state {
+            Some(FlashState::AwaitingReset) => FlashState::AwaitingReset,
+            _ if status.committed => FlashState::Committed,
+            _ => FlashState::Activated,
         };
 
         let active_version = status.fw_version.map(|v| Self::nv_bytes_to_string(&v));
