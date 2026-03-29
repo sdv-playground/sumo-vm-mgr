@@ -1,110 +1,144 @@
 # vm-mgr
 
-Platform-agnostic VM lifecycle manager for automotive ECUs. Handles A/B bank switching, boot decisions, OTA software updates, and UDS DID resolution. Includes a SOVD REST server for remote diagnostics.
-
-Reference implementation — designed to be forked and adapted with proprietary manifests and transport layers.
-
-## Crates
-
-| Crate | Binary | Purpose |
-|-------|--------|---------|
-| `nv-store` | — | Sector-rotated NV storage with CRC-32 integrity |
-| `vm-boot` | `vm-boot` | Boot decisions: trial boot, auto-rollback, image hash verification |
-| `vm-boot` | `vm-runner` | Boot loop orchestrator (process_boot → start VM → wait → repeat) |
-| `vm-diagserver` | `vm-diagserver` | CLI tool: OTA install/commit/rollback, UDS DID resolution (F187–F199) |
-| `vm-diagserver` | `vm-sovd` | SOVD REST server exposing bank sets as SOVD components |
-
-`vm-boot` produces two binaries: `vm-boot` handles a single boot decision (pick bank, verify hash, increment trial counter), while `vm-runner` wraps it in a loop that launches the VM via the backend trait and restarts on exit.
-
-`vm-diagserver` produces two binaries: `vm-diagserver` is the CLI for direct NV store access, while `vm-sovd` is an HTTP server exposing the same data via SOVD-compatible REST endpoints.
-
-## Prerequisites
-
-- Rust toolchain (stable)
-- QEMU (for the dev/test backend)
+Platform-agnostic VM lifecycle manager for automotive ECUs. Handles A/B bank switching, boot decisions, OTA software updates with SUIT manifest validation, encrypted firmware, and SOVD-compatible diagnostics.
 
 ## Quick Start
 
 ```bash
 cargo build
-cargo test   # 101 tests
+cargo test                      # 105+ tests
 
-# Run the boot loop + SOVD server
-./example/run.sh --profile example/profiles/os1-minimal.toml --images /path/to/output
+# Generate SUIT signing keys + encrypted firmware + CRL manifests
+cargo run --example build
 
-# From another terminal — SOVD REST API
-curl http://localhost:8080/vehicle/v1/components
-curl http://localhost:8080/vehicle/v1/components/os1/data
-curl http://localhost:8080/vehicle/v1/components/os1/flash/activation
+# Start SOVD server (port 4000) with security helper (port 9100)
+./example/run.sh
 
-# Or use the CLI directly
-./target/debug/vm-diagserver /tmp/vm-mgr-nv.bin status os1
+# Or fresh start (wipes NV store)
+./example/run.sh --fresh
 ```
 
-`run.sh` starts both `vm-runner` (boot loop) and `vm-sovd` (SOVD server) sharing the same NV store.
+Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to `http://localhost:4000`.
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--profile <path>` | *(required)* | VM profile TOML file |
-| `--images <dir>` | *(required)* | Directory with bank images |
-| `--sim-dir <dir>` | — | Directory with simulator binaries |
-| `--nv <path>` | `/tmp/vm-mgr-nv.bin` | NV store file path |
+**SOVD Explorer settings:** Helper URL `http://localhost:9100`, token `dev-secret-123`.
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `VM_MGR_NV` | `/tmp/vm-mgr-nv.bin` | NV store file path |
-| `VM_MGR_SOVD_ADDR` | `0.0.0.0:8080` | SOVD server bind address |
+## Architecture
+
+```
+┌──────────────────────────────────────────────┐
+│ vm-mgr                                        │
+│                                               │
+│  nv-store        NV data: boot state, FW meta,│
+│  (lib)           factory, runtime DIDs, DTCs   │
+│                                               │
+│  vm-boot         Boot decisions, trial count,  │
+│  (lib+bin)       hash verify, QEMU/QNX backend │
+│                                               │
+│  vm-diagserver   SUIT validation, OTA engine,  │
+│  (lib+bins)      DID resolution, VmBackend     │
+│       │                                        │
+│       ├── sovd-core (DiagnosticBackend trait)  │
+│       ├── sovd-api  (HTTP routing)            │
+│       ├── sumo-onboard (SUIT validation)      │
+│       └── sumo-processor (command sequences)  │
+└──────────────────────────────────────────────┘
+```
+
+### Crates
+
+| Crate | Binaries | Purpose |
+|-------|----------|---------|
+| `nv-store` | — | Sector-rotated NV storage with CRC-32 integrity |
+| `vm-boot` | `vm-boot`, `vm-runner` | Boot decisions, trial counting, auto-rollback, backend trait |
+| `vm-diagserver` | `vm-diagserver`, `vm-sovd` | SUIT+SOVD: manifest validation, OTA engine, DID resolution, REST server |
+
+## SUIT Manifest Integration
+
+Firmware updates use [RFC 9124 SUIT](https://datatracker.ietf.org/doc/draft-ietf-suit-manifest/) manifests via [sumo-rs](https://github.com/tr-sdv-sandbox/sumo-rs):
+
+- **Signed envelopes** — COSE_Sign1 signature verification
+- **Encrypted firmware** — AES-128-GCM + ECDH-ES+A128KW per-device key wrapping
+- **Compressed payloads** — zstd compression before encryption
+- **Security version** — custom parameter (-257), separate from sequence_number
+- **CRL manifests** — policy-only (no firmware), raises anti-rollback floor
+- **SUIT command sequences** — manifests declare the update flow (install, validate, invoke)
+- **Content-addressable firmware** — manifests ~500 bytes, firmware stored by SHA-256
+
+### Security Version Model
+
+Separates build ordering from anti-rollback policy:
+
+```
+v1.0.0 (seq=1, secver=1) ←→ v1.1.0 (seq=2, secver=1)   # A/B fleet testing
+v1.2.0 (seq=3, secver=2)                                   # security-critical fix
+CRL manifest (secver=2, no payload, 228 bytes)              # blocks secver < 2
+```
+
+### Example Firmware
+
+```bash
+cargo run --example build
+```
+
+Generates in `example/output/`:
+
+| File | Description |
+|------|-------------|
+| `os1-v1.0.0.suit` | Encrypted firmware (secver=1) |
+| `os1-v1.1.0.suit` | Encrypted firmware (secver=1) |
+| `os1-v1.2.0.suit` | Encrypted firmware (secver=1) |
+| `os1-v1.3.0.suit` | Encrypted firmware (secver=1) |
+| `os1-v1.2.0-secver2-full.suit` | Re-signed with secver=2 |
+| `os1-crl-secver2.suit` | CRL: blocks secver < 2 (228 bytes) |
+| `firmware/*.bin` | Content-addressable binaries (by SHA-256) |
 
 ## SOVD Server
 
-`vm-sovd` exposes the three A/B bank sets as SOVD-compatible components:
+Uses [sovd-core](https://github.com/sdv-playground/SOVDd) `DiagnosticBackend` trait — wire-format compatible with [sovd-client](https://github.com/sdv-playground/SOVDd) and [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer).
+
+### Components
 
 | Component | Bank Set | Description |
 |-----------|----------|-------------|
 | `hyp` | Hypervisor | Hypervisor A/B bank set |
-| `os1` | OS1 | Primary OS VM A/B bank set |
-| `os2` | OS2 | Secondary OS VM A/B bank set |
+| `os1` | OS1 | Primary OS VM |
+| `os2` | OS2 | Secondary OS VM |
 
 ### Endpoints
 
+Standard SOVD REST API including:
+
 ```
-GET  /health
-GET  /vehicle/v1/components
-GET  /vehicle/v1/components/{id}
-GET  /vehicle/v1/components/{id}/data
-GET  /vehicle/v1/components/{id}/data/{param}
-PUT  /vehicle/v1/components/{id}/data/{param}
-GET  /vehicle/v1/components/{id}/faults
-DELETE /vehicle/v1/components/{id}/faults
-GET  /vehicle/v1/components/{id}/flash/activation
-POST /vehicle/v1/components/{id}/flash/commit
-POST /vehicle/v1/components/{id}/flash/rollback
-```
-
-Parameters can be addressed by name (`fw_version`, `vin`, `active_bank`) or hex DID (`F189`, `F190`, `FD00`). Runtime DIDs are writable via PUT.
-
-The server can be used standalone or proxied through SOVDd via its `sovd-proxy` crate. SOVD Explorer can connect to it directly.
-
-### Standalone usage
-
-```bash
-./target/debug/vm-sovd /tmp/vm-mgr-nv.bin
-./target/debug/vm-sovd /tmp/vm-mgr-nv.bin 127.0.0.1:9090
+GET/PUT  /vehicle/v1/components/{id}/modes/session    # Programming session
+GET/PUT  /vehicle/v1/components/{id}/modes/security    # Seed/key security unlock
+POST     /vehicle/v1/components/{id}/files             # Upload firmware
+POST     /vehicle/v1/components/{id}/files/{id}/verify # Verify package
+POST     /vehicle/v1/components/{id}/flash/transfer    # Start flash
+GET      /vehicle/v1/components/{id}/flash/activation  # Activation state
+POST     /vehicle/v1/components/{id}/flash/commit      # Commit trial
+POST     /vehicle/v1/components/{id}/flash/rollback    # Rollback trial
+POST     /vehicle/v1/components/{id}/reset             # ECU reset
 ```
 
-## Profiles
+Plus data (DIDs), faults (DTCs), and all standard SOVD resource types.
 
-VM profiles are TOML files in `example/profiles/` that define QEMU parameters (RAM, CPUs, kernel, devices). Two are included:
+### Session & Security
 
-- `os1-minimal.toml` — minimal QEMU config with network only
-- `os1-dev.toml` — full dev config with additional devices
+Flash operations require programming session + security unlock:
+
+1. `PUT /modes/session {"value": "programming"}`
+2. `PUT /modes/security {"value": "level1_requestseed"}` → seed
+3. `PUT /modes/security {"value": "level1", "key": "..."}` → unlocked
+4. Upload + flash + commit
+
+`SecurityProvider` trait is pluggable — `TestSecurityProvider` (XOR 0xFF) for development, production HSM for deployment. Uses [SOVD Security Helper](https://github.com/skarlsson/SOVD-security-helper) for key derivation.
 
 ## Key Concepts
 
 - **Three A/B bank sets**: Hypervisor, OS1, OS2 — independent state machines
 - **Trial boot**: Up to 10 reboots before auto-rollback to previous bank
 - **Copy-on-update**: Runtime DIDs/DTCs cloned to target bank before OTA write
-- **Anti-rollback**: `min_security_ver` floor raised on commit, blocks downgrades
+- **NV persistence**: Boot state, security floor survive power cycles (sector-rotated, CRC-protected)
 - **Backend trait**: `QemuBackend` for dev/test, `QnxBackend` stub for production
 
 ## NV Store Layout
@@ -112,35 +146,29 @@ VM profiles are TOML files in `example/profiles/` that define QEMU parameters (R
 ```
 Boot State     — active bank, committed flag, boot count (per bank set)
 Factory        — serial number, VIN, HW numbers (write-once)
-FW Meta A/B    — firmware version, SHA-256, security version, UDS SW DIDs
+FW Meta A/B    — firmware version, SHA-256, security version, UDS DIDs
 Runtime A/B    — writable DIDs, DTCs (cloned on update)
-App            — cert revocation, timestamps, shared config
 ```
 
-## Diagnostics
+## Flash Flow
 
-The diagserver library implements UDS DID resolution with priority:
+```
+Session → Programming → Security Unlock → Upload SUIT Envelope
+  → Validate (signature + digest + security_version)
+  → Install (decrypt + decompress + write to target bank)
+  → Reset → Trial (activated, not committed)
+  → Health check → Commit (permanent) or Rollback
+```
 
-1. **Runtime** (writable DIDs, per-bank)
-2. **FW Meta** (firmware identity, per-bank)
-3. **Factory** (hardware identity, shared)
-4. **Dynamic** (computed: active bank, boot count, security versions)
-
-Standard DIDs: F187 (spare part), F188 (ECU SW number), F189 (FW version), F18A–F199.
-
-## Specs
-
-Detailed design documents live in `specs/`:
-
-- `disk-layout.md` — GPT partition table
-- `nv-store-format.md` — NV partition internal layout
-- `bank-state-machine.md` — Update lifecycle state machine
+For CRL manifests: Upload → Apply floor → Done (no flash/reset/commit).
 
 ## Related Projects
 
-- **[SOVDd](https://github.com/sdv-playground/SOVDd)** — SOVD diagnostic server. Translates ASAM SOVD REST API into UDS commands over SocketCAN/DoIP. Multi-ECU gateway, flash/OTA lifecycle, SSE streaming, CLI tool.
-- **[SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer)** — Tauri 2 desktop GUI for automotive ECU diagnostics via the SOVD protocol. Parameter read/write, fault display, firmware flashing with two-phase commit, and OIDC-secured security access.
-
-## License
-
-MIT — see `LICENSE` (TODO: add LICENSE file).
+| Project | Description |
+|---------|-------------|
+| [sumo-rs](https://github.com/tr-sdv-sandbox/sumo-rs) | SUIT manifest library (Rust) |
+| [sumo-sovd](https://github.com/sdv-playground/sumo-sovd) | Campaign orchestrator over SOVD |
+| [sumo-campaign-viewer](https://github.com/sdv-playground/sumo-campaign-viewer) | Campaign visualization tool |
+| [SOVDd](https://github.com/sdv-playground/SOVDd) | SOVD diagnostic server |
+| [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) | Diagnostic GUI |
+| [SUMO specs](https://github.com/tr-sdv-sandbox/sumo) | Specifications and feature mapping |
