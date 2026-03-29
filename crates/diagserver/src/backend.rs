@@ -469,7 +469,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
         let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
         let _result = ota::install(&mut *nv, self.bank_set, &image_data, &meta)
-            .map_err(|e| BackendError::Internal(format!("ota install: {e}")))?;
+            .map_err(map_ota_error)?;
 
         let transfer_id = self.next_id();
         {
@@ -575,14 +575,17 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
     async fn commit_flash(&self) -> BackendResult<()> {
         let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
-        ota::commit(&mut *nv, self.bank_set)
-            .map_err(|e| BackendError::Internal(format!("commit: {e}")))
+        ota::commit(&mut *nv, self.bank_set).map_err(map_ota_error)?;
+        // Clear flash transfer state after commit
+        *self.flash_transfer.lock().unwrap() = None;
+        Ok(())
     }
 
     async fn rollback_flash(&self) -> BackendResult<()> {
         let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
-        ota::rollback(&mut *nv, self.bank_set)
-            .map_err(|e| BackendError::Internal(format!("rollback: {e}")))?;
+        ota::rollback(&mut *nv, self.bank_set).map_err(map_ota_error)?;
+        // Clear flash transfer state after rollback
+        *self.flash_transfer.lock().unwrap() = None;
         Ok(())
     }
 
@@ -783,6 +786,20 @@ fn did_value_to_json(_did_num: u16, value: &[u8], reg: Option<&DidEntry>) -> ser
             let hex: String = value.iter().map(|b| format!("{b:02x}")).collect();
             serde_json::Value::String(format!("0x{hex}"))
         }
+    }
+}
+
+fn map_ota_error(e: ota::OtaError) -> BackendError {
+    match e {
+        ota::OtaError::InTrial => BackendError::Busy("bank set is in trial mode".into()),
+        ota::OtaError::AlreadyCommitted => BackendError::Busy("already committed".into()),
+        ota::OtaError::NotInTrial => BackendError::Busy("not in trial mode".into()),
+        ota::OtaError::SecurityVersionTooLow { image, floor } => {
+            BackendError::InvalidRequest(format!(
+                "security version {image} below anti-rollback floor {floor}"
+            ))
+        }
+        other => BackendError::Internal(format!("{other}")),
     }
 }
 
