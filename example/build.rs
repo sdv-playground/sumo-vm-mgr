@@ -61,6 +61,7 @@ fn sign_integrated_encrypted(
         .sequence_number(seq)
         .security_version(security_version)
         .payload_digest(digest, firmware.len() as u64)
+        .payload_uri("#firmware".to_string())
         .encryption_info(&encrypted.encryption_info)
         .integrated_payload("#firmware".to_string(), encrypted.ciphertext)
         .text_version(version)

@@ -20,7 +20,6 @@ chrono = { version = "0.4", features = ["serde"] }
 sovd-core = { git = "ssh://git@github.com/sdv-playground/SOVDd.git", branch = "main" }
 sovd-api = { git = "ssh://git@github.com/sdv-playground/SOVDd.git", branch = "main" }
 sumo-onboard = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
-coset = "0.3"
 sumo-crypto = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 sumo-codec = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 

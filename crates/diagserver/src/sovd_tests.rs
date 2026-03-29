@@ -48,6 +48,7 @@ fn make_test_suit_envelope(keys: &TestKeys, component: &str, seq: u64, image: &[
         .component_id(vec![component.to_string()])
         .sequence_number(seq)
         .payload_digest(&digest, image.len() as u64)
+        .payload_uri("#firmware".to_string())
         .integrated_payload("#firmware".to_string(), image.to_vec())
         .build(&keys.signing_key)
         .unwrap()
