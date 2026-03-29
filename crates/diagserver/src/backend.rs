@@ -467,9 +467,25 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             (p.validated.image_meta.clone(), p.validated.image_data.clone(), size)
         };
 
-        let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
-        let _result = ota::install(&mut *nv, self.bank_set, &image_data, &meta)
-            .map_err(map_ota_error)?;
+        if image_data.is_empty() {
+            // CRL / security-floor-only manifest — raise floor without flashing.
+            // Directly update min_security_ver on the active bank's FW meta.
+            let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let bs = nv.read_boot_state().ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+            let active = bs.banks[self.bank_set as usize].active_bank;
+            if let Some(mut fw_meta) = nv.read_fw_meta(self.bank_set, active) {
+                if meta.fw_secver > fw_meta.min_security_ver {
+                    fw_meta.min_security_ver = meta.fw_secver;
+                    nv.write_fw_meta(self.bank_set, active, &mut fw_meta)
+                        .map_err(|e| BackendError::Internal(format!("NV write: {e}")))?;
+                }
+            }
+        } else {
+            // Normal firmware flash — install to target bank
+            let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            ota::install(&mut *nv, self.bank_set, &image_data, &meta)
+                .map_err(map_ota_error)?;
+        }
 
         let transfer_id = self.next_id();
         {

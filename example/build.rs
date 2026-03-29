@@ -54,6 +54,22 @@ fn build_envelope(
         .unwrap()
 }
 
+fn build_crl_envelope(
+    signing_key: &sumo_offboard::CoseKey,
+    component: &str,
+    seq: u64,
+    security_version: u64,
+) -> Vec<u8> {
+    // Security-floor-only manifest — no payload, just raises the anti-rollback floor.
+    ImageManifestBuilder::new()
+        .component_id(vec![component.to_string()])
+        .sequence_number(seq)
+        .security_version(security_version)
+        .text_description(format!("CRL: block security_version < {security_version}"))
+        .build(signing_key)
+        .unwrap()
+}
+
 fn main() {
     let base = Path::new("example");
     let keys_dir = base.join("keys");
@@ -75,14 +91,19 @@ fn main() {
     fs::write(keys_dir.join("signing.pub"), &public_bytes).unwrap();
     println!("[build] wrote {}", keys_dir.join("signing.pub").display());
 
-    // 2. Build firmware envelopes — two components, two versions each
-    //    security_version=1 for both v1 and v2, enabling A/B testing between them.
-    //    A security-critical update would bump security_version to 2.
+    // 2. Build firmware envelopes
+    //
+    // All 1.x versions have security_version=1, freely up/downgradable.
+    // After discovering a critical bug in < 1.2.0, a CRL manifest bumps
+    // security_version to 2 — blocking 1.0.0 and 1.1.0 permanently.
+    // 1.2.0 and 1.3.0 also carry security_version=2 so they survive the bump.
     let images = [
-        FwConfig { component: "os1", seq: 1, security_version: 1, version: "1.0.0", model_name: "OS1-Linux", spare_part: "OS1-SPARE-001", filename: "os1-v1.suit" },
-        FwConfig { component: "os1", seq: 2, security_version: 1, version: "2.0.0", model_name: "OS1-Linux", spare_part: "OS1-SPARE-002", filename: "os1-v2.suit" },
-        FwConfig { component: "os2", seq: 1, security_version: 1, version: "1.0.0", model_name: "OS2-Linux", spare_part: "OS2-SPARE-001", filename: "os2-v1.suit" },
-        FwConfig { component: "os2", seq: 2, security_version: 1, version: "2.0.0", model_name: "OS2-Linux", spare_part: "OS2-SPARE-002", filename: "os2-v2.suit" },
+        // Freely interchangeable (secver=1)
+        FwConfig { component: "os1", seq: 1, security_version: 1, version: "1.0.0", model_name: "OS1-Linux", spare_part: "OS1-SP-100", filename: "os1-v1.0.0.suit" },
+        FwConfig { component: "os1", seq: 2, security_version: 1, version: "1.1.0", model_name: "OS1-Linux", spare_part: "OS1-SP-110", filename: "os1-v1.1.0.suit" },
+        // Post-security-fix (secver=2) — still installable before CRL, required after
+        FwConfig { component: "os1", seq: 3, security_version: 2, version: "1.2.0", model_name: "OS1-Linux", spare_part: "OS1-SP-120", filename: "os1-v1.2.0.suit" },
+        FwConfig { component: "os1", seq: 4, security_version: 2, version: "1.3.0", model_name: "OS1-Linux", spare_part: "OS1-SP-130", filename: "os1-v1.3.0.suit" },
     ];
 
     for cfg in &images {
@@ -94,25 +115,32 @@ fn main() {
         println!("[build] wrote {} ({} bytes)", path.display(), envelope.len());
     }
 
-    // 3. Print usage
+    // 3. CRL manifest — bumps security floor to 2, blocking 1.0.0 and 1.1.0
+    println!("[build] building CRL manifest (block secver < 2)...");
+    let crl = build_crl_envelope(&signing_key, "os1", 100, 2);
+    let crl_path = output_dir.join("os1-crl-secver2.suit");
+    fs::write(&crl_path, &crl).unwrap();
+    println!("[build] wrote {} ({} bytes)", crl_path.display(), crl.len());
+
+    // 4. Print usage
     println!();
     println!("=== Demo artifacts ready ===");
     println!();
-    println!("Start the SOVD server:");
-    println!("  ./scripts/run.sh");
+    println!("Firmware images:");
+    println!("  os1-v1.0.0.suit  (secver=1)  freely installable");
+    println!("  os1-v1.1.0.suit  (secver=1)  freely installable");
+    println!("  os1-v1.2.0.suit  (secver=2)  survives CRL bump");
+    println!("  os1-v1.3.0.suit  (secver=2)  survives CRL bump");
+    println!("  os1-crl-secver2.suit          CRL: blocks secver < 2");
     println!();
-    println!("Flash OS1 v1 then upgrade to v2:");
-    println!("  curl -X POST http://localhost:4000/vehicle/v1/components/os1/files \\");
-    println!("    --data-binary @example/output/os1-v1.suit");
-    println!("  curl -X POST http://localhost:4000/vehicle/v1/components/os1/files/1/verify");
-    println!("  curl -X POST http://localhost:4000/vehicle/v1/components/os1/flash/transfer \\");
-    println!("    -H 'Content-Type: application/json' -d '{{\"file_id\": \"1\"}}'");
-    println!("  curl -X POST http://localhost:4000/vehicle/v1/components/os1/flash/commit");
-    println!();
-    println!("  # Now upgrade to v2:");
-    println!("  curl -X POST http://localhost:4000/vehicle/v1/components/os1/files \\");
-    println!("    --data-binary @example/output/os1-v2.suit");
-    println!("  # ... verify, transfer, commit as above");
+    println!("Test scenario:");
+    println!("  1. Flash 1.0.0, commit, flash 1.1.0, commit → both work (A/B testing)");
+    println!("  2. Flash 1.0.0 again → works (same security floor)");
+    println!("  3. Flash CRL manifest, commit → raises floor to 2");
+    println!("  4. Flash 1.0.0 → REJECTED (secver 1 < floor 2)");
+    println!("  5. Flash 1.1.0 → REJECTED (secver 1 < floor 2)");
+    println!("  6. Flash 1.2.0 → works (secver 2 >= floor 2)");
+    println!("  7. Flash 1.3.0 → works (secver 2 >= floor 2)");
     println!();
     println!("Or use SOVD Explorer → connect to http://localhost:4000");
 }
