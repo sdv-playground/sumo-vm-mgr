@@ -28,21 +28,28 @@ impl ManifestProvider for SuitProvider {
     ) -> Result<ValidatedFirmware, ManifestError> {
         let crypto = RustCryptoBackend::new();
 
-        let mut validator = Validator::new(&self.trust_anchor, None);
-        validator.set_min_sequence(min_security_ver as u64);
+        // Don't use SUIT validator's set_min_sequence for anti-rollback.
+        // The SUIT sequence_number is for replay ordering; security_version
+        // (custom param -257) is the anti-rollback floor, checked by ota::install.
+        let validator = Validator::new(&self.trust_anchor, None);
 
         let manifest = validator
             .validate_envelope(data, &crypto, 0)
             .map_err(|e| match e {
-                sumo_onboard::Sum2Error::RollbackRejected => ManifestError::RollbackRejected {
-                    seq: 0,
-                    min: min_security_ver as u64,
-                },
                 sumo_onboard::Sum2Error::AuthFailed => {
                     ManifestError::SignatureInvalid("COSE_Sign1 verification failed".into())
                 }
                 other => ManifestError::ParseError(format!("{other:?}")),
             })?;
+
+        // Check security_version against floor (if manifest provides one)
+        let secver = manifest.security_version(0).unwrap_or(0);
+        if secver < min_security_ver as u64 {
+            return Err(ManifestError::RollbackRejected {
+                seq: secver,
+                min: min_security_ver as u64,
+            });
+        }
 
         // Extract integrated payload (firmware image) — optional for floor-only manifests
         let image_data = manifest
