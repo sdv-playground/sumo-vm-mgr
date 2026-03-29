@@ -70,6 +70,17 @@ struct StoredPackage {
 }
 
 // ---------------------------------------------------------------------------
+// Flash transfer tracking
+// ---------------------------------------------------------------------------
+
+struct FlashTransferState {
+    transfer_id: String,
+    package_id: String,
+    state: FlashState,
+    image_size: u64,
+}
+
+// ---------------------------------------------------------------------------
 // VmBackend
 // ---------------------------------------------------------------------------
 
@@ -81,6 +92,7 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     manifest_provider: Arc<dyn ManifestProvider>,
     security_provider: Arc<dyn SecurityProvider>,
     packages: Mutex<HashMap<String, StoredPackage>>,
+    flash_transfer: Mutex<Option<FlashTransferState>>,
     session: Mutex<SessionState>,
     security: Mutex<SecurityAccessState>,
     next_id: Mutex<u64>,
@@ -127,6 +139,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             manifest_provider,
             security_provider,
             packages: Mutex::new(HashMap::new()),
+            flash_transfer: Mutex::new(None),
             session: Mutex::new(SessionState::Default),
             security: Mutex::new(SecurityAccessState::default()),
             next_id: Mutex::new(1),
@@ -445,29 +458,44 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     async fn start_flash(&self, package_id: &str) -> BackendResult<String> {
         self.require_flash_access()?;
 
-        let (meta, image_data) = {
+        let (meta, image_data, image_size) = {
             let packages = self.packages.lock().unwrap();
             let p = packages
                 .get(package_id)
                 .ok_or_else(|| BackendError::EntityNotFound(package_id.to_string()))?;
-            (p.validated.image_meta.clone(), p.validated.image_data.clone())
+            let size = p.validated.image_data.len() as u64;
+            (p.validated.image_meta.clone(), p.validated.image_data.clone(), size)
         };
 
         let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
         let _result = ota::install(&mut *nv, self.bank_set, &image_data, &meta)
             .map_err(|e| BackendError::Internal(format!("ota install: {e}")))?;
 
-        Ok(self.next_id())
+        let transfer_id = self.next_id();
+        {
+            let mut ft = self.flash_transfer.lock().unwrap();
+            *ft = Some(FlashTransferState {
+                transfer_id: transfer_id.clone(),
+                package_id: package_id.to_string(),
+                state: FlashState::AwaitingExit,
+                image_size,
+            });
+        }
+
+        Ok(transfer_id)
     }
 
     async fn get_flash_status(&self, transfer_id: &str) -> BackendResult<FlashStatus> {
+        let ft = self.flash_transfer.lock().unwrap();
+        let t = ft.as_ref().ok_or_else(|| BackendError::EntityNotFound(transfer_id.to_string()))?;
+
         Ok(FlashStatus {
-            transfer_id: transfer_id.to_string(),
-            package_id: String::new(),
-            state: FlashState::AwaitingReset,
+            transfer_id: t.transfer_id.clone(),
+            package_id: t.package_id.clone(),
+            state: t.state,
             progress: Some(FlashProgress {
-                bytes_transferred: 1,
-                bytes_total: 1,
+                bytes_transferred: t.image_size,
+                bytes_total: t.image_size,
                 blocks_transferred: 1,
                 blocks_total: 1,
                 percent: 100.0,
@@ -477,7 +505,40 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn finalize_flash(&self) -> BackendResult<()> {
+        let mut ft = self.flash_transfer.lock().unwrap();
+        if let Some(ref mut t) = *ft {
+            t.state = FlashState::AwaitingReset;
+        }
         Ok(())
+    }
+
+    async fn ecu_reset(&self, _reset_type: u8) -> BackendResult<Option<u8>> {
+        // VM "reset" — advance flash state to Activated
+        let mut ft = self.flash_transfer.lock().unwrap();
+        if let Some(ref mut t) = *ft {
+            t.state = FlashState::Activated;
+        }
+        Ok(None)
+    }
+
+    async fn list_flash_transfers(&self) -> BackendResult<Vec<FlashStatus>> {
+        let ft = self.flash_transfer.lock().unwrap();
+        match ft.as_ref() {
+            Some(t) => Ok(vec![FlashStatus {
+                transfer_id: t.transfer_id.clone(),
+                package_id: t.package_id.clone(),
+                state: t.state,
+                progress: Some(FlashProgress {
+                    bytes_transferred: t.image_size,
+                    bytes_total: t.image_size,
+                    blocks_transferred: 1,
+                    blocks_total: 1,
+                    percent: 100.0,
+                }),
+                error: None,
+            }]),
+            None => Ok(vec![]),
+        }
     }
 
     async fn get_activation_state(&self) -> BackendResult<ActivationState> {
