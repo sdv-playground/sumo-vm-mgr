@@ -1905,6 +1905,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sumo-processor"
+version = "0.1.0"
+source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#b62b9623257950b500a3038be2bae45b44617470"
+dependencies = [
+ "sumo-codec",
+ "sumo-crypto",
+ "sumo-onboard",
+ "tracing",
+]
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2290,6 +2301,7 @@ dependencies = [
  "sumo-crypto",
  "sumo-offboard",
  "sumo-onboard",
+ "sumo-processor",
  "tokio",
  "tower",
  "tracing",

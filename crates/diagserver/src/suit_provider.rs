@@ -86,7 +86,9 @@ impl ManifestProvider for SuitProvider {
                 })?
                 .to_vec();
 
-            // Run the SUIT orchestrator — handles decrypt, decompress, verify
+            // Run the SUIT orchestrator — handles fetch, decrypt, decompress, verify
+            // (L2 processing uses the orchestrator for streaming crypto;
+            //  L1 campaign sequencing uses sumo-processor)
             let ops = VmPlatformOps::new(raw_payload);
             orchestrator::process_image(&validator, &manifest, &ops, &crypto)
                 .map_err(|e| match e {
