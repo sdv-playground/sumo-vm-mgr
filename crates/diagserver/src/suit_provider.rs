@@ -110,6 +110,8 @@ impl ManifestProvider for SuitProvider {
         // Map SUIT text fields to UDS DID identity fields
         if let Some(s) = manifest.text_vendor_name(0) {
             copy_to_nv(s, &mut meta.supplier_sw_number);
+            // Also use as supplier_sw_version if not separately provided
+            copy_to_nv(&version_display, &mut meta.supplier_sw_version);
         }
         if let Some(s) = manifest.text_model_name(0) {
             copy_to_nv(s, &mut meta.system_name);
@@ -117,6 +119,14 @@ impl ManifestProvider for SuitProvider {
         if let Some(s) = manifest.text_model_info(0) {
             copy_to_nv(s, &mut meta.ecu_sw_number);
         }
+        if let Some(s) = manifest.text_description() {
+            copy_to_nv(s, &mut meta.spare_part_number);
+        }
+
+        // Device-local fields — set at install time
+        let now = chrono::Utc::now().format("%Y%m%d").to_string();
+        copy_to_nv(&now, &mut meta.programming_date);
+        copy_to_nv("SOVD-OTA", &mut meta.tester_serial);
 
         Ok(ValidatedFirmware {
             bank_set,

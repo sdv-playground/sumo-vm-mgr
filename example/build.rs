@@ -26,6 +26,7 @@ struct FwConfig {
     security_version: u64,
     version: &'static str,
     model_name: &'static str,
+    spare_part: &'static str,
     filename: &'static str,
 }
 
@@ -47,7 +48,8 @@ fn build_envelope(
         .text_version(cfg.version)
         .text_vendor_name("vm-mgr")
         .text_model_name(cfg.model_name)
-        .text_model_info(format!("{} build {}", cfg.component, cfg.seq))
+        .text_model_info(format!("{}-SW-{:03}", cfg.component.to_uppercase(), cfg.seq))
+        .text_description(cfg.spare_part)
         .build(signing_key)
         .unwrap()
 }
@@ -77,10 +79,10 @@ fn main() {
     //    security_version=1 for both v1 and v2, enabling A/B testing between them.
     //    A security-critical update would bump security_version to 2.
     let images = [
-        FwConfig { component: "os1", seq: 1, security_version: 1, version: "1.0.0", model_name: "OS1-Linux", filename: "os1-v1.suit" },
-        FwConfig { component: "os1", seq: 2, security_version: 1, version: "2.0.0", model_name: "OS1-Linux", filename: "os1-v2.suit" },
-        FwConfig { component: "os2", seq: 1, security_version: 1, version: "1.0.0", model_name: "OS2-Linux", filename: "os2-v1.suit" },
-        FwConfig { component: "os2", seq: 2, security_version: 1, version: "2.0.0", model_name: "OS2-Linux", filename: "os2-v2.suit" },
+        FwConfig { component: "os1", seq: 1, security_version: 1, version: "1.0.0", model_name: "OS1-Linux", spare_part: "OS1-SPARE-001", filename: "os1-v1.suit" },
+        FwConfig { component: "os1", seq: 2, security_version: 1, version: "2.0.0", model_name: "OS1-Linux", spare_part: "OS1-SPARE-002", filename: "os1-v2.suit" },
+        FwConfig { component: "os2", seq: 1, security_version: 1, version: "1.0.0", model_name: "OS2-Linux", spare_part: "OS2-SPARE-001", filename: "os2-v1.suit" },
+        FwConfig { component: "os2", seq: 2, security_version: 1, version: "2.0.0", model_name: "OS2-Linux", spare_part: "OS2-SPARE-002", filename: "os2-v2.suit" },
     ];
 
     for cfg in &images {
