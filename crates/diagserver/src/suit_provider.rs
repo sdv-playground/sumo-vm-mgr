@@ -15,7 +15,6 @@ pub struct SuitProvider {
 }
 
 impl SuitProvider {
-    /// Create a new provider with a trust anchor (COSE_Key public key, CBOR bytes).
     pub fn new(trust_anchor: Vec<u8>) -> Self {
         Self { trust_anchor }
     }
@@ -29,16 +28,14 @@ impl ManifestProvider for SuitProvider {
     ) -> Result<ValidatedFirmware, ManifestError> {
         let crypto = RustCryptoBackend::new();
 
-        // Build validator with trust anchor and anti-rollback floor
         let mut validator = Validator::new(&self.trust_anchor, None);
         validator.set_min_sequence(min_security_ver as u64);
 
-        // Validate envelope: checks signature, digest, sequence number
         let manifest = validator
             .validate_envelope(data, &crypto, 0)
             .map_err(|e| match e {
                 sumo_onboard::Sum2Error::RollbackRejected => ManifestError::RollbackRejected {
-                    seq: 0, // we don't have access to the rejected seq here
+                    seq: 0,
                     min: min_security_ver as u64,
                 },
                 sumo_onboard::Sum2Error::AuthFailed => {
@@ -47,32 +44,28 @@ impl ManifestProvider for SuitProvider {
                 other => ManifestError::ParseError(format!("{other:?}")),
             })?;
 
-        // Extract integrated payload (firmware image)
+        // Extract integrated payload (firmware image) — optional for floor-only manifests
         let image_data = manifest
             .integrated_payload(INTEGRATED_PAYLOAD_KEY)
-            .ok_or_else(|| {
-                ManifestError::ParseError(format!(
-                    "no integrated payload at key \"{INTEGRATED_PAYLOAD_KEY}\""
-                ))
-            })?
-            .to_vec();
+            .map(|p| p.to_vec())
+            .unwrap_or_default();
 
-        // Verify image digest if present
-        if let Some((digest_info,)) = manifest.image_digest(0) {
-            let actual_hash = crypto.sha256(&image_data);
-            if actual_hash[..] != digest_info.bytes[..] {
-                return Err(ManifestError::DigestMismatch);
+        // Verify image digest if present and image is non-empty
+        if !image_data.is_empty() {
+            if let Some((digest_info,)) = manifest.image_digest(0) {
+                let actual_hash = crypto.sha256(&image_data);
+                if actual_hash[..] != digest_info.bytes[..] {
+                    return Err(ManifestError::DigestMismatch);
+                }
             }
-        }
 
-        // Verify image size if present
-        if let Some(expected_size) = manifest.image_size(0) {
-            let actual_size = image_data.len() as u64;
-            if actual_size != expected_size {
-                return Err(ManifestError::SizeMismatch {
-                    expected: expected_size,
-                    actual: actual_size,
-                });
+            if let Some(expected_size) = manifest.image_size(0) {
+                if image_data.len() as u64 != expected_size {
+                    return Err(ManifestError::SizeMismatch {
+                        expected: expected_size,
+                        actual: image_data.len() as u64,
+                    });
+                }
             }
         }
 
@@ -95,23 +88,35 @@ impl ManifestProvider for SuitProvider {
                 ManifestError::ComponentUnknown(comp_str)
             })?;
 
-        // Map SUIT fields to ImageMeta
+        // --- Map SUIT fields to ImageMeta ---
         let seq = manifest.sequence_number();
         let seq_u32 = if seq > u32::MAX as u64 { u32::MAX } else { seq as u32 };
 
         let mut meta = ImageMeta::default();
         meta.fw_seq = seq_u32;
-        meta.fw_secver = seq_u32;
 
-        // Use sequence number as version display, or text version if available
+        // Security version from custom parameter -257, defaults to 0 if absent.
+        // When 0, commit won't advance the anti-rollback floor — enabling A/B testing.
+        let secver = manifest.security_version(0).unwrap_or(0);
+        meta.fw_secver = if secver > u32::MAX as u64 { u32::MAX } else { secver as u32 };
+
+        // Feature version from text field (human-readable display)
         let version_display = manifest
             .text_version(0)
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("seq-{seq}"));
+        copy_to_nv(&version_display, &mut meta.fw_version);
 
-        let ver_bytes = version_display.as_bytes();
-        let n = ver_bytes.len().min(meta.fw_version.len());
-        meta.fw_version[..n].copy_from_slice(&ver_bytes[..n]);
+        // Map SUIT text fields to UDS DID identity fields
+        if let Some(s) = manifest.text_vendor_name(0) {
+            copy_to_nv(s, &mut meta.supplier_sw_number);
+        }
+        if let Some(s) = manifest.text_model_name(0) {
+            copy_to_nv(s, &mut meta.system_name);
+        }
+        if let Some(s) = manifest.text_model_info(0) {
+            copy_to_nv(s, &mut meta.ecu_sw_number);
+        }
 
         Ok(ValidatedFirmware {
             bank_set,
@@ -120,4 +125,9 @@ impl ManifestProvider for SuitProvider {
             version_display,
         })
     }
+}
+
+fn copy_to_nv(s: &str, dst: &mut [u8]) {
+    let n = s.len().min(dst.len());
+    dst[..n].copy_from_slice(&s.as_bytes()[..n]);
 }

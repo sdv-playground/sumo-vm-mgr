@@ -20,21 +20,34 @@ use sumo_offboard::ImageManifestBuilder;
 
 const FIRMWARE_SIZE: usize = 1024 * 1024; // 1MB
 
+struct FwConfig {
+    component: &'static str,
+    seq: u64,
+    security_version: u64,
+    version: &'static str,
+    model_name: &'static str,
+    filename: &'static str,
+}
+
 fn build_envelope(
     crypto: &RustCryptoBackend,
     signing_key: &sumo_offboard::CoseKey,
-    component: &str,
-    seq: u64,
+    cfg: &FwConfig,
 ) -> Vec<u8> {
     let mut firmware = vec![0u8; FIRMWARE_SIZE];
     crypto.random_bytes(&mut firmware).unwrap();
     let digest = crypto.sha256(&firmware);
 
     ImageManifestBuilder::new()
-        .component_id(vec![component.to_string()])
-        .sequence_number(seq)
+        .component_id(vec![cfg.component.to_string()])
+        .sequence_number(cfg.seq)
+        .security_version(cfg.security_version)
         .payload_digest(&digest, firmware.len() as u64)
         .integrated_payload("#firmware".to_string(), firmware)
+        .text_version(cfg.version)
+        .text_vendor_name("vm-mgr")
+        .text_model_name(cfg.model_name)
+        .text_model_info(format!("{} build {}", cfg.component, cfg.seq))
         .build(signing_key)
         .unwrap()
 }
@@ -61,17 +74,20 @@ fn main() {
     println!("[build] wrote {}", keys_dir.join("signing.pub").display());
 
     // 2. Build firmware envelopes — two components, two versions each
+    //    security_version=1 for both v1 and v2, enabling A/B testing between them.
+    //    A security-critical update would bump security_version to 2.
     let images = [
-        ("os1", 1u64, "os1-v1.suit"),
-        ("os1", 2,    "os1-v2.suit"),
-        ("os2", 1,    "os2-v1.suit"),
-        ("os2", 2,    "os2-v2.suit"),
+        FwConfig { component: "os1", seq: 1, security_version: 1, version: "1.0.0", model_name: "OS1-Linux", filename: "os1-v1.suit" },
+        FwConfig { component: "os1", seq: 2, security_version: 1, version: "2.0.0", model_name: "OS1-Linux", filename: "os1-v2.suit" },
+        FwConfig { component: "os2", seq: 1, security_version: 1, version: "1.0.0", model_name: "OS2-Linux", filename: "os2-v1.suit" },
+        FwConfig { component: "os2", seq: 2, security_version: 1, version: "2.0.0", model_name: "OS2-Linux", filename: "os2-v2.suit" },
     ];
 
-    for (component, seq, filename) in &images {
-        println!("[build] building {filename} ({component} seq={seq})...");
-        let envelope = build_envelope(&crypto, &signing_key, component, *seq);
-        let path = output_dir.join(filename);
+    for cfg in &images {
+        println!("[build] building {} ({} v{} seq={} secver={})...",
+            cfg.filename, cfg.component, cfg.version, cfg.seq, cfg.security_version);
+        let envelope = build_envelope(&crypto, &signing_key, cfg);
+        let path = output_dir.join(cfg.filename);
         fs::write(&path, &envelope).unwrap();
         println!("[build] wrote {} ({} bytes)", path.display(), envelope.len());
     }
