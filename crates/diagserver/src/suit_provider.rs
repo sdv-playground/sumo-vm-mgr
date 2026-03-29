@@ -72,8 +72,8 @@ impl ManifestProvider for SuitProvider {
             });
         }
 
-        // Determine if this has a payload (firmware update vs CRL/policy)
-        let has_payload = manifest.image_digest(0).is_some();
+        // Determine update type from manifest command sequences
+        let has_payload = manifest.has_firmware();
 
         let image_data = if has_payload {
             // Extract integrated payload for the orchestrator's fetch
