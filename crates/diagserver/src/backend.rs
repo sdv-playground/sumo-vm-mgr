@@ -489,17 +489,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         }
 
         let transfer_id = self.next_id();
-        {
+        if !is_crl {
             let mut ft = self.flash_transfer.lock().unwrap();
             *ft = Some(FlashTransferState {
                 transfer_id: transfer_id.clone(),
                 package_id: package_id.to_string(),
-                // CRL: floor applied immediately, skip to Committed (no reset/activate needed)
-                // Firmware: normal flow through Complete → finalize → reset → activate → commit
-                state: if is_crl { FlashState::Committed } else { FlashState::Complete },
+                state: FlashState::Complete,
                 image_size,
             });
         }
+        // CRL: no flash transfer state — floor already applied, nothing to poll/finalize/commit
 
         Ok(transfer_id)
     }

@@ -61,6 +61,7 @@ fn sign_integrated_encrypted(
         .sequence_number(seq)
         .security_version(security_version)
         .payload_digest(digest, firmware.len() as u64)
+        .payload_uri("#firmware".to_string())
         .encryption_info(&encrypted.encryption_info)
         .integrated_payload("#firmware".to_string(), encrypted.ciphertext)
         .text_version(version)
@@ -191,9 +192,10 @@ fn main() {
     // 4. Security incident — re-sign 1.2.0 and 1.3.0 with secver=2
     //    (reference-only manifests — firmware is in content-addressable store)
     // ---------------------------------------------------------------
-    println!("\n[build] === Re-signed manifests after security incident (secver=2, reference-only) ===");
+    println!("\n[build] === Re-signed manifests after security incident (secver=2) ===");
 
     for (i, fw) in builds.iter().enumerate().skip(2) {
+        // Reference-only (no payload, for content-addressable workflow)
         let filename = format!("os1-v{}-secver2.suit", fw.version);
         let envelope = sign_reference(
             &signing_key, "os1", (i + 1) as u64, 2,
@@ -203,7 +205,20 @@ fn main() {
         );
         let path = output_dir.join(&filename);
         fs::write(&path, &envelope).unwrap();
-        println!("[build] {} ({} bytes, secver=2, no payload)", filename, envelope.len());
+        println!("[build] {} ({} bytes, secver=2, reference)", filename, envelope.len());
+
+        // Integrated (with payload, for direct upload)
+        let filename = format!("os1-v{}-secver2-full.suit", fw.version);
+        let envelope = sign_integrated_encrypted(
+            &signing_key, &sender_key, &device_key,
+            "os1", (i + 1) as u64, 2,
+            fw.version, "OS1-Linux",
+            &format!("OS1-SP-{}", fw.version.replace('.', "")),
+            &fw.binary, &fw.digest,
+        );
+        let path = output_dir.join(&filename);
+        fs::write(&path, &envelope).unwrap();
+        println!("[build] {} ({} bytes, secver=2, integrated)", filename, envelope.len());
     }
 
     // ---------------------------------------------------------------
