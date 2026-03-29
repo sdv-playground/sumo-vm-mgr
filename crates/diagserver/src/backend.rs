@@ -467,9 +467,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             (p.validated.image_meta.clone(), p.validated.image_data.clone(), size)
         };
 
-        if image_data.is_empty() {
+        let is_crl = image_data.is_empty();
+
+        if is_crl {
             // CRL / security-floor-only manifest — raise floor without flashing.
-            // Directly update min_security_ver on the active bank's FW meta.
             let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
             let bs = nv.read_boot_state().ok_or_else(|| BackendError::Internal("no boot state".into()))?;
             let active = bs.banks[self.bank_set as usize].active_bank;
@@ -493,7 +494,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             *ft = Some(FlashTransferState {
                 transfer_id: transfer_id.clone(),
                 package_id: package_id.to_string(),
-                state: FlashState::Complete,
+                // CRL: floor applied immediately, skip to Committed (no reset/activate needed)
+                // Firmware: normal flow through Complete → finalize → reset → activate → commit
+                state: if is_crl { FlashState::Committed } else { FlashState::Complete },
                 image_size,
             });
         }
@@ -591,8 +594,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
     async fn commit_flash(&self) -> BackendResult<()> {
         let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
-        ota::commit(&mut *nv, self.bank_set).map_err(map_ota_error)?;
-        // Clear flash transfer state after commit
+        match ota::commit(&mut *nv, self.bank_set) {
+            Ok(()) => {}
+            Err(ota::OtaError::AlreadyCommitted) => {} // CRL or idempotent commit — OK
+            Err(e) => return Err(map_ota_error(e)),
+        }
+        // Clear flash transfer state
         *self.flash_transfer.lock().unwrap() = None;
         Ok(())
     }
