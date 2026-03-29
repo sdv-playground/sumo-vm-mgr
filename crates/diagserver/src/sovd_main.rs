@@ -23,30 +23,51 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: vm-sovd <nv-store-path> <trust-anchor-path> [bind-addr]");
+        eprintln!("Usage: vm-sovd <nv-store-path> <trust-anchor-path> [--device-key <path>] [bind-addr]");
         eprintln!();
         eprintln!("  trust-anchor-path: COSE_Key public key file (CBOR bytes)");
+        eprintln!("  --device-key:      ECDH P-256 private key for firmware decryption");
         eprintln!("  bind-addr defaults to 0.0.0.0:8080");
         eprintln!();
         eprintln!("Example:");
-        eprintln!("  vm-sovd /tmp/vm-mgr-nv.bin example/keys/signing.pub");
-        eprintln!("  vm-sovd /tmp/vm-mgr-nv.bin example/keys/signing.pub 127.0.0.1:9090");
+        eprintln!("  vm-sovd /tmp/vm-mgr-nv.bin example/keys/signing.pub --device-key example/keys/device.key");
         std::process::exit(1);
     }
 
     let nv_path = PathBuf::from(&args[1]);
     let trust_anchor_path = PathBuf::from(&args[2]);
-    let bind_addr = args
-        .get(3)
-        .map(|s| s.as_str())
-        .unwrap_or("0.0.0.0:8080");
+
+    // Parse remaining args
+    let mut device_key_path: Option<PathBuf> = None;
+    let mut bind_addr = "0.0.0.0:8080";
+    let mut i = 3;
+    while i < args.len() {
+        if args[i] == "--device-key" && i + 1 < args.len() {
+            device_key_path = Some(PathBuf::from(&args[i + 1]));
+            i += 2;
+        } else {
+            bind_addr = &args[i];
+            i += 1;
+        }
+    }
 
     // Load trust anchor
     let trust_anchor = std::fs::read(&trust_anchor_path).unwrap_or_else(|e| {
         eprintln!("failed to read trust anchor {}: {e}", trust_anchor_path.display());
         std::process::exit(1);
     });
-    let manifest_provider = Arc::new(SuitProvider::new(trust_anchor));
+
+    // Load device key (optional — required for encrypted firmware)
+    let mut provider = SuitProvider::new(trust_anchor);
+    if let Some(ref dk_path) = device_key_path {
+        let dk = std::fs::read(dk_path).unwrap_or_else(|e| {
+            eprintln!("failed to read device key {}: {e}", dk_path.display());
+            std::process::exit(1);
+        });
+        provider = provider.with_device_key(dk);
+        tracing::info!("device key loaded: {}", dk_path.display());
+    }
+    let manifest_provider = Arc::new(provider);
     let security_provider = Arc::new(TestSecurityProvider);
 
     // Open/create NV store

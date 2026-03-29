@@ -2275,6 +2275,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "coset",
  "crc32fast",
  "getrandom 0.2.17",
  "http-body-util",

@@ -1,8 +1,11 @@
 /// SUIT manifest provider — validates RFC 9124 SUIT envelopes via sumo-rs.
 
+use coset::CborSerializable;
 use nv_store::types::BankSet;
 use sumo_crypto::{CryptoBackend, RustCryptoBackend};
 use sumo_onboard::Validator;
+use sumo_onboard::decryptor::StreamingDecryptor;
+use sumo_onboard::decompressor::StreamingDecompressor;
 
 use crate::manifest_provider::{ManifestError, ManifestProvider, ValidatedFirmware};
 use crate::ota::ImageMeta;
@@ -12,11 +15,17 @@ const INTEGRATED_PAYLOAD_KEY: &str = "#firmware";
 
 pub struct SuitProvider {
     trust_anchor: Vec<u8>,
+    device_key: Option<Vec<u8>>,  // COSE_Key CBOR (private, for decryption)
 }
 
 impl SuitProvider {
     pub fn new(trust_anchor: Vec<u8>) -> Self {
-        Self { trust_anchor }
+        Self { trust_anchor, device_key: None }
+    }
+
+    pub fn with_device_key(mut self, key: Vec<u8>) -> Self {
+        self.device_key = Some(key);
+        self
     }
 }
 
@@ -51,13 +60,45 @@ impl ManifestProvider for SuitProvider {
             });
         }
 
-        // Extract integrated payload (firmware image) — optional for floor-only manifests
-        let image_data = manifest
+        // Extract integrated payload — optional for floor-only manifests
+        let raw_payload = manifest
             .integrated_payload(INTEGRATED_PAYLOAD_KEY)
             .map(|p| p.to_vec())
             .unwrap_or_default();
 
-        // Verify image digest if present and image is non-empty
+        // Decrypt + decompress if encryption_info is present
+        let image_data = if !raw_payload.is_empty() && manifest.encryption_info(0).is_some() {
+            let device_key_bytes = self.device_key.as_ref().ok_or_else(|| {
+                ManifestError::ParseError("encrypted payload but no device key configured".into())
+            })?;
+            let device_coset_key = coset::CoseKey::from_slice(device_key_bytes)
+                .map_err(|e| ManifestError::ParseError(format!("invalid device key: {e}")))?;
+
+            // Decrypt (AES-GCM, CEK unwrapped via ECDH-ES+A128KW)
+            let mut decryptor = StreamingDecryptor::new(&manifest, 0, &device_coset_key, &crypto)
+                .map_err(|e| ManifestError::ParseError(format!("decryption init: {e:?}")))?;
+
+            let mut buf = vec![0u8; raw_payload.len() + 256];
+            let mut total = 0;
+            total += decryptor.update(&raw_payload, &mut buf[total..])
+                .map_err(|e| ManifestError::ParseError(format!("decryption: {e:?}")))?;
+            total += decryptor.finalize(&mut buf[total..])
+                .map_err(|e| ManifestError::ParseError(format!("decryption finalize: {e:?}")))?;
+            let decrypted = buf[..total].to_vec();
+
+            // Decompress (zstd)
+            let mut decompressor = StreamingDecompressor::new()
+                .map_err(|e| ManifestError::ParseError(format!("decompressor init: {e:?}")))?;
+            let mut out = [0u8; 0];
+            decompressor.update(&decrypted, &mut out)
+                .map_err(|e| ManifestError::ParseError(format!("decompress: {e:?}")))?;
+            decompressor.finalize_to_vec()
+                .map_err(|e| ManifestError::ParseError(format!("decompress finalize: {e:?}")))?
+        } else {
+            raw_payload
+        };
+
+        // Verify plaintext image digest if present and image is non-empty
         if !image_data.is_empty() {
             if let Some((digest_info,)) = manifest.image_digest(0) {
                 let actual_hash = crypto.sha256(&image_data);

@@ -12,7 +12,10 @@ use std::fs;
 use std::path::Path;
 
 use sumo_crypto::{CryptoBackend, RustCryptoBackend};
+use sumo_offboard::cose_key::CoseKey;
+use sumo_offboard::encryptor;
 use sumo_offboard::keygen;
+use sumo_offboard::recipient::Recipient;
 use sumo_offboard::ImageManifestBuilder;
 
 const FIRMWARE_SIZE: usize = 1024 * 1024; // 1MB
@@ -25,9 +28,15 @@ fn build_firmware(crypto: &RustCryptoBackend) -> (Vec<u8>, [u8; 32]) {
     (firmware, hash)
 }
 
-/// Sign a manifest wrapping a firmware binary (integrated payload — single blob).
-fn sign_integrated(
+/// Sign a manifest wrapping encrypted firmware (integrated payload).
+///
+/// Pipeline: firmware → compress (zstd) → encrypt (AES-GCM + ECDH-ES+A128KW per device)
+/// The manifest carries encryption_info (COSE_Encrypt with wrapped CEK per recipient).
+/// payload_digest is the plaintext hash (verified after decryption on device).
+fn sign_integrated_encrypted(
     signing_key: &sumo_offboard::CoseKey,
+    sender_key: &sumo_offboard::CoseKey,
+    device_pub: &sumo_offboard::CoseKey,
     component: &str,
     seq: u64,
     security_version: u64,
@@ -37,12 +46,23 @@ fn sign_integrated(
     firmware: &[u8],
     digest: &[u8; 32],
 ) -> Vec<u8> {
+    // Compress
+    let compressed = encryptor::compress_firmware(firmware, 3).unwrap();
+
+    // Encrypt (one CEK, wrapped per device)
+    let recipients = [Recipient {
+        public_key: CoseKey::from_cose_key_bytes(&device_pub.to_cose_key_bytes()).unwrap(),
+        kid: b"device-1".to_vec(),
+    }];
+    let encrypted = encryptor::encrypt_firmware_ecdh(&compressed, sender_key, &recipients).unwrap();
+
     ImageManifestBuilder::new()
         .component_id(vec![component.to_string()])
         .sequence_number(seq)
         .security_version(security_version)
         .payload_digest(digest, firmware.len() as u64)
-        .integrated_payload("#firmware".to_string(), firmware.to_vec())
+        .encryption_info(&encrypted.encryption_info)
+        .integrated_payload("#firmware".to_string(), encrypted.ciphertext)
         .text_version(version)
         .text_vendor_name("vm-mgr")
         .text_model_name(model_name)
@@ -106,12 +126,21 @@ fn main() {
     let crypto = RustCryptoBackend::new();
 
     // ---------------------------------------------------------------
-    // 1. Generate signing key
+    // 1. Generate signing key + device key + sender key
     // ---------------------------------------------------------------
-    println!("[build] generating ES256 signing key...");
+    println!("[build] generating keys...");
     let signing_key = keygen::generate_signing_key(keygen::ES256).unwrap();
     fs::write(keys_dir.join("signing.key"), signing_key.to_cose_key_bytes()).unwrap();
     fs::write(keys_dir.join("signing.pub"), signing_key.public_key_bytes()).unwrap();
+
+    // Device ECDH key (on-device, for decrypting firmware)
+    let device_key = keygen::generate_device_key(keygen::ES256).unwrap();
+    fs::write(keys_dir.join("device.key"), device_key.to_cose_key_bytes()).unwrap();
+    fs::write(keys_dir.join("device.pub"), device_key.public_key_bytes()).unwrap();
+
+    // Sender ECDH key (build server, ephemeral per release)
+    let sender_key = keygen::generate_device_key(keygen::ES256).unwrap();
+
     println!("[build] wrote keys to {}", keys_dir.display());
 
     // ---------------------------------------------------------------
@@ -146,8 +175,9 @@ fn main() {
 
     for (i, fw) in builds.iter().enumerate() {
         let filename = format!("os1-v{}.suit", fw.version);
-        let envelope = sign_integrated(
-            &signing_key, "os1", (i + 1) as u64, 1,
+        let envelope = sign_integrated_encrypted(
+            &signing_key, &sender_key, &device_key,
+            "os1", (i + 1) as u64, 1,
             fw.version, "OS1-Linux",
             &format!("OS1-SP-{}", fw.version.replace('.', "")),
             &fw.binary, &fw.digest,

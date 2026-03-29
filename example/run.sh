@@ -26,6 +26,7 @@ SECRETS_CONFIG="$ROOT_DIR/example/config/secrets.toml"
 NV_PATH="${VM_MGR_NV:-/tmp/vm-mgr-nv.bin}"
 KEYS_DIR="$ROOT_DIR/example/keys"
 TRUST_ANCHOR="$KEYS_DIR/signing.pub"
+DEVICE_KEY="$KEYS_DIR/device.key"
 
 # Defaults
 SOVD_ADDR="${VM_MGR_SOVD_ADDR:-0.0.0.0:4000}"
@@ -162,9 +163,9 @@ echo ""
 
 # 8. Start SOVD server
 if [ -z "$PROFILE" ]; then
-    exec "$SOVD" "$NV_PATH" "$TRUST_ANCHOR" "$SOVD_ADDR"
+    exec "$SOVD" "$NV_PATH" "$TRUST_ANCHOR" --device-key "$DEVICE_KEY" "$SOVD_ADDR"
 else
-    "$SOVD" "$NV_PATH" "$TRUST_ANCHOR" "$SOVD_ADDR" &
+    "$SOVD" "$NV_PATH" "$TRUST_ANCHOR" --device-key "$DEVICE_KEY" "$SOVD_ADDR" &
     SOVD_PID=$!
     "$RUNNER" "${EXTRA_ARGS[@]}" --nv "$NV_PATH" --init
 fi
