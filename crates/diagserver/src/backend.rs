@@ -477,7 +477,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             *ft = Some(FlashTransferState {
                 transfer_id: transfer_id.clone(),
                 package_id: package_id.to_string(),
-                state: FlashState::AwaitingExit,
+                state: FlashState::Complete,
                 image_size,
             });
         }
