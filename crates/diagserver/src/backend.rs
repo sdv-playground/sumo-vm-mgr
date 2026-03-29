@@ -542,12 +542,13 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
         {
             let mut s = self.session.lock().unwrap();
+            let changed = *s != new_state;
             *s = new_state;
-        }
-        // Security resets on session change (ISO 14229)
-        {
-            let mut sec = self.security.lock().unwrap();
-            *sec = SecurityAccessState::default();
+            if changed {
+                // Security resets on session change (ISO 14229)
+                let mut sec = self.security.lock().unwrap();
+                *sec = SecurityAccessState::default();
+            }
         }
 
         self.get_session_mode().await
