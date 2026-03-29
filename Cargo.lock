@@ -1750,7 +1750,7 @@ dependencies = [
 [[package]]
 name = "sovd-api"
 version = "0.1.0"
-source = "git+ssh://git@github.com/sdv-playground/SOVDd.git?branch=main#17cfdd8b0000b2ace4762639d72a92a71168e2da"
+source = "git+ssh://git@github.com/sdv-playground/SOVDd.git?branch=main#a1079146527230449c9e6fb1b390f0ef8f4b20e6"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1779,7 +1779,7 @@ dependencies = [
 [[package]]
 name = "sovd-conv"
 version = "0.1.0"
-source = "git+ssh://git@github.com/sdv-playground/SOVDd.git?branch=main#17cfdd8b0000b2ace4762639d72a92a71168e2da"
+source = "git+ssh://git@github.com/sdv-playground/SOVDd.git?branch=main#a1079146527230449c9e6fb1b390f0ef8f4b20e6"
 dependencies = [
  "hex",
  "serde",
@@ -1791,7 +1791,7 @@ dependencies = [
 [[package]]
 name = "sovd-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/sdv-playground/SOVDd.git?branch=main#17cfdd8b0000b2ace4762639d72a92a71168e2da"
+source = "git+ssh://git@github.com/sdv-playground/SOVDd.git?branch=main#a1079146527230449c9e6fb1b390f0ef8f4b20e6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1806,7 +1806,7 @@ dependencies = [
 [[package]]
 name = "sovd-uds"
 version = "0.1.0"
-source = "git+ssh://git@github.com/sdv-playground/SOVDd.git?branch=main#17cfdd8b0000b2ace4762639d72a92a71168e2da"
+source = "git+ssh://git@github.com/sdv-playground/SOVDd.git?branch=main#a1079146527230449c9e6fb1b390f0ef8f4b20e6"
 dependencies = [
  "anyhow",
  "async-trait",
