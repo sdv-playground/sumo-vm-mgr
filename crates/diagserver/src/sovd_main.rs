@@ -1,13 +1,15 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use nv_store::block::FileBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
-use nv_store::types::NvBootState;
+use nv_store::types::{BankSet, NvBootState};
 
-use vm_diagserver::sovd::router::create_router;
+use sovd_core::DiagnosticBackend;
+
+use vm_diagserver::backend::VmBackend;
 use vm_diagserver::sovd::security::TestSecurityProvider;
-use vm_diagserver::sovd::state::{AppState, ModeStore, UploadStore};
 use vm_diagserver::suit_provider::SuitProvider;
 
 #[tokio::main]
@@ -39,13 +41,15 @@ async fn main() {
         .map(|s| s.as_str())
         .unwrap_or("0.0.0.0:8080");
 
-    // Load trust anchor (signing public key)
+    // Load trust anchor
     let trust_anchor = std::fs::read(&trust_anchor_path).unwrap_or_else(|e| {
         eprintln!("failed to read trust anchor {}: {e}", trust_anchor_path.display());
         std::process::exit(1);
     });
     let manifest_provider = Arc::new(SuitProvider::new(trust_anchor));
+    let security_provider = Arc::new(TestSecurityProvider);
 
+    // Open/create NV store
     let dev = if nv_path.exists() {
         FileBlockDevice::open(&nv_path).expect("failed to open NV store")
     } else {
@@ -60,14 +64,22 @@ async fn main() {
         tracing::info!("initialized boot state");
     }
 
-    let state = AppState {
-        nv: Arc::new(Mutex::new(nv)),
-        uploads: Arc::new(Mutex::new(UploadStore::new())),
-        manifest_provider,
-        modes: Arc::new(Mutex::new(ModeStore::new())),
-        security_provider: Arc::new(TestSecurityProvider),
-    };
-    let router = create_router(state);
+    let nv = Arc::new(Mutex::new(nv));
+
+    // Create one backend per bank set
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    for (id, set) in [("hyp", BankSet::Hypervisor), ("os1", BankSet::Os1), ("os2", BankSet::Os2)] {
+        let backend = VmBackend::new(
+            set,
+            nv.clone(),
+            manifest_provider.clone(),
+            security_provider.clone(),
+        );
+        backends.insert(id.to_string(), Arc::new(backend));
+    }
+
+    let state = sovd_api::AppState::new(backends);
+    let router = sovd_api::create_router(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await

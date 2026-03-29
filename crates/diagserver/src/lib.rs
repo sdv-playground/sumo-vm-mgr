@@ -1,9 +1,13 @@
+pub mod backend;
 pub mod did;
 pub mod manifest;
 pub mod manifest_provider;
 pub mod ota;
-pub mod sovd;
 pub mod suit_provider;
+
+pub mod sovd {
+    pub mod security;
+}
 
 #[cfg(test)]
 mod tests;
