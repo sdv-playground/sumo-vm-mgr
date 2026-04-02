@@ -890,8 +890,41 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         *self.session.lock().unwrap() = SessionState::Default;
         *self.security.lock().unwrap() = SecurityAccessState::default();
 
-        // Signal vm-service to restart the VM (if wired up)
-        if let Some(ref socket_path) = self.vm_service_socket {
+        // Flip the `current` symlink so vm-service boots the right bank
+        if let (Some(ref images_dir), Some(ref socket_path)) = (&self.images_dir, &self.vm_service_socket) {
+            let set_name = match self.bank_set {
+                BankSet::Hypervisor => "hyp",
+                BankSet::Os1 => "os1",
+                BankSet::Os2 => "os2",
+                BankSet::Hsm => "hsm",
+                BankSet::Qtd => "qtd",
+            };
+            let target_bank = *self.running_bank.lock().unwrap();
+            let bank_dir_name = match target_bank {
+                Bank::A => "bank_a",
+                Bank::B => "bank_b",
+            };
+            let symlink_path = images_dir.join(set_name).join("current");
+            let target = images_dir.join(set_name).join(bank_dir_name);
+            // Atomic symlink swap: create temp, rename over existing
+            let tmp_link = symlink_path.with_extension("tmp");
+            let _ = std::fs::remove_file(&tmp_link);
+            if let Err(e) = std::os::unix::fs::symlink(&target, &tmp_link)
+                .and_then(|()| std::fs::rename(&tmp_link, &symlink_path))
+            {
+                tracing::warn!("failed to flip current symlink for {set_name}: {e}");
+            } else {
+                tracing::info!("flipped {set_name}/current -> {bank_dir_name}");
+            }
+
+            // Signal vm-service to restart the VM
+            let id = &self.entity_info.id;
+            match Self::notify_vm_service(socket_path, id).await {
+                Ok(()) => tracing::info!("vm-service restart requested for {id}"),
+                Err(e) => tracing::warn!("failed to notify vm-service for {id}: {e}"),
+            }
+        } else if let Some(ref socket_path) = self.vm_service_socket {
+            // No images_dir — just restart without symlink flip
             let id = &self.entity_info.id;
             match Self::notify_vm_service(socket_path, id).await {
                 Ok(()) => tracing::info!("vm-service restart requested for {id}"),
