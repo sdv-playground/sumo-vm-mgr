@@ -1,0 +1,26 @@
+# Example vm-service config for a single Linux VM.
+#
+# Uses the dummy backend (no real QEMU) so the example runs anywhere.
+# Swap to backend: qemu for a real VM with actual images.
+
+socket: /tmp/vm-service-example.sock
+
+vms:
+  linux1:
+    backend: dummy
+    arch: x86_64
+    cpus: 2
+    ram_mb: 1024
+    image_dir: /tmp/vm-service-example/linux1/current
+    images:
+      kernel: bzImage
+      rootfs: rootfs.qcow2
+    devices:
+      - type: health
+        backend: simulated
+      - type: network
+        ssh_port: 2222
+    health:
+      timeout_secs: 10
+    shutdown:
+      timeout_secs: 5

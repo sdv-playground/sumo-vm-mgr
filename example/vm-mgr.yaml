@@ -1,0 +1,40 @@
+# vm-mgr.yaml — declares all managed components and their backends.
+#
+# Each component specifies a backend:
+#   dummy  — NV state only, no real VM (default)
+#   qemu   — QEMU VM with optional health watchdog
+#   qnx    — QNX qvm guest (future)
+#
+# QEMU components reference an existing VmProfile TOML for device config.
+
+nv_store: /tmp/sumo-sovd-sim-nv.bin
+images_dir: /opt/vm-mgr/images
+
+components:
+  hyp:
+    bank_set: hyp
+    backend: dummy
+
+  os1:
+    bank_set: os1
+    backend: qemu
+    profile: example/profiles/os1-dev.toml
+    shutdown:
+      timeout_secs: 10
+      method: health
+    readiness:
+      method: health
+      timeout_secs: 30
+
+  os2:
+    bank_set: os2
+    backend: dummy
+
+  hsm:
+    bank_set: hsm
+    backend: dummy
+    single_bank: true
+
+  qtd:
+    bank_set: qtd
+    backend: dummy
