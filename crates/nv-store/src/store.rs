@@ -259,5 +259,5 @@ impl<D: BlockDevice> NvStore<D> {
 }
 
 /// Minimum device size to hold the full NV layout.
-/// OS2 Runtime B ends at 0x050000 + 8*4096 = 0x058000.
-pub const MIN_NV_DEVICE_SIZE: u64 = 0x058000; // 352 KB
+/// QTD (bank set 4) Runtime B ends at 0x070000 + 0x010000 + 8*4096 = 0x088000.
+pub const MIN_NV_DEVICE_SIZE: u64 = 0x088000; // 544 KB

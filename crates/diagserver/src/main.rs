@@ -12,7 +12,7 @@ fn usage() -> ! {
     eprintln!("Usage: vm-diagserver <nv-store-path> <command> [args...]");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  status <set>                     Show bank status (hyp|os1|os2)");
+    eprintln!("  status <set>                     Show bank status (hyp|os1|os2|hsm|qtd)");
     eprintln!("  install <set> <image-path> <ver> <secver>  Install OTA image");
     eprintln!("  commit <set>                     Commit trial bank");
     eprintln!("  rollback <set>                   Rollback to previous bank");
@@ -28,8 +28,10 @@ fn parse_set(s: &str) -> BankSet {
         "hyp" => BankSet::Hypervisor,
         "os1" => BankSet::Os1,
         "os2" => BankSet::Os2,
+        "hsm" => BankSet::Hsm,
+        "qtd" => BankSet::Qtd,
         _ => {
-            eprintln!("Invalid bank set '{s}'. Use: hyp, os1, os2");
+            eprintln!("Invalid bank set '{s}'. Use: hyp, os1, os2, hsm, qtd");
             std::process::exit(1);
         }
     }
@@ -130,7 +132,7 @@ fn main() {
             meta.fw_secver = secver;
             meta.fw_seq = secver;
 
-            match ota::install(&mut nv, set, &image_data, &meta) {
+            match ota::install(&mut nv, set, &image_data, &meta, false) {
                 Ok(result) => {
                     println!("[diag] installed to bank {}", bank_letter(result.target_bank));
                     println!("[diag] SHA-256: {}", hex(&result.image_sha256));
@@ -172,7 +174,7 @@ fn main() {
             }
             let set = parse_set(&args[3]);
             let did_num = parse_did(&args[4]);
-            let val = did::read_did(&nv, set, did_num);
+            let val = did::read_did(&nv, set, did_num, None);
             match val {
                 did::DidValue::Bytes(b) => {
                     // Try as string first
@@ -271,7 +273,7 @@ fn main() {
             }
 
             // Write FW meta for each bank set with a manifest
-            for name in ["hyp", "os1", "os2"] {
+            for name in ["hyp", "os1", "os2", "hsm", "qtd"] {
                 let manifest_file = dir.join(format!("{name}.yaml"));
                 if !manifest_file.exists() {
                     continue;

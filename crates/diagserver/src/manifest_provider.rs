@@ -12,6 +12,10 @@ pub struct ValidatedFirmware {
     pub image_meta: ImageMeta,
     pub image_data: Vec<u8>,
     pub version_display: String,
+    /// Pre-computed image SHA-256 (set by streaming path where image is written to disk directly).
+    pub image_sha256: Option<[u8; 32]>,
+    /// Image size in bytes (set by streaming path).
+    pub image_size: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -49,4 +53,25 @@ pub trait ManifestProvider: Send + Sync {
         data: &[u8],
         min_security_ver: u32,
     ) -> Result<ValidatedFirmware, ManifestError>;
+
+    /// Validate envelope header only (auth + manifest, no payload processing).
+    /// Used by the streaming upload path which processes the payload separately.
+    /// Default implementation falls back to full `validate()`.
+    fn validate_header_only(
+        &self,
+        data: &[u8],
+        min_security_ver: u32,
+    ) -> Result<ValidatedFirmware, ManifestError> {
+        self.validate(data, min_security_ver)
+    }
+
+    /// Access the trust anchor bytes for streaming decryptor setup.
+    fn trust_anchor(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// Access the device key bytes for streaming decryptor setup.
+    fn device_key(&self) -> Option<&[u8]> {
+        None
+    }
 }

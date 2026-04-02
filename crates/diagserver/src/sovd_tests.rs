@@ -18,7 +18,7 @@ use nv_store::types::*;
 
 use sovd_core::DiagnosticBackend;
 
-use crate::backend::VmBackend;
+use crate::backend::{VmBackend, ComponentConfig};
 use crate::manifest_provider::ManifestProvider;
 use crate::ota;
 use crate::sovd::security::TestSecurityProvider;
@@ -67,10 +67,17 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
     let nv = Arc::new(Mutex::new(nv));
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
-    for (id, set) in [("hyp", BankSet::Hypervisor), ("os1", BankSet::Os1), ("os2", BankSet::Os2)] {
+    let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
+        ("hyp", BankSet::Hypervisor, ComponentConfig { entity_type: "hpc".into(), ..ComponentConfig::default() }),
+        ("os1", BankSet::Os1, ComponentConfig::default()),
+        ("os2", BankSet::Os2, ComponentConfig::default()),
+        ("hsm", BankSet::Hsm, ComponentConfig { supports_rollback: false, single_bank: true, entity_type: "hsm".into(), ..ComponentConfig::default() }),
+        ("qtd", BankSet::Qtd, ComponentConfig::default()),
+    ];
+    for (id, set, config) in components {
         backends.insert(
             id.to_string(),
-            Arc::new(VmBackend::new(set, nv.clone(), manifest_provider.clone(), security_provider.clone())),
+            Arc::new(VmBackend::new(set, nv.clone(), manifest_provider.clone(), security_provider.clone(), config)),
         );
     }
 
@@ -208,7 +215,7 @@ async fn list_components() {
     let (status, json) = get(&router, "/vehicle/v1/components").await;
     assert_eq!(status, StatusCode::OK);
     let items = json["items"].as_array().unwrap();
-    assert_eq!(items.len(), 3);
+    assert_eq!(items.len(), 5);
 }
 
 #[tokio::test]
@@ -386,10 +393,10 @@ async fn flash_full_suit_flow() {
     let (status, _) = post_empty(&router, "/vehicle/v1/components/os1/flash/commit").await;
     assert_eq!(status, StatusCode::OK);
 
-    // 6. Verify committed
+    // 6. Verify idle after commit (flash_transfer cleared → Complete)
     let (status, json) = get(&router, "/vehicle/v1/components/os1/flash/activation").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["state"], "committed");
+    assert_eq!(json["state"], "complete");
 }
 
 // ============================================================
@@ -444,7 +451,7 @@ async fn ota_commit_via_sovd() {
         meta.fw_version[..5].copy_from_slice(b"2.0.0");
         meta.fw_secver = 1;
         meta.fw_seq = 1;
-        ota::install(&mut *nv, BankSet::Os1, b"test", &meta).unwrap();
+        ota::install(&mut *nv, BankSet::Os1, b"test", &meta, false).unwrap();
     }
 
     let (_, json) = get(&router, "/vehicle/v1/components/os1/flash/activation").await;
@@ -455,7 +462,7 @@ async fn ota_commit_via_sovd() {
     assert_eq!(status, StatusCode::OK);
 
     let (_, json) = get(&router, "/vehicle/v1/components/os1/flash/activation").await;
-    assert_eq!(json["state"], "committed");
+    assert_eq!(json["state"], "complete"); // idle after commit
 }
 
 #[tokio::test]
@@ -468,7 +475,7 @@ async fn ota_rollback_via_sovd() {
         meta.fw_version[..5].copy_from_slice(b"2.0.0");
         meta.fw_secver = 1;
         meta.fw_seq = 1;
-        ota::install(&mut *nv, BankSet::Os1, b"test", &meta).unwrap();
+        ota::install(&mut *nv, BankSet::Os1, b"test", &meta, false).unwrap();
     }
 
     let (status, _) = post_empty(&router, "/vehicle/v1/components/os1/flash/rollback").await;

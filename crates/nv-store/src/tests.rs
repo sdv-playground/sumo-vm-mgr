@@ -17,6 +17,8 @@ fn boot_state_roundtrip() {
             BankBootState { active_bank: Bank::A, committed: true, boot_count: 0 },
             BankBootState { active_bank: Bank::B, committed: false, boot_count: 7 },
             BankBootState { active_bank: Bank::A, committed: true, boot_count: 0 },
+            BankBootState::default(),
+            BankBootState::default(),
         ],
     };
 

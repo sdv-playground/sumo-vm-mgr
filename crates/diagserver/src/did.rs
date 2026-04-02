@@ -34,6 +34,8 @@ pub const DID_COMMITTED: u16 = 0xFD01;
 pub const DID_MIN_SECURITY_VER: u16 = 0xFD02;
 pub const DID_CURRENT_SECURITY_VER: u16 = 0xFD03;
 pub const DID_BOOT_COUNT: u16 = 0xFD04;
+pub const DID_GUEST_STATE: u16 = 0xFD05;
+pub const DID_HEARTBEAT_SEQ: u16 = 0xFD06;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DidValue {
@@ -56,16 +58,21 @@ impl DidValue {
 }
 
 /// Read a DID for a given bank set. Resolves from Runtime → FW Meta → Factory → Dynamic.
+///
+/// `running_bank`: the bank the ECU is actually running on. This may differ
+/// from NV `active_bank` after install (which stages the next-boot bank).
+/// Pass `None` to use NV active_bank (e.g. during boot before running_bank is known).
 pub fn read_did<D: BlockDevice>(
     nv: &NvStore<D>,
     set: BankSet,
     did: u16,
+    running_bank: Option<Bank>,
 ) -> DidValue {
     let state = match nv.read_boot_state() {
         Some(s) => s,
         None => return DidValue::NotFound,
     };
-    let active = state.banks[set as usize].active_bank;
+    let active = running_bank.unwrap_or(state.banks[set as usize].active_bank);
 
     // 1. Check runtime DIDs (writable, per-bank)
     if let Some(runtime) = nv.read_runtime(set, active) {
@@ -117,7 +124,8 @@ pub fn read_did<D: BlockDevice>(
     let bs = &state.banks[set as usize];
     match did {
         DID_ACTIVE_BANK => {
-            DidValue::Bytes(vec![if bs.active_bank == Bank::A { b'A' } else { b'B' }])
+            // Report the bank we're actually running on, not the staged next-boot bank
+            DidValue::Bytes(vec![if active == Bank::A { b'A' } else { b'B' }])
         }
         DID_COMMITTED => {
             DidValue::Bytes(vec![bs.committed as u8])

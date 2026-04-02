@@ -1,9 +1,11 @@
 /// Core types for the NV store bank management system.
 ///
-/// Three independent A/B bank sets:
+/// Five independent A/B bank sets:
 ///   - Hypervisor (QNX)
 ///   - OS1 (Linux or QNX VM)
 ///   - OS2 (Linux or QNX VM)
+///   - HSM (Hardware Security Module — single-banked, non-rollbackable)
+///   - QTD (QNX Target Partition)
 
 /// Identifies which bank is active within a bank set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,18 +32,20 @@ impl Bank {
     }
 }
 
-/// Identifies which bank set (hypervisor, OS1, OS2).
+/// Identifies which bank set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum BankSet {
     Hypervisor = 0,
     Os1 = 1,
     Os2 = 2,
+    Hsm = 3,
+    Qtd = 4,
 }
 
 impl BankSet {
     pub fn all() -> [BankSet; NUM_BANK_SETS] {
-        [BankSet::Hypervisor, BankSet::Os1, BankSet::Os2]
+        [BankSet::Hypervisor, BankSet::Os1, BankSet::Os2, BankSet::Hsm, BankSet::Qtd]
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
@@ -49,12 +53,14 @@ impl BankSet {
             "hyp" | "hypervisor" => Some(BankSet::Hypervisor),
             "os1" => Some(BankSet::Os1),
             "os2" => Some(BankSet::Os2),
+            "hsm" => Some(BankSet::Hsm),
+            "qtd" => Some(BankSet::Qtd),
             _ => None,
         }
     }
 }
 
-pub const NUM_BANK_SETS: usize = 3;
+pub const NUM_BANK_SETS: usize = 5;
 pub const MAX_TRIAL_BOOTS: u8 = 10;
 
 // NV partition magic numbers (sector validation)
@@ -139,7 +145,7 @@ impl Default for BankBootState {
 
 /// Complete boot state for all bank sets.
 ///
-/// Wire format (24 bytes):
+/// Wire format (28 bytes):
 /// ```text
 /// [0..4]   magic (NVB1)
 /// [4..8]   write_seq
@@ -152,8 +158,13 @@ impl Default for BankBootState {
 /// [14]     os2.active_bank
 /// [15]     os2.committed
 /// [16]     os2.boot_count
-/// [17..20] padding
-/// [20..24] (reserved for sector CRC — NOT part of record)
+/// [17]     hsm.active_bank
+/// [18]     hsm.committed
+/// [19]     hsm.boot_count
+/// [20]     qtd.active_bank
+/// [21]     qtd.committed
+/// [22]     qtd.boot_count
+/// [23..28] padding
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NvBootState {
@@ -165,11 +176,7 @@ impl Default for NvBootState {
     fn default() -> Self {
         Self {
             write_seq: 0,
-            banks: [
-                BankBootState::default(),
-                BankBootState::default(),
-                BankBootState::default(),
-            ],
+            banks: std::array::from_fn(|_| BankBootState::default()),
         }
     }
 }
@@ -178,7 +185,7 @@ impl NvRecord for NvBootState {
     const MAGIC: u32 = MAGIC_BOOT;
 
     fn size() -> usize {
-        20 // 4 magic + 4 seq + 3*3 banks + 3 padding
+        28 // 4 magic + 4 seq + 5*3 banks + 5 padding
     }
 
     fn write_seq(&self) -> u32 {
@@ -198,7 +205,7 @@ impl NvRecord for NvBootState {
             buf[off + 1] = bs.committed as u8;
             buf[off + 2] = bs.boot_count;
         }
-        // [17..20] padding stays zero
+        // [23..28] padding stays zero
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {

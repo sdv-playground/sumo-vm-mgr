@@ -1,0 +1,15 @@
+component_id: ["hsm"]
+vendor_id: "fa6b4a53-d5ad-5fdf-be9d-e4e97d85cd2b"
+class_id: "b1d4e8a2-3f7c-5912-8e4a-6c9d0f2b5e71"
+
+sequence_number: 1
+version: "1.0.0"
+
+spare_part_number: "HSM-SPARE-001"
+ecu_sw_number: "HSM-SW-001"
+supplier_sw_number: "SUP-SW-HSM-001"
+supplier_sw_version: "1.0.0"
+system_name: "HSM-Firmware"
+odx_file_id: "ODX-HSM-V1"
+tester_serial: "FACTORY"
+programming_date: "20260323"

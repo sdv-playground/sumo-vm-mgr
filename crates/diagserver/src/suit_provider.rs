@@ -35,17 +35,28 @@ impl SuitProvider {
         self.device_key = Some(key);
         self
     }
+
+    /// Access the trust anchor bytes (for streaming processor).
+    pub fn trust_anchor(&self) -> &[u8] {
+        &self.trust_anchor
+    }
+
+    /// Access the device key bytes (for streaming processor).
+    pub fn device_key(&self) -> Option<&[u8]> {
+        self.device_key.as_deref()
+    }
 }
 
-impl ManifestProvider for SuitProvider {
-    fn validate(
+impl SuitProvider {
+    /// Validate envelope header only (no payload processing).
+    /// Used by the streaming processor which handles the payload separately.
+    pub fn validate_header_only(
         &self,
         data: &[u8],
         min_security_ver: u32,
     ) -> Result<ValidatedFirmware, ManifestError> {
         let crypto = RustCryptoBackend::new();
 
-        // Build validator with trust anchor and optional device key
         let mut validator = Validator::new(&self.trust_anchor, None);
         if let Some(ref dk) = self.device_key {
             validator.add_device_key(dk).map_err(|e| {
@@ -53,7 +64,6 @@ impl ManifestProvider for SuitProvider {
             })?;
         }
 
-        // Validate envelope: signature, digest
         let manifest = validator
             .validate_envelope(data, &crypto, 0)
             .map_err(|e| match e {
@@ -63,7 +73,6 @@ impl ManifestProvider for SuitProvider {
                 other => ManifestError::ParseError(format!("{other:?}")),
             })?;
 
-        // Check security_version against floor
         let secver = manifest.security_version(0).unwrap_or(0);
         if secver < min_security_ver as u64 {
             return Err(ManifestError::RollbackRejected {
@@ -72,37 +81,14 @@ impl ManifestProvider for SuitProvider {
             });
         }
 
-        // Determine update type from manifest command sequences
-        let has_payload = manifest.has_firmware();
+        Self::extract_metadata(&manifest, secver)
+    }
 
-        let image_data = if has_payload {
-            // Extract integrated payload for the orchestrator's fetch
-            let raw_payload = manifest
-                .integrated_payload(INTEGRATED_PAYLOAD_KEY)
-                .ok_or_else(|| {
-                    ManifestError::ParseError(format!(
-                        "manifest has image_digest but no integrated payload at \"{INTEGRATED_PAYLOAD_KEY}\""
-                    ))
-                })?
-                .to_vec();
-
-            // Run the SUIT orchestrator — handles fetch, decrypt, decompress, verify
-            // (L2 processing uses the orchestrator for streaming crypto;
-            //  L1 campaign sequencing uses sumo-processor)
-            let ops = VmPlatformOps::new(raw_payload);
-            orchestrator::process_image(&validator, &manifest, &ops, &crypto)
-                .map_err(|e| match e {
-                    Sum2Error::DigestMismatch => ManifestError::DigestMismatch,
-                    other => ManifestError::ParseError(format!("orchestrator: {other:?}")),
-                })?;
-
-            ops.take_written()
-        } else {
-            // CRL / policy-only manifest — no payload
-            Vec::new()
-        };
-
-        // --- Map SUIT fields to ImageMeta ---
+    /// Extract metadata from a validated manifest (shared by validate and validate_header_only).
+    fn extract_metadata(
+        manifest: &sumo_onboard::manifest::Manifest,
+        secver: u64,
+    ) -> Result<ValidatedFirmware, ManifestError> {
         let bank_set = manifest
             .component_id(0)
             .and_then(|segments| segments.last())
@@ -155,9 +141,96 @@ impl ManifestProvider for SuitProvider {
         Ok(ValidatedFirmware {
             bank_set,
             image_meta: meta,
-            image_data,
+            image_data: Vec::new(),
             version_display,
+            image_sha256: None,
+            image_size: None,
         })
+    }
+}
+
+impl ManifestProvider for SuitProvider {
+    fn validate(
+        &self,
+        data: &[u8],
+        min_security_ver: u32,
+    ) -> Result<ValidatedFirmware, ManifestError> {
+        let crypto = RustCryptoBackend::new();
+
+        // Build validator with trust anchor and optional device key
+        let mut validator = Validator::new(&self.trust_anchor, None);
+        if let Some(ref dk) = self.device_key {
+            validator.add_device_key(dk).map_err(|e| {
+                ManifestError::ParseError(format!("invalid device key: {e:?}"))
+            })?;
+        }
+
+        // Validate envelope: signature, digest
+        let manifest = validator
+            .validate_envelope(data, &crypto, 0)
+            .map_err(|e| match e {
+                Sum2Error::AuthFailed => {
+                    ManifestError::SignatureInvalid("COSE_Sign1 verification failed".into())
+                }
+                other => ManifestError::ParseError(format!("{other:?}")),
+            })?;
+
+        // Check security_version against floor
+        let secver = manifest.security_version(0).unwrap_or(0);
+        if secver < min_security_ver as u64 {
+            return Err(ManifestError::RollbackRejected {
+                seq: secver,
+                min: min_security_ver as u64,
+            });
+        }
+
+        // Determine update type from manifest command sequences
+        let has_payload = manifest.has_firmware();
+
+        let image_data = if has_payload {
+            // Extract integrated payload for the orchestrator's fetch
+            let raw_payload = manifest
+                .integrated_payload(INTEGRATED_PAYLOAD_KEY)
+                .ok_or_else(|| {
+                    ManifestError::ParseError(format!(
+                        "manifest has image_digest but no integrated payload at \"{INTEGRATED_PAYLOAD_KEY}\""
+                    ))
+                })?
+                .to_vec();
+
+            // Run the SUIT orchestrator — handles fetch, decrypt, decompress, verify
+            let ops = VmPlatformOps::new(raw_payload);
+            orchestrator::process_image(&validator, &manifest, &ops, &crypto)
+                .map_err(|e| match e {
+                    Sum2Error::DigestMismatch => ManifestError::DigestMismatch,
+                    other => ManifestError::ParseError(format!("orchestrator: {other:?}")),
+                })?;
+
+            ops.take_written()
+        } else {
+            // CRL / policy-only manifest — no payload
+            Vec::new()
+        };
+
+        let mut validated = Self::extract_metadata(&manifest, secver)?;
+        validated.image_data = image_data;
+        Ok(validated)
+    }
+
+    fn validate_header_only(
+        &self,
+        data: &[u8],
+        min_security_ver: u32,
+    ) -> Result<ValidatedFirmware, ManifestError> {
+        SuitProvider::validate_header_only(self, data, min_security_ver)
+    }
+
+    fn trust_anchor(&self) -> Option<&[u8]> {
+        Some(SuitProvider::trust_anchor(self))
+    }
+
+    fn device_key(&self) -> Option<&[u8]> {
+        SuitProvider::device_key(self)
     }
 }
 

@@ -145,7 +145,7 @@ fn main() {
     println!("[build] wrote keys to {}", keys_dir.display());
 
     // ---------------------------------------------------------------
-    // 2. Build 4 firmware binaries (content-addressable by SHA-256)
+    // 2. Build firmware binaries (content-addressable by SHA-256)
     // ---------------------------------------------------------------
     println!("\n[build] === Firmware binaries ===");
 
@@ -155,26 +155,32 @@ fn main() {
         digest: [u8; 32],
     }
 
-    let builds: Vec<FwBuild> = ["1.0.0", "1.1.0", "1.2.0", "1.3.0"]
-        .iter()
-        .map(|v| {
-            let (binary, digest) = build_firmware(&crypto);
-            let hash_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-            let fw_path = fw_dir.join(format!("{}.bin", hash_hex));
-            fs::write(&fw_path, &binary).unwrap();
-            println!("[build] v{v} → {} ({} bytes, hash: {}…)",
-                fw_path.display(), binary.len(), &hash_hex[..16]);
-            FwBuild { version: v, binary, digest }
-        })
-        .collect();
+    let build_fw = |component: &'static str, version: &'static str| -> FwBuild {
+        let (binary, digest) = build_firmware(&crypto);
+        let hash_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let fw_path = fw_dir.join(format!("{}.bin", hash_hex));
+        fs::write(&fw_path, &binary).unwrap();
+        println!("[build] {component} v{version} → {} ({} bytes, hash: {}…)",
+            fw_path.display(), binary.len(), &hash_hex[..16]);
+        FwBuild { version, binary, digest }
+    };
+
+    // OS1: upgrade path 1.0.0 → 1.1.0 → 1.2.0 → 1.3.0
+    let os1_builds: Vec<FwBuild> = ["1.0.0", "1.1.0", "1.2.0", "1.3.0"]
+        .iter().map(|v| build_fw("os1", v)).collect();
+
+    // HSM: single-bank firmware
+    let hsm_build = build_fw("hsm", "1.1.0");
+
+    // QTD: A/B banked firmware
+    let qtd_build = build_fw("qtd", "1.1.0");
 
     // ---------------------------------------------------------------
-    // 3. Initial release — all versions get security_version=1
-    //    (freely up/downgradable, A/B testing between any of them)
+    // 3. OS1 release — all versions get security_version=1
     // ---------------------------------------------------------------
-    println!("\n[build] === Initial manifests (secver=1, integrated) ===");
+    println!("\n[build] === OS1 manifests (secver=1, integrated) ===");
 
-    for (i, fw) in builds.iter().enumerate() {
+    for (i, fw) in os1_builds.iter().enumerate() {
         let filename = format!("os1-v{}.suit", fw.version);
         let envelope = sign_integrated_encrypted(
             &signing_key, &sender_key, &device_key,
@@ -189,12 +195,45 @@ fn main() {
     }
 
     // ---------------------------------------------------------------
-    // 4. Security incident — re-sign 1.2.0 and 1.3.0 with secver=2
+    // 4. HSM + QTD manifests
+    // ---------------------------------------------------------------
+    println!("\n[build] === HSM manifest (secver=1, integrated) ===");
+    {
+        let filename = format!("hsm-v{}.suit", hsm_build.version);
+        let envelope = sign_integrated_encrypted(
+            &signing_key, &sender_key, &device_key,
+            "hsm", 1, 1,
+            hsm_build.version, "HSM-Firmware",
+            &format!("HSM-SP-{}", hsm_build.version.replace('.', "")),
+            &hsm_build.binary, &hsm_build.digest,
+        );
+        let path = output_dir.join(&filename);
+        fs::write(&path, &envelope).unwrap();
+        println!("[build] {} ({} bytes, secver=1)", filename, envelope.len());
+    }
+
+    println!("\n[build] === QTD manifest (secver=1, integrated) ===");
+    {
+        let filename = format!("qtd-v{}.suit", qtd_build.version);
+        let envelope = sign_integrated_encrypted(
+            &signing_key, &sender_key, &device_key,
+            "qtd", 1, 1,
+            qtd_build.version, "QTD-QNX",
+            &format!("QTD-SP-{}", qtd_build.version.replace('.', "")),
+            &qtd_build.binary, &qtd_build.digest,
+        );
+        let path = output_dir.join(&filename);
+        fs::write(&path, &envelope).unwrap();
+        println!("[build] {} ({} bytes, secver=1)", filename, envelope.len());
+    }
+
+    // ---------------------------------------------------------------
+    // 5. Security incident — re-sign OS1 1.2.0 and 1.3.0 with secver=2
     //    (reference-only manifests — firmware is in content-addressable store)
     // ---------------------------------------------------------------
-    println!("\n[build] === Re-signed manifests after security incident (secver=2) ===");
+    println!("\n[build] === Re-signed OS1 manifests after security incident (secver=2) ===");
 
-    for (i, fw) in builds.iter().enumerate().skip(2) {
+    for (i, fw) in os1_builds.iter().enumerate().skip(2) {
         // Reference-only (no payload, for content-addressable workflow)
         let filename = format!("os1-v{}-secver2.suit", fw.version);
         let envelope = sign_reference(
@@ -222,7 +261,7 @@ fn main() {
     }
 
     // ---------------------------------------------------------------
-    // 5. CRL manifest — raises floor to 2, blocking 1.0.0 and 1.1.0
+    // 6. CRL manifest — raises floor to 2, blocking 1.0.0 and 1.1.0
     // ---------------------------------------------------------------
     println!("\n[build] === CRL manifest ===");
     let crl = sign_crl(&signing_key, "os1", 100, 2);
@@ -231,26 +270,35 @@ fn main() {
     println!("[build] os1-crl-secver2.suit ({} bytes)", crl.len());
 
     // ---------------------------------------------------------------
-    // 6. Usage
+    // 7. Usage
     // ---------------------------------------------------------------
-    println!("\n=== Test scenarios ===");
+    println!("\n=== Components ===");
     println!();
-    println!("A/B testing (before security incident):");
-    println!("  Flash 1.0.0, commit, flash 1.1.0, commit → both work");
-    println!("  Flash 1.0.0 again → works (same security floor)");
+    println!("  os1  — OS1 Linux VM (A/B banked, rollbackable)");
+    println!("  os2  — OS2 Linux VM (A/B banked, rollbackable)");
+    println!("  hsm  — Hardware Security Module (single-bank, non-rollbackable)");
+    println!("  qtd  — QNX Target Partition (A/B banked, rollbackable)");
+    println!("  hyp  — Hypervisor (A/B banked, rollbackable)");
+    println!();
+    println!("=== Test scenarios ===");
+    println!();
+    println!("Upgrade path (os1):");
+    println!("  Flash 1.1.0 → commit → flash 1.2.0 → commit → flash 1.3.0 → commit");
+    println!();
+    println!("A/B testing:");
+    println!("  Flash 1.3.0 → rollback (stay on 1.2.0) → flash 1.3.0 → commit");
     println!();
     println!("Security incident response:");
     println!("  Flash os1-crl-secver2.suit → raises floor to 2");
     println!("  Flash 1.0.0 → REJECTED (secver 1 < floor 2)");
-    println!("  Flash 1.1.0 → REJECTED (secver 1 < floor 2)");
-    println!("  Flash 1.2.0 (original, secver=1) → REJECTED");
     println!("  Flash os1-v1.2.0-secver2.suit → works (re-signed, secver=2)");
-    println!("  Flash os1-v1.3.0-secver2.suit → works (re-signed, secver=2)");
+    println!();
+    println!("HSM (single-bank):");
+    println!("  Flash hsm-v1.1.0.suit → immediate commit, no rollback available");
     println!();
     println!("Content-addressable workflow:");
     println!("  Re-signed manifests are ~500 bytes (no firmware payload)");
     println!("  Firmware binaries are in example/output/firmware/ (by SHA-256)");
-    println!("  Tester caches firmware locally, receives only manifests from fleet server");
     println!();
     println!("SOVD Explorer → connect to http://localhost:4000");
 }

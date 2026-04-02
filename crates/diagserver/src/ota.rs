@@ -100,6 +100,9 @@ pub struct InstallResult {
 /// 4. Write FW Meta for target bank
 /// 5. Switch active bank to target, enter trial mode
 ///
+/// When `single_bank` is true (e.g. HSM), the image is written to bank A
+/// in-place with immediate commit — no bank swap, no trial mode.
+///
 /// Note: The actual image write to the OS partition is the caller's
 /// responsibility (platform-specific). This function handles NV metadata only.
 pub fn install<D: BlockDevice>(
@@ -107,8 +110,9 @@ pub fn install<D: BlockDevice>(
     set: BankSet,
     image_data: &[u8],
     meta: &ImageMeta,
+    single_bank: bool,
 ) -> Result<InstallResult, OtaError> {
-    let mut state = nv.read_boot_state().ok_or(OtaError::NoBootState)?;
+    let state = nv.read_boot_state().ok_or(OtaError::NoBootState)?;
     let idx = set as usize;
 
     // Precondition: must be committed
@@ -117,7 +121,6 @@ pub fn install<D: BlockDevice>(
     }
 
     let active = state.banks[idx].active_bank;
-    let target = active.other();
 
     // Anti-rollback check
     if let Some(current_meta) = nv.read_fw_meta(set, active) {
@@ -129,51 +132,132 @@ pub fn install<D: BlockDevice>(
         }
     }
 
-    // Copy-on-update: clone runtime DIDs from active → target
-    nv.copy_runtime(set, active, target)?;
-
-    // Compute image hash
+    // Compute image hash and CRC
     let image_sha256: [u8; 32] = Sha256::digest(image_data).into();
-
-    // Compute image CRC
     let fw_crc = crc32fast::hash(image_data);
 
-    // Preserve min_security_ver from active bank
-    let min_security_ver = nv
-        .read_fw_meta(set, active)
-        .map(|m| m.min_security_ver)
-        .unwrap_or(0);
+    install_inner(nv, set, state, idx, active, image_sha256, fw_crc, meta, single_bank)
+}
 
-    // Write FW Meta for target bank
-    let mut fw_meta = NvFwMeta {
-        write_seq: 0,
-        fw_version: meta.fw_version,
-        fw_seq: meta.fw_seq,
-        fw_secver: meta.fw_secver,
-        fw_crc,
-        image_sha256,
-        spare_part_number: meta.spare_part_number,
-        ecu_sw_number: meta.ecu_sw_number,
-        supplier_sw_number: meta.supplier_sw_number,
-        supplier_sw_version: meta.supplier_sw_version,
-        odx_file_id: meta.odx_file_id,
-        system_name: meta.system_name,
-        programming_date: meta.programming_date,
-        tester_serial: meta.tester_serial,
-        min_security_ver,
-    };
-    nv.write_fw_meta(set, target, &mut fw_meta)?;
+/// Install with pre-computed hash (streaming path — image already on disk).
+pub fn install_precomputed<D: BlockDevice>(
+    nv: &mut NvStore<D>,
+    set: BankSet,
+    image_sha256: [u8; 32],
+    image_size: u64,
+    meta: &ImageMeta,
+    single_bank: bool,
+) -> Result<InstallResult, OtaError> {
+    let state = nv.read_boot_state().ok_or(OtaError::NoBootState)?;
+    let idx = set as usize;
 
-    // Switch to target bank, enter trial mode
-    state.banks[idx].active_bank = target;
-    state.banks[idx].committed = false;
-    state.banks[idx].boot_count = 0;
-    nv.write_boot_state(&mut state)?;
+    if !state.banks[idx].committed {
+        return Err(OtaError::InTrial);
+    }
 
-    Ok(InstallResult {
-        target_bank: target,
-        image_sha256,
-    })
+    let active = state.banks[idx].active_bank;
+
+    if let Some(current_meta) = nv.read_fw_meta(set, active) {
+        if meta.fw_secver < current_meta.min_security_ver {
+            return Err(OtaError::SecurityVersionTooLow {
+                image: meta.fw_secver,
+                floor: current_meta.min_security_ver,
+            });
+        }
+    }
+
+    let fw_crc = crc32fast::hash(&image_size.to_le_bytes()); // Placeholder CRC for streamed data
+
+    install_inner(nv, set, state, idx, active, image_sha256, fw_crc, meta, single_bank)
+}
+
+fn install_inner<D: BlockDevice>(
+    nv: &mut NvStore<D>,
+    set: BankSet,
+    mut state: NvBootState,
+    idx: usize,
+    active: Bank,
+    image_sha256: [u8; 32],
+    fw_crc: u32,
+    meta: &ImageMeta,
+    single_bank: bool,
+) -> Result<InstallResult, OtaError> {
+    if single_bank {
+        // Single-bank install (HSM): overwrite bank A in-place, immediate commit
+        let min_security_ver = meta.fw_secver; // raise floor immediately
+
+        let mut fw_meta = NvFwMeta {
+            write_seq: 0,
+            fw_version: meta.fw_version,
+            fw_seq: meta.fw_seq,
+            fw_secver: meta.fw_secver,
+            fw_crc,
+            image_sha256,
+            spare_part_number: meta.spare_part_number,
+            ecu_sw_number: meta.ecu_sw_number,
+            supplier_sw_number: meta.supplier_sw_number,
+            supplier_sw_version: meta.supplier_sw_version,
+            odx_file_id: meta.odx_file_id,
+            system_name: meta.system_name,
+            programming_date: meta.programming_date,
+            tester_serial: meta.tester_serial,
+            min_security_ver,
+        };
+        nv.write_fw_meta(set, Bank::A, &mut fw_meta)?;
+
+        // Keep committed=true, bank A, no trial
+        state.banks[idx].active_bank = Bank::A;
+        state.banks[idx].committed = true;
+        state.banks[idx].boot_count = 0;
+        nv.write_boot_state(&mut state)?;
+
+        Ok(InstallResult {
+            target_bank: Bank::A,
+            image_sha256,
+        })
+    } else {
+        // A/B banked install: write to inactive bank, enter trial mode
+        let target = active.other();
+
+        // Copy-on-update: clone runtime DIDs from active → target
+        nv.copy_runtime(set, active, target)?;
+
+        // Preserve min_security_ver from active bank
+        let min_security_ver = nv
+            .read_fw_meta(set, active)
+            .map(|m| m.min_security_ver)
+            .unwrap_or(0);
+
+        let mut fw_meta = NvFwMeta {
+            write_seq: 0,
+            fw_version: meta.fw_version,
+            fw_seq: meta.fw_seq,
+            fw_secver: meta.fw_secver,
+            fw_crc,
+            image_sha256,
+            spare_part_number: meta.spare_part_number,
+            ecu_sw_number: meta.ecu_sw_number,
+            supplier_sw_number: meta.supplier_sw_number,
+            supplier_sw_version: meta.supplier_sw_version,
+            odx_file_id: meta.odx_file_id,
+            system_name: meta.system_name,
+            programming_date: meta.programming_date,
+            tester_serial: meta.tester_serial,
+            min_security_ver,
+        };
+        nv.write_fw_meta(set, target, &mut fw_meta)?;
+
+        // Switch to target bank, enter trial mode
+        state.banks[idx].active_bank = target;
+        state.banks[idx].committed = false;
+        state.banks[idx].boot_count = 0;
+        nv.write_boot_state(&mut state)?;
+
+        Ok(InstallResult {
+            target_bank: target,
+            image_sha256,
+        })
+    }
 }
 
 /// Commit the current trial bank set.
