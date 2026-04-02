@@ -7,12 +7,3 @@ members = [
     "crates/vm-service",
 ]
 
-[patch."ssh://git@github.com/sdv-playground/SOVDd.git"]
-sovd-core = { path = "../SOVDd/crates/sovd-core" }
-sovd-api = { path = "../SOVDd/crates/sovd-api" }
-
-[patch."ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git"]
-sumo-onboard = { path = "../sumo-rs/sumo-onboard" }
-sumo-processor = { path = "../sumo-rs/sumo-processor" }
-sumo-crypto = { path = "../sumo-rs/sumo-crypto" }
-sumo-codec = { path = "../sumo-rs/sumo-codec" }
