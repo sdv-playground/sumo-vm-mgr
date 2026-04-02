@@ -37,6 +37,7 @@ impl QemuRunner {
         }
     }
 
+    #[allow(dead_code)]
     pub fn qemu_bin(mut self, path: impl Into<PathBuf>) -> Self {
         self.qemu_bin = Some(path.into());
         self
@@ -47,6 +48,7 @@ impl QemuRunner {
         self
     }
 
+    #[allow(dead_code)]
     pub fn try_kvm(mut self, enable: bool) -> Self {
         self.try_kvm = enable;
         self

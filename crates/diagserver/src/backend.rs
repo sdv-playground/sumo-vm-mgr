@@ -94,9 +94,6 @@ pub struct ComponentConfig {
     pub single_bank: bool,
     /// SOVD entity_type for component identity.
     pub entity_type: String,
-    /// Path to ivshmem health shared memory file.
-    /// When set, this component exposes guest_state and heartbeat_seq DIDs.
-    pub health_shm_path: Option<PathBuf>,
 }
 
 impl Default for ComponentConfig {
@@ -105,7 +102,6 @@ impl Default for ComponentConfig {
             supports_rollback: true,
             single_bank: false,
             entity_type: "vm".to_string(),
-            health_shm_path: None,
         }
     }
 }
@@ -141,8 +137,6 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// Set to Transferring during receive_package_stream so the campaign
     /// viewer can see that a firmware download is in progress.
     upload_phase: Mutex<Option<FlashState>>,
-    /// Path to ivshmem health shared memory for guest health DIDs.
-    health_shm_path: Option<PathBuf>,
 }
 
 impl<D: BlockDevice + Send + 'static> VmBackend<D> {
@@ -183,8 +177,6 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             BankSet::Hsm => ("hsm", "HSM", "Hardware Security Module"),
             BankSet::Qtd => ("qtd", "QTD", "QNX Target Partition A/B bank set"),
         };
-
-        let health_shm_path = config.health_shm_path.clone();
 
         // Read the current active bank at startup — this is what we're running on.
         let running_bank = if config.single_bank {
@@ -233,7 +225,6 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             vm_service_socket,
             images_dir,
             upload_phase: Mutex::new(None),
-            health_shm_path,
         }
     }
 
@@ -316,7 +307,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
         let comp_id = &self.entity_info.id;
 
-        let has_health = self.health_shm_path.is_some();
+        let has_health = self.vm_service_socket.is_some();
         let mut params: Vec<ParameterInfo> = DID_REGISTRY
             .iter()
             .filter(|d| has_health || (d.did != did::DID_GUEST_STATE && d.did != did::DID_HEARTBEAT_SEQ))
@@ -367,9 +358,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             let (did_num, reg) = resolve_param(param_id)
                 .ok_or_else(|| BackendError::ParameterNotFound(param_id.clone()))?;
 
-            // Health DIDs — read from shared memory, not NV store
+            // Health DIDs — query vm-service HTTP API
             if did_num == did::DID_GUEST_STATE || did_num == did::DID_HEARTBEAT_SEQ {
-                let health = self.health_shm_path.as_ref().and_then(|p| read_guest_health(p));
+                let health = self.vm_service_socket.as_ref()
+                    .and_then(|sock| query_vm_health(sock, &self.entity_info.id));
                 let (value, raw) = match (did_num, &health) {
                     (did::DID_GUEST_STATE, Some(h)) => {
                         let s = guest_state_str(h.guest_state);
@@ -1237,7 +1229,7 @@ fn map_ota_error(e: ota::OtaError) -> BackendError {
 }
 
 // ---------------------------------------------------------------------------
-// Guest health (ivshmem shared memory)
+// Guest health (via vm-service HTTP API)
 // ---------------------------------------------------------------------------
 
 struct GuestHealth {
@@ -1245,24 +1237,32 @@ struct GuestHealth {
     hb_seq: u32,
 }
 
-/// Read guest health from ivshmem shared memory file.
-/// Layout from cvc-vm-spec vhealth_regs.h: heartbeat at offset 0x800.
-fn read_guest_health(shm_path: &std::path::Path) -> Option<GuestHealth> {
-    const HB_OFFSET: usize = 0x800;
-    const HB_MAGIC: u32 = 0x4842_5448; // "HBTH"
+/// Query vm-service health endpoint via Unix socket.
+/// Returns guest_state and hb_seq from the JSON response.
+fn query_vm_health(socket_path: &std::path::Path, vm_name: &str) -> Option<GuestHealth> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
 
-    let data = std::fs::read(shm_path).ok()?;
-    if data.len() < HB_OFFSET + 0x20 {
-        return None;
-    }
+    let mut stream = UnixStream::connect(socket_path).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
 
-    let magic = u32::from_le_bytes(data[HB_OFFSET..HB_OFFSET + 4].try_into().ok()?);
-    if magic != HB_MAGIC {
-        return None;
-    }
+    let request = format!(
+        "GET /vms/{vm_name}/health HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
 
-    let hb_seq = u32::from_le_bytes(data[HB_OFFSET + 0x08..HB_OFFSET + 0x0C].try_into().ok()?);
-    let guest_state = u32::from_le_bytes(data[HB_OFFSET + 0x0C..HB_OFFSET + 0x10].try_into().ok()?);
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).ok()?;
+    let response = std::str::from_utf8(&buf[..n]).ok()?;
+
+    let body = response.split("\r\n\r\n").nth(1)?;
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+
+    let guest_state = json.get("guest_state")?.as_u64()? as u32;
+    let hb_seq = json.get("hb_seq")?.as_u64()? as u32;
 
     Some(GuestHealth { guest_state, hb_seq })
 }

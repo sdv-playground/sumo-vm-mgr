@@ -39,6 +39,7 @@ impl std::error::Error for RunnerError {}
 
 /// Handle to a running VM.
 pub struct VmHandle {
+    #[allow(dead_code)]
     pub name: String,
     pub pid: Option<u32>,
 }
@@ -54,6 +55,7 @@ pub trait VmRunner: Send {
     fn is_running(&self, handle: &VmHandle) -> bool;
 
     /// Block until the VM exits. Returns the exit code, or None if unknown.
+    #[allow(dead_code)]
     fn wait(&mut self, handle: &VmHandle) -> Result<Option<i32>, RunnerError>;
 
     /// Clean up all host-side resources (ivshmem servers, simulators, sockets).
@@ -61,12 +63,14 @@ pub trait VmRunner: Send {
 
     /// Wait until the VM signals it is ready (e.g., health device heartbeat).
     /// Default: returns immediately (always ready).
+    #[allow(dead_code)]
     fn wait_ready(&mut self, _handle: &VmHandle, _timeout: Duration) -> Result<(), RunnerError> {
         Ok(())
     }
 
     /// Attempt graceful shutdown, then force-kill if still running after timeout.
     /// Default: calls stop() immediately.
+    #[allow(dead_code)]
     fn graceful_shutdown(&mut self, handle: &VmHandle, _timeout: Duration) -> Result<(), RunnerError> {
         self.stop(handle)
     }

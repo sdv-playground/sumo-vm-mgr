@@ -40,6 +40,7 @@ const CMD_SHUTDOWN: u32 = 1;
 /// How long a stale heartbeat is tolerated before declaring unhealthy.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[allow(dead_code)]
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -51,6 +52,16 @@ pub enum HealthStatus {
     ShuttingDown,
     Stopped,
     Unknown,
+}
+
+/// Detailed health information including raw guest heartbeat values.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthDetail {
+    pub status: HealthStatus,
+    /// Guest state from heartbeat register (0=booting, 1=running, 2=degraded, 3=shutting_down).
+    pub guest_state: Option<u32>,
+    /// Heartbeat sequence number (incremented ~1s by guest).
+    pub hb_seq: Option<u32>,
 }
 
 impl std::fmt::Display for HealthStatus {
@@ -87,26 +98,22 @@ impl HealthMonitor {
         }
     }
 
-    /// Read current health status from shared memory.
-    ///
-    /// Checks magic, guest_state, SERVICES_READY flag, and verifies that
-    /// hb_seq is still advancing (guest hasn't crashed/stalled).
-    pub fn status(&mut self) -> HealthStatus {
+    /// Read detailed health from shared memory, including raw guest_state and hb_seq.
+    pub fn detail(&mut self) -> HealthDetail {
         let data = match std::fs::read(&self.shm_path) {
             Ok(d) => d,
-            Err(_) => return HealthStatus::Unknown,
+            Err(_) => return HealthDetail { status: HealthStatus::Unknown, guest_state: None, hb_seq: None },
         };
 
         if data.len() < HB_FLAGS_OFF + 4 {
-            return HealthStatus::Unknown;
+            return HealthDetail { status: HealthStatus::Unknown, guest_state: None, hb_seq: None };
         }
 
         let magic = u32::from_le_bytes(
             data[HB_MAGIC_OFF..HB_MAGIC_OFF + 4].try_into().unwrap(),
         );
         if magic != HB_MAGIC {
-            // Guest driver hasn't written heartbeat yet
-            return HealthStatus::Starting;
+            return HealthDetail { status: HealthStatus::Starting, guest_state: None, hb_seq: None };
         }
 
         let seq = u32::from_le_bytes(
@@ -123,21 +130,23 @@ impl HealthMonitor {
         let now = Instant::now();
         match self.last_seq {
             Some(prev) if prev == seq => {
-                // Seq unchanged — check timeout
                 if let Some(last_change) = self.last_seq_change {
                     if now.duration_since(last_change) > HEARTBEAT_TIMEOUT {
-                        return HealthStatus::Unhealthy;
+                        return HealthDetail {
+                            status: HealthStatus::Unhealthy,
+                            guest_state: Some(guest_state),
+                            hb_seq: Some(seq),
+                        };
                     }
                 }
             }
             _ => {
-                // Seq advanced (or first observation)
                 self.last_seq = Some(seq);
                 self.last_seq_change = Some(now);
             }
         }
 
-        if guest_state == GUEST_STATE_SHUTTING_DOWN {
+        let status = if guest_state == GUEST_STATE_SHUTTING_DOWN {
             HealthStatus::ShuttingDown
         } else if guest_state == GUEST_STATE_RUNNING && (flags & HB_FLAG_SERVICES_READY) != 0 {
             HealthStatus::Running
@@ -145,10 +154,18 @@ impl HealthMonitor {
             HealthStatus::Starting
         } else {
             HealthStatus::Unhealthy
-        }
+        };
+
+        HealthDetail { status, guest_state: Some(guest_state), hb_seq: Some(seq) }
+    }
+
+    /// Read current health status from shared memory.
+    pub fn status(&mut self) -> HealthStatus {
+        self.detail().status
     }
 
     /// Wait until the VM signals readiness.
+    #[allow(dead_code)]
     pub fn wait_ready(&mut self, timeout: Duration, is_running: impl Fn() -> bool) -> Result<(), String> {
         if !self.shm_path.exists() {
             // No health device configured — consider immediately ready
@@ -193,6 +210,7 @@ impl HealthMonitor {
     }
 
     /// Wait for VM to exit after sending shutdown, with timeout.
+    #[allow(dead_code)]
     pub fn wait_shutdown(&self, timeout: Duration, is_running: impl Fn() -> bool) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {

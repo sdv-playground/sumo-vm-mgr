@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::config::{BackendType, VmDefinition, VmServiceConfig};
-use crate::health::{HealthMonitor, HealthStatus};
+use crate::health::{HealthDetail, HealthMonitor, HealthStatus};
 use crate::runner::dummy::DummyRunner;
 use crate::runner::qemu::QemuRunner;
 use crate::runner::qnx::QnxRunner;
@@ -32,6 +32,7 @@ pub struct VmManager {
 /// Returned by `initiate_stop` — carries enough info to wait for exit
 /// without holding the manager lock.
 pub struct StopHandle {
+    #[allow(dead_code)]
     pub name: String,
     pub pid: Option<u32>,
     pub timeout_secs: u64,
@@ -189,6 +190,7 @@ impl VmManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn restart_vm(&mut self, name: &str) -> Result<(), ManagerError> {
         // Stop if running (ignore NotRunning)
         match self.stop_vm(name) {
@@ -198,23 +200,28 @@ impl VmManager {
         self.start_vm(name)
     }
 
+    #[allow(dead_code)]
     pub fn health(&mut self, name: &str) -> Result<HealthStatus, ManagerError> {
+        Ok(self.health_detail(name)?.status)
+    }
+
+    pub fn health_detail(&mut self, name: &str) -> Result<HealthDetail, ManagerError> {
         let vm = self.vms.get_mut(name)
             .ok_or_else(|| ManagerError::NotFound(name.to_string()))?;
 
         let handle = match &vm.handle {
             Some(h) => h,
-            None => return Ok(HealthStatus::Stopped),
+            None => return Ok(HealthDetail { status: HealthStatus::Stopped, guest_state: None, hb_seq: None }),
         };
 
         if !vm.runner.is_running(handle) {
-            return Ok(HealthStatus::Stopped);
+            return Ok(HealthDetail { status: HealthStatus::Stopped, guest_state: None, hb_seq: None });
         }
 
         if let Some(ref mut monitor) = vm.health_monitor {
-            Ok(monitor.status())
+            Ok(monitor.detail())
         } else {
-            Ok(HealthStatus::Running)
+            Ok(HealthDetail { status: HealthStatus::Running, guest_state: None, hb_seq: None })
         }
     }
 

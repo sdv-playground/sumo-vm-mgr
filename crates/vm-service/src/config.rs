@@ -49,6 +49,7 @@ pub struct VmDefinition {
     pub disks: Vec<DiskConfig>,
     /// Health monitoring configuration.
     #[serde(default)]
+    #[allow(dead_code)]
     pub health: Option<HealthConfig>,
     /// Shutdown configuration.
     #[serde(default)]
@@ -96,6 +97,7 @@ pub struct DiskConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct HealthConfig {
     /// Seconds before declaring VM unhealthy.
     #[serde(default = "default_health_timeout")]
@@ -138,6 +140,7 @@ impl VmDefinition {
     }
 
     /// Get SSH port if any network device has one.
+    #[allow(dead_code)]
     pub fn ssh_port(&self) -> Option<u16> {
         self.devices.iter().find_map(|d| match d {
             DeviceConfig::Network { ssh_port, .. } => *ssh_port,

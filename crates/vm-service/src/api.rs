@@ -133,8 +133,12 @@ async fn health_vm(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     let mut mgr = mgr.lock().await;
-    match mgr.health(&name) {
-        Ok(status) => (StatusCode::OK, Json(serde_json::json!({"status": status}))),
+    match mgr.health_detail(&name) {
+        Ok(detail) => (StatusCode::OK, Json(serde_json::json!({
+            "status": detail.status,
+            "guest_state": detail.guest_state,
+            "hb_seq": detail.hb_seq,
+        }))),
         Err(e) => error_response(e),
     }
 }

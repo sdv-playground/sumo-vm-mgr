@@ -102,10 +102,7 @@ async fn main() {
         ("hyp", BankSet::Hypervisor, ComponentConfig {
             entity_type: "hpc".into(), ..ComponentConfig::default()
         }),
-        ("os1", BankSet::Os1, ComponentConfig {
-            health_shm_path: Some(PathBuf::from("/dev/shm/ivshmem-health")),
-            ..ComponentConfig::default()
-        }),
+        ("os1", BankSet::Os1, ComponentConfig::default()),
         ("os2", BankSet::Os2, ComponentConfig::default()),
         ("hsm", BankSet::Hsm, ComponentConfig {
             supports_rollback: false,

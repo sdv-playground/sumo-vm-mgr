@@ -147,6 +147,7 @@ pub(crate) fn write_shm_magic(vm_name: &str, label: &str, magic: u32) {
 }
 
 /// Clean up ivshmem shared memory files for a VM.
+#[allow(dead_code)]
 pub(crate) fn cleanup_shm(vm_name: &str) {
     let prefix = format!("ivshmem-{vm_name}-");
     let _ = std::fs::read_dir("/dev/shm").map(|entries| {
