@@ -12,9 +12,6 @@ use nv_store::types::*;
 use sha2::{Sha256, Digest};
 
 pub mod config;
-pub mod backend;
-pub mod qemu;
-pub mod qnx;
 
 /// Result of processing boot for a single bank set.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,11 +104,11 @@ impl<D: BlockDevice> BootManager<D> {
                 // First boot — initialize default state (all committed to Bank A)
                 let mut default = NvBootState::default();
                 self.nv.write_boot_state(&mut default)?;
-                return Ok([BootAction::FirstBoot, BootAction::FirstBoot, BootAction::FirstBoot]);
+                return Ok(std::array::from_fn(|_| BootAction::FirstBoot));
             }
         };
 
-        let mut actions = [BootAction::FirstBoot, BootAction::FirstBoot, BootAction::FirstBoot];
+        let mut actions: [BootAction; NUM_BANK_SETS] = std::array::from_fn(|_| BootAction::FirstBoot);
         let mut state_changed = false;
 
         for (i, bs) in state.banks.iter_mut().enumerate() {

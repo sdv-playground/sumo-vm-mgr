@@ -7,14 +7,9 @@ edition = "2021"
 nv-store = { path = "../nv-store" }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 toml = "0.8"
-libc = "0.2"
-ctrlc = "3"
 
 [[bin]]
 name = "vm-boot"
 path = "src/main.rs"
-
-[[bin]]
-name = "vm-runner"
-path = "src/bin/runner.rs"

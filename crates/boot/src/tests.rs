@@ -5,7 +5,6 @@ use sha2::{Sha256, Digest};
 
 use crate::*;
 use crate::config::*;
-use crate::backend::BootBackend;
 
 fn make_bootmgr() -> BootManager<MemBlockDevice> {
     BootManager::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize))
@@ -557,140 +556,114 @@ interface = "can0"
 }
 
 // ============================================================
-// QEMU backend command generation tests
+// YAML config parsing tests
 // ============================================================
 
-#[test]
-fn qemu_build_command_minimal() {
-    let toml = r#"
-[vm]
-bank_set = "os1"
-ram_mb = 1024
-cpus = 2
-kernel = "Image"
+use crate::config::VmMgrConfig;
 
-[[devices]]
-type = "network"
-ssh_port = 2222
+#[test]
+fn parse_yaml_config() {
+    let yaml = r#"
+nv_store: /tmp/test-nv.bin
+images_dir: /opt/images
+
+components:
+  os1:
+    bank_set: os1
+    backend: qemu
+    profile: profiles/os1.toml
+    shutdown:
+      timeout_secs: 15
+      method: health
+    readiness:
+      method: health
+      timeout_secs: 30
+  os2:
+    bank_set: os2
+    backend: dummy
+  hsm:
+    bank_set: hsm
+    backend: dummy
+    single_bank: true
 "#;
 
-    let profile = VmProfile::from_toml(toml).unwrap();
-    let backend = qemu::QemuBackend::new().try_kvm(false);
-    let cmd = backend.build_command(&profile, BankSet::Os1, Bank::A, Path::new("/images")).unwrap();
+    let config = VmMgrConfig::from_yaml(yaml).unwrap();
+    assert_eq!(config.nv_store.to_str().unwrap(), "/tmp/test-nv.bin");
+    assert_eq!(config.images_dir.to_str().unwrap(), "/opt/images");
+    assert_eq!(config.components.len(), 3);
 
-    // Check key args are present
-    assert!(cmd.contains(&"-machine".to_string()));
-    assert!(cmd.contains(&"virt,gic-version=3".to_string()));
-    assert!(cmd.contains(&"-cpu".to_string()));
-    assert!(cmd.contains(&"cortex-a76".to_string()));
-    assert!(cmd.contains(&"-m".to_string()));
-    assert!(cmd.contains(&"1024M".to_string()));
-    assert!(cmd.contains(&"-smp".to_string()));
-    assert!(cmd.contains(&"2".to_string()));
-    assert!(cmd.contains(&"-nographic".to_string()));
-    assert!(cmd.contains(&"-kernel".to_string()));
+    let os1 = &config.components["os1"];
+    assert_eq!(os1.bank_set, "os1");
+    assert_eq!(os1.backend, "qemu");
+    assert_eq!(os1.profile.as_ref().unwrap().to_str().unwrap(), "profiles/os1.toml");
+    assert!(!os1.single_bank);
+    assert_eq!(os1.shutdown.as_ref().unwrap().timeout_secs, 15);
+    assert_eq!(os1.readiness.as_ref().unwrap().timeout_secs, 30);
 
-    // Rootfs image should reference the bank
-    let rootfs_arg = cmd.iter().find(|a| a.contains("os1-a.img")).unwrap();
-    assert!(rootfs_arg.contains("/images/os1-a.img"));
+    let os2 = &config.components["os2"];
+    assert_eq!(os2.backend, "dummy");
+    assert!(os2.profile.is_none());
 
-    // SSH port forwarding
-    let netdev = cmd.iter().find(|a| a.contains("hostfwd")).unwrap();
-    assert!(netdev.contains("2222"));
+    let hsm = &config.components["hsm"];
+    assert!(hsm.single_bank);
 }
 
 #[test]
-fn qemu_build_command_bank_b() {
-    let toml = r#"
-[vm]
-bank_set = "os1"
-kernel = "Image"
+fn parse_yaml_config_defaults() {
+    let yaml = r#"
+nv_store: /tmp/nv.bin
+images_dir: /images
 
-[[devices]]
-type = "network"
+components:
+  os1:
+    bank_set: os1
 "#;
 
-    let profile = VmProfile::from_toml(toml).unwrap();
-    let backend = qemu::QemuBackend::new().try_kvm(false);
-    let cmd = backend.build_command(&profile, BankSet::Os1, Bank::B, Path::new("/images")).unwrap();
-
-    // Should use bank B image
-    assert!(cmd.iter().any(|a| a.contains("os1-b.img")));
-    assert!(!cmd.iter().any(|a| a.contains("os1-a.img")));
+    let config = VmMgrConfig::from_yaml(yaml).unwrap();
+    let os1 = &config.components["os1"];
+    assert_eq!(os1.backend, "dummy"); // default backend
+    assert!(!os1.single_bank);
+    assert!(os1.shutdown.is_none());
+    assert!(os1.readiness.is_none());
 }
 
 #[test]
-fn qemu_build_command_with_ivshmem() {
-    let toml = r#"
-[vm]
-bank_set = "os1"
-kernel = "Image"
+fn device_needs_ivshmem() {
+    use crate::config::DeviceConfig;
 
-[[devices]]
-type = "can"
-index = 0
-backend = "simulated"
+    // Health and Time always need ivshmem
+    assert!(DeviceConfig::Health { backend: "simulated".into() }.needs_ivshmem());
+    assert!(DeviceConfig::Health { backend: "native".into() }.needs_ivshmem());
+    assert!(DeviceConfig::Time { backend: "simulated".into() }.needs_ivshmem());
+    assert!(DeviceConfig::Time { backend: "native".into() }.needs_ivshmem());
 
-[[devices]]
-type = "health"
-backend = "simulated"
+    // CAN needs ivshmem unless host-passthrough
+    assert!(DeviceConfig::Can { index: 0, backend: "simulated".into(), interface: None }.needs_ivshmem());
+    assert!(DeviceConfig::Can { index: 0, backend: "native".into(), interface: None }.needs_ivshmem());
+    assert!(!DeviceConfig::Can { index: 0, backend: "host-passthrough".into(), interface: Some("vcan0".into()) }.needs_ivshmem());
 
-[[devices]]
-type = "time"
-backend = "simulated"
-
-[[devices]]
-type = "network"
-"#;
-
-    let profile = VmProfile::from_toml(toml).unwrap();
-    let backend = qemu::QemuBackend::new().try_kvm(false);
-    let cmd = backend.build_command(&profile, BankSet::Os1, Bank::A, Path::new("/images")).unwrap();
-
-    // Should have ivshmem-doorbell for each simulated device
-    let doorbell_count = cmd.iter().filter(|a| a.contains("ivshmem-doorbell")).count();
-    assert_eq!(doorbell_count, 3); // can0, health, time
-
-    // Kernel cmdline should have CAN params
-    let append_idx = cmd.iter().position(|a| a == "-append").unwrap();
-    let cmdline = &cmd[append_idx + 1];
-    assert!(cmdline.contains("vcan_shm.backend=ivshmem"));
-    assert!(cmdline.contains("vcan_shm.num_devices=1"));
+    // HSM, Network, Disk, Console never need ivshmem
+    assert!(!DeviceConfig::Hsm { backend: "vsock".into(), keystore: None }.needs_ivshmem());
+    assert!(!DeviceConfig::Network { mac: None, ssh_port: None }.needs_ivshmem());
+    assert!(!DeviceConfig::Disk { role: "data".into(), path: "d.img".into(), readonly: false }.needs_ivshmem());
+    assert!(!DeviceConfig::Console.needs_ivshmem());
 }
 
 #[test]
-fn qemu_build_command_with_disks() {
-    let toml = r#"
-[vm]
-bank_set = "os1"
-kernel = "Image"
+fn device_needs_simulator() {
+    use crate::config::DeviceConfig;
 
-[[devices]]
-type = "disk"
-role = "swap"
-path = "swap.img"
+    // Only "simulated" backend needs a simulator
+    assert!(DeviceConfig::Health { backend: "simulated".into() }.needs_simulator());
+    assert!(!DeviceConfig::Health { backend: "native".into() }.needs_simulator());
+    assert!(DeviceConfig::Time { backend: "simulated".into() }.needs_simulator());
+    assert!(!DeviceConfig::Time { backend: "native".into() }.needs_simulator());
+    assert!(DeviceConfig::Can { index: 0, backend: "simulated".into(), interface: None }.needs_simulator());
+    assert!(!DeviceConfig::Can { index: 0, backend: "native".into(), interface: None }.needs_simulator());
+    assert!(!DeviceConfig::Can { index: 0, backend: "host-passthrough".into(), interface: Some("vcan0".into()) }.needs_simulator());
 
-[[devices]]
-type = "disk"
-role = "data"
-path = "data.img"
-
-[[devices]]
-type = "network"
-"#;
-
-    let profile = VmProfile::from_toml(toml).unwrap();
-    let backend = qemu::QemuBackend::new().try_kvm(false);
-    let cmd = backend.build_command(&profile, BankSet::Os1, Bank::A, Path::new("/images")).unwrap();
-
-    // Should have drives for swap, data, and rootfs
-    let drive_count = cmd.iter().filter(|a| a.starts_with("file=")).count();
-    assert!(drive_count >= 3);
-
-    // Cmdline should have resume= for swap
-    let append_idx = cmd.iter().position(|a| a == "-append").unwrap();
-    let cmdline = &cmd[append_idx + 1];
-    assert!(cmdline.contains("resume=/dev/vdc"));
+    // Non-ivshmem devices never need a simulator (via this method)
+    assert!(!DeviceConfig::Hsm { backend: "vsock".into(), keystore: None }.needs_simulator());
+    assert!(!DeviceConfig::Network { mac: None, ssh_port: None }.needs_simulator());
+    assert!(!DeviceConfig::Console.needs_simulator());
 }
-
-use std::path::Path;

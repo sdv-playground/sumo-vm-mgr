@@ -7,6 +7,7 @@
 /// - Session/security mode control
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -19,6 +20,7 @@ use nv_store::types::*;
 use sovd_core::backend::*;
 use sovd_core::error::{BackendError, BackendResult};
 use sovd_core::models::*;
+use sovd_core::PackageStream;
 
 use crate::did;
 use crate::manifest_provider::{ManifestProvider, ValidatedFirmware};
@@ -81,6 +83,34 @@ struct FlashTransferState {
 }
 
 // ---------------------------------------------------------------------------
+// Component configuration
+// ---------------------------------------------------------------------------
+
+/// Per-component configuration for VmBackend behavior.
+pub struct ComponentConfig {
+    /// Whether this component supports rollback (false for HSM).
+    pub supports_rollback: bool,
+    /// Whether this component is single-banked (true for HSM — always bank A).
+    pub single_bank: bool,
+    /// SOVD entity_type for component identity.
+    pub entity_type: String,
+    /// Path to ivshmem health shared memory file.
+    /// When set, this component exposes guest_state and heartbeat_seq DIDs.
+    pub health_shm_path: Option<PathBuf>,
+}
+
+impl Default for ComponentConfig {
+    fn default() -> Self {
+        Self {
+            supports_rollback: true,
+            single_bank: false,
+            entity_type: "vm".to_string(),
+            health_shm_path: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VmBackend
 // ---------------------------------------------------------------------------
 
@@ -88,14 +118,31 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     entity_info: EntityInfo,
     capabilities: Capabilities,
     bank_set: BankSet,
+    config: ComponentConfig,
     nv: Arc<Mutex<NvStore<D>>>,
     manifest_provider: Arc<dyn ManifestProvider>,
     security_provider: Arc<dyn SecurityProvider>,
     packages: Mutex<HashMap<String, StoredPackage>>,
     flash_transfer: Mutex<Option<FlashTransferState>>,
+    /// The bank the ECU is actually running on. Only changes on ecu_reset().
+    /// NV active_bank may differ after install (it's the "next boot" bank).
+    running_bank: Mutex<Bank>,
     session: Mutex<SessionState>,
     security: Mutex<SecurityAccessState>,
     next_id: Mutex<u64>,
+    /// Optional Unix socket path for vm-service control API.
+    /// When set, ecu_reset() POSTs to vm-service to restart the VM.
+    vm_service_socket: Option<PathBuf>,
+    /// Optional images directory — when set, firmware payloads are written
+    /// to {images_dir}/{set}-{bank}.img during flash. Required for real
+    /// image-based OTA (e.g. QEMU rootfs swap).
+    images_dir: Option<PathBuf>,
+    /// Tracks upload phase for activation state reporting.
+    /// Set to Transferring during receive_package_stream so the campaign
+    /// viewer can see that a firmware download is in progress.
+    upload_phase: Mutex<Option<FlashState>>,
+    /// Path to ivshmem health shared memory for guest health DIDs.
+    health_shm_path: Option<PathBuf>,
 }
 
 impl<D: BlockDevice + Send + 'static> VmBackend<D> {
@@ -104,18 +151,56 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         nv: Arc<Mutex<NvStore<D>>>,
         manifest_provider: Arc<dyn ManifestProvider>,
         security_provider: Arc<dyn SecurityProvider>,
+        config: ComponentConfig,
+    ) -> Self {
+        Self::with_options(bank_set, nv, manifest_provider, security_provider, config, None, None)
+    }
+
+    pub fn with_vm_service(
+        bank_set: BankSet,
+        nv: Arc<Mutex<NvStore<D>>>,
+        manifest_provider: Arc<dyn ManifestProvider>,
+        security_provider: Arc<dyn SecurityProvider>,
+        config: ComponentConfig,
+        vm_service_socket: Option<PathBuf>,
+    ) -> Self {
+        Self::with_options(bank_set, nv, manifest_provider, security_provider, config, vm_service_socket, None)
+    }
+
+    pub fn with_options(
+        bank_set: BankSet,
+        nv: Arc<Mutex<NvStore<D>>>,
+        manifest_provider: Arc<dyn ManifestProvider>,
+        security_provider: Arc<dyn SecurityProvider>,
+        config: ComponentConfig,
+        vm_service_socket: Option<PathBuf>,
+        images_dir: Option<PathBuf>,
     ) -> Self {
         let (id, name, desc) = match bank_set {
             BankSet::Hypervisor => ("hyp", "Hypervisor", "Hypervisor A/B bank set"),
             BankSet::Os1 => ("os1", "OS1", "Primary OS VM A/B bank set"),
             BankSet::Os2 => ("os2", "OS2", "Secondary OS VM A/B bank set"),
+            BankSet::Hsm => ("hsm", "HSM", "Hardware Security Module"),
+            BankSet::Qtd => ("qtd", "QTD", "QNX Target Partition A/B bank set"),
+        };
+
+        let health_shm_path = config.health_shm_path.clone();
+
+        // Read the current active bank at startup — this is what we're running on.
+        let running_bank = if config.single_bank {
+            Bank::A // single-banked components always run on bank A
+        } else {
+            let nv_guard = nv.lock().unwrap();
+            nv_guard.read_boot_state()
+                .map(|s| s.banks[bank_set as usize].active_bank)
+                .unwrap_or(Bank::A)
         };
 
         Self {
             entity_info: EntityInfo {
                 id: id.to_string(),
                 name: name.to_string(),
-                entity_type: "vm".to_string(),
+                entity_type: config.entity_type.clone(),
                 description: Some(desc.to_string()),
                 href: format!("/vehicle/v1/components/{id}"),
                 status: None,
@@ -135,14 +220,20 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 operations: false,
             },
             bank_set,
+            config,
             nv,
             manifest_provider,
             security_provider,
             packages: Mutex::new(HashMap::new()),
             flash_transfer: Mutex::new(None),
+            running_bank: Mutex::new(running_bank),
             session: Mutex::new(SessionState::Default),
             security: Mutex::new(SecurityAccessState::default()),
             next_id: Mutex::new(1),
+            vm_service_socket,
+            images_dir,
+            upload_phase: Mutex::new(None),
+            health_shm_path,
         }
     }
 
@@ -169,6 +260,40 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let end = data.iter().position(|&c| c == 0).unwrap_or(data.len());
         String::from_utf8_lossy(&data[..end]).to_string()
     }
+
+    /// Send a restart request to vm-service over its Unix socket.
+    async fn notify_vm_service(socket_path: &std::path::Path, vm_name: &str) -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::UnixStream::connect(socket_path)
+            .await
+            .map_err(|e| format!("connect to vm-service: {e}"))?;
+
+        let request = format!(
+            "POST /vms/{vm_name}/restart HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\
+             \r\n"
+        );
+
+        stream.write_all(request.as_bytes())
+            .await
+            .map_err(|e| format!("write to vm-service: {e}"))?;
+
+        // Read response (just check status line)
+        let mut buf = vec![0u8; 256];
+        let n = stream.read(&mut buf)
+            .await
+            .map_err(|e| format!("read from vm-service: {e}"))?;
+
+        let response = String::from_utf8_lossy(&buf[..n]);
+        if response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200") {
+            Ok(())
+        } else {
+            Err(format!("vm-service returned: {}", response.lines().next().unwrap_or("empty")))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,8 +316,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
         let comp_id = &self.entity_info.id;
 
+        let has_health = self.health_shm_path.is_some();
         let mut params: Vec<ParameterInfo> = DID_REGISTRY
             .iter()
+            .filter(|d| has_health || (d.did != did::DID_GUEST_STATE && d.did != did::DID_HEARTBEAT_SEQ))
             .map(|d| ParameterInfo {
                 id: d.id.to_string(),
                 name: d.name.to_string(),
@@ -206,8 +333,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             .collect();
 
         // Add runtime DIDs
-        if let Some(bs) = nv.read_boot_state() {
-            let active = bs.banks[self.bank_set as usize].active_bank;
+        {
+            let active = *self.running_bank.lock().unwrap();
             if let Some(runtime) = nv.read_runtime(self.bank_set, active) {
                 for i in 0..runtime.did_count as usize {
                     let did_num = runtime.dids[i].did;
@@ -240,7 +367,41 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             let (did_num, reg) = resolve_param(param_id)
                 .ok_or_else(|| BackendError::ParameterNotFound(param_id.clone()))?;
 
-            let result = did::read_did(&*nv, self.bank_set, did_num);
+            // Health DIDs — read from shared memory, not NV store
+            if did_num == did::DID_GUEST_STATE || did_num == did::DID_HEARTBEAT_SEQ {
+                let health = self.health_shm_path.as_ref().and_then(|p| read_guest_health(p));
+                let (value, raw) = match (did_num, &health) {
+                    (did::DID_GUEST_STATE, Some(h)) => {
+                        let s = guest_state_str(h.guest_state);
+                        (serde_json::Value::String(s.to_string()), format!("{:08x}", h.guest_state))
+                    }
+                    (did::DID_GUEST_STATE, None) => {
+                        (serde_json::Value::String("offline".to_string()), "ffffffff".to_string())
+                    }
+                    (did::DID_HEARTBEAT_SEQ, Some(h)) => {
+                        (serde_json::json!(h.hb_seq), format!("{:08x}", h.hb_seq))
+                    }
+                    (did::DID_HEARTBEAT_SEQ, None) => {
+                        (serde_json::json!(0), "00000000".to_string())
+                    }
+                    _ => unreachable!(),
+                };
+                let name = reg.map(|r| r.name).unwrap_or(param_id.as_str());
+                values.push(DataValue {
+                    id: param_id.clone(),
+                    name: name.to_string(),
+                    value,
+                    unit: None,
+                    timestamp: Utc::now(),
+                    raw: Some(raw),
+                    did: Some(format!("{:04X}", did_num)),
+                    length: Some(4),
+                });
+                continue;
+            }
+
+            let rb = *self.running_bank.lock().unwrap();
+            let result = did::read_did(&*nv, self.bank_set, did_num, Some(rb));
             match result {
                 did::DidValue::Bytes(bytes) => {
                     let value = did_value_to_json(did_num, &bytes, reg);
@@ -291,8 +452,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
     async fn get_faults(&self, _filter: Option<&FaultFilter>) -> BackendResult<FaultsResult> {
         let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
-        let bs = nv.read_boot_state().ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-        let active = bs.banks[self.bank_set as usize].active_bank;
+        let active = *self.running_bank.lock().unwrap();
         let runtime = nv.read_runtime(self.bank_set, active).unwrap_or_default();
 
         let faults: Vec<Fault> = (0..runtime.dtc_count as usize)
@@ -324,8 +484,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
     async fn clear_faults(&self, _group: Option<u32>) -> BackendResult<ClearFaultsResult> {
         let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
-        let bs = nv.read_boot_state().ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-        let active = bs.banks[self.bank_set as usize].active_bank;
+        let active = *self.running_bank.lock().unwrap();
         let mut runtime = nv.read_runtime(self.bank_set, active).unwrap_or_default();
 
         let cleared = runtime.dtc_count as u32;
@@ -363,11 +522,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
         let min_security_ver = {
             let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
-            nv.read_boot_state()
-                .and_then(|bs| {
-                    let active = bs.banks[self.bank_set as usize].active_bank;
-                    nv.read_fw_meta(self.bank_set, active).map(|m| m.min_security_ver)
-                })
+            let rb = *self.running_bank.lock().unwrap();
+            nv.read_fw_meta(self.bank_set, rb)
+                .map(|m| m.min_security_ver)
                 .unwrap_or(0)
         };
 
@@ -381,6 +538,84 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 "manifest targets {:?}, but this is {:?}",
                 validated.bank_set, self.bank_set
             )));
+        }
+
+        let id = self.next_id();
+        let mut packages = self.packages.lock().unwrap();
+        packages.insert(
+            id.clone(),
+            StoredPackage {
+                id: id.clone(),
+                validated,
+                status: PackageStatus::Verified,
+            },
+        );
+
+        Ok(id)
+    }
+
+    async fn receive_package_stream(
+        &self,
+        stream: PackageStream,
+        content_length: Option<u64>,
+    ) -> BackendResult<String> {
+        self.require_flash_access()?;
+
+        let min_security_ver = {
+            let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let rb = *self.running_bank.lock().unwrap();
+            nv.read_fw_meta(self.bank_set, rb)
+                .map(|m| m.min_security_ver)
+                .unwrap_or(0)
+        };
+
+        tracing::info!(
+            bank_set = ?self.bank_set,
+            content_length = ?content_length,
+            "streaming package upload started"
+        );
+
+        // Create a transfer entry so the viewer can see the upload in progress
+        let transfer_id = self.next_id();
+        {
+            let mut ft = self.flash_transfer.lock().unwrap();
+            *ft = Some(FlashTransferState {
+                transfer_id: transfer_id.clone(),
+                package_id: String::new(), // not yet known
+                state: FlashState::Transferring,
+                image_size: content_length.unwrap_or(0),
+            });
+        }
+
+        // Signal upload in progress so activation state shows Transferring
+        *self.upload_phase.lock().unwrap() = Some(FlashState::Transferring);
+
+        let validated = match crate::streaming::process_envelope_stream(
+            stream,
+            self.manifest_provider.as_ref(),
+            min_security_ver,
+            self.images_dir.as_deref(),
+            self.bank_set,
+        )
+        .await {
+            Ok(v) => v,
+            Err(e) => {
+                *self.upload_phase.lock().unwrap() = None;
+                let mut ft = self.flash_transfer.lock().unwrap();
+                if let Some(ref mut t) = *ft {
+                    t.state = FlashState::Failed;
+                }
+                return Err(e);
+            }
+        };
+
+        // Upload complete — clear upload phase, update transfer to Preparing
+        *self.upload_phase.lock().unwrap() = None;
+        {
+            let mut ft = self.flash_transfer.lock().unwrap();
+            if let Some(ref mut t) = *ft {
+                t.state = FlashState::Preparing;
+            }
         }
 
         let id = self.next_id();
@@ -458,22 +693,33 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     async fn start_flash(&self, package_id: &str) -> BackendResult<String> {
         self.require_flash_access()?;
 
-        let (meta, image_data, image_size) = {
+        let (meta, image_data, image_size, pre_sha256, pre_size) = {
             let packages = self.packages.lock().unwrap();
             let p = packages
                 .get(package_id)
                 .ok_or_else(|| BackendError::EntityNotFound(package_id.to_string()))?;
-            let size = p.validated.image_data.len() as u64;
-            (p.validated.image_meta.clone(), p.validated.image_data.clone(), size)
+            let size = if let Some(s) = p.validated.image_size {
+                s
+            } else {
+                p.validated.image_data.len() as u64
+            };
+            (
+                p.validated.image_meta.clone(),
+                p.validated.image_data.clone(),
+                size,
+                p.validated.image_sha256,
+                p.validated.image_size,
+            )
         };
 
-        let is_crl = image_data.is_empty();
+        // Streaming path: image_data is empty but image was already written to disk
+        let is_streamed = image_data.is_empty() && pre_sha256.is_some();
+        let is_crl = image_data.is_empty() && pre_sha256.is_none();
 
         if is_crl {
             // CRL / security-floor-only manifest — raise floor without flashing.
             let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
-            let bs = nv.read_boot_state().ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-            let active = bs.banks[self.bank_set as usize].active_bank;
+            let active = *self.running_bank.lock().unwrap();
             if let Some(mut fw_meta) = nv.read_fw_meta(self.bank_set, active) {
                 if meta.fw_secver > fw_meta.min_security_ver {
                     fw_meta.min_security_ver = meta.fw_secver;
@@ -481,26 +727,105 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                         .map_err(|e| BackendError::Internal(format!("NV write: {e}")))?;
                 }
             }
-        } else {
-            // Normal firmware flash — install to target bank
+        } else if is_streamed {
+            // Streaming path — image already written to staged file, use pre-computed hash
             let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
-            ota::install(&mut *nv, self.bank_set, &image_data, &meta)
+            let result = ota::install_precomputed(
+                &mut *nv,
+                self.bank_set,
+                pre_sha256.unwrap(),
+                pre_size.unwrap_or(0),
+                &meta,
+                self.config.single_bank,
+            )
+            .map_err(map_ota_error)?;
+
+            // Rename staged file to target bank image
+            if let Some(ref images_dir) = self.images_dir {
+                let set_name = match self.bank_set {
+                    BankSet::Hypervisor => "hyp",
+                    BankSet::Os1 => "os1",
+                    BankSet::Os2 => "os2",
+                    BankSet::Hsm => "hsm",
+                    BankSet::Qtd => "qtd",
+                };
+                let bank_name = match result.target_bank {
+                    Bank::A => "a",
+                    Bank::B => "b",
+                };
+                let staged_path = images_dir.join(format!("{set_name}-staged.img"));
+                let target_path = images_dir.join(format!("{set_name}-{bank_name}.img"));
+                if staged_path.exists() {
+                    std::fs::rename(&staged_path, &target_path).map_err(|e| {
+                        BackendError::Internal(format!(
+                            "failed to rename {} → {}: {e}",
+                            staged_path.display(),
+                            target_path.display()
+                        ))
+                    })?;
+                    tracing::info!(
+                        "renamed {} → {}",
+                        staged_path.display(),
+                        target_path.display()
+                    );
+                }
+            }
+        } else {
+            // Buffered path — install from memory
+            let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let result = ota::install(&mut *nv, self.bank_set, &image_data, &meta, self.config.single_bank)
                 .map_err(map_ota_error)?;
+
+            // Write firmware payload to bank image file (real rootfs OTA)
+            if let Some(ref images_dir) = self.images_dir {
+                let set_name = match self.bank_set {
+                    BankSet::Hypervisor => "hyp",
+                    BankSet::Os1 => "os1",
+                    BankSet::Os2 => "os2",
+                    BankSet::Hsm => "hsm",
+                    BankSet::Qtd => "qtd",
+                };
+                let bank_name = match result.target_bank {
+                    Bank::A => "a",
+                    Bank::B => "b",
+                };
+                let image_path = images_dir.join(format!("{set_name}-{bank_name}.img"));
+                tracing::info!(
+                    "writing {} bytes to {}",
+                    image_data.len(),
+                    image_path.display()
+                );
+                std::fs::write(&image_path, &image_data).map_err(|e| {
+                    BackendError::Internal(format!(
+                        "failed to write image to {}: {e}",
+                        image_path.display()
+                    ))
+                })?;
+            }
         }
 
-        let transfer_id = self.next_id();
         if !is_crl {
             let mut ft = self.flash_transfer.lock().unwrap();
+            if let Some(ref mut t) = *ft {
+                // Reuse existing transfer from streaming upload path
+                t.package_id = package_id.to_string();
+                t.state = FlashState::AwaitingExit;
+                t.image_size = image_size;
+                return Ok(t.transfer_id.clone());
+            }
+            // Buffered path — create new transfer
+            let transfer_id = self.next_id();
             *ft = Some(FlashTransferState {
                 transfer_id: transfer_id.clone(),
                 package_id: package_id.to_string(),
-                state: FlashState::Complete,
+                state: FlashState::AwaitingExit,
                 image_size,
             });
+            return Ok(transfer_id);
         }
         // CRL: no flash transfer state — floor already applied, nothing to poll/finalize/commit
 
-        Ok(transfer_id)
+        Ok(self.next_id())
     }
 
     async fn get_flash_status(&self, transfer_id: &str) -> BackendResult<FlashStatus> {
@@ -531,11 +856,49 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn ecu_reset(&self, _reset_type: u8) -> BackendResult<Option<u8>> {
-        // VM "reset" — advance flash state to Activated
-        let mut ft = self.flash_transfer.lock().unwrap();
-        if let Some(ref mut t) = *ft {
-            t.state = FlashState::Activated;
+        // VM "reset" — simulate reboot:
+        // 1. Switch running_bank to NV active_bank (the bank install() staged)
+        // 2. Increment boot_count for trial mode (like process_boot())
+        // 3. Advance flash state to Activated
+        // 4. Reset session and security (ISO 14229)
+
+        if !self.config.single_bank {
+            let idx = self.bank_set as usize;
+            let mut nv = self.nv.lock().unwrap();
+            if let Some(mut state) = nv.read_boot_state() {
+                // Switch to the staged bank
+                *self.running_bank.lock().unwrap() = state.banks[idx].active_bank;
+
+                // Simulate process_boot(): increment boot_count in trial mode
+                if !state.banks[idx].committed {
+                    state.banks[idx].boot_count += 1;
+                    let _ = nv.write_boot_state(&mut state);
+                }
+            }
         }
+        // Single-bank components: no bank switch, always bank A, always committed
+
+        // Advance flash state
+        {
+            let mut ft = self.flash_transfer.lock().unwrap();
+            if let Some(ref mut t) = *ft {
+                t.state = FlashState::Activated;
+            }
+        }
+
+        // Reset session and security (ISO 14229)
+        *self.session.lock().unwrap() = SessionState::Default;
+        *self.security.lock().unwrap() = SecurityAccessState::default();
+
+        // Signal vm-service to restart the VM (if wired up)
+        if let Some(ref socket_path) = self.vm_service_socket {
+            let id = &self.entity_info.id;
+            match Self::notify_vm_service(socket_path, id).await {
+                Ok(()) => tracing::info!("vm-service restart requested for {id}"),
+                Err(e) => tracing::warn!("failed to notify vm-service for {id}: {e}"),
+            }
+        }
+
         Ok(None)
     }
 
@@ -560,8 +923,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn get_activation_state(&self) -> BackendResult<ActivationState> {
-        // If a flash transfer is in progress, report its state
-        // (AwaitingReset blocks until ecu_reset is called)
+        // Check upload phase first (streaming firmware download in progress)
+        let upload_state = self.upload_phase.lock().unwrap().clone();
+
         let flash_state = {
             let ft = self.flash_transfer.lock().unwrap();
             ft.as_ref().map(|t| t.state)
@@ -571,20 +935,27 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         let status = ota::status(&*nv, self.bank_set)
             .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
 
-        let state = match flash_state {
-            Some(FlashState::AwaitingReset) => FlashState::AwaitingReset,
-            _ if status.committed => FlashState::Committed,
-            _ => FlashState::Activated,
+        // Priority: upload phase > flash transfer > NV state
+        let state = match upload_state {
+            Some(s) => s, // Transferring during firmware download
+            None => match flash_state {
+                Some(s) => s,
+                None if !status.committed => FlashState::Activated, // trial without transfer (e.g. after restart)
+                None => FlashState::Complete, // idle — no active update
+            },
         };
 
-        let active_version = status.fw_version.map(|v| Self::nv_bytes_to_string(&v));
-        let previous_bank = status.active_bank.other();
+        // Use running_bank for versions (not NV active_bank which may be staged)
+        let rb = *self.running_bank.lock().unwrap();
+        let active_version = nv
+            .read_fw_meta(self.bank_set, rb)
+            .map(|m| Self::nv_bytes_to_string(&m.fw_version));
         let previous_version = nv
-            .read_fw_meta(self.bank_set, previous_bank)
+            .read_fw_meta(self.bank_set, rb.other())
             .map(|m| Self::nv_bytes_to_string(&m.fw_version));
 
         Ok(ActivationState {
-            supports_rollback: true,
+            supports_rollback: self.config.supports_rollback,
             state,
             active_version,
             previous_version,
@@ -604,6 +975,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn rollback_flash(&self) -> BackendResult<()> {
+        if !self.config.supports_rollback {
+            return Err(BackendError::InvalidRequest(
+                "rollback not supported for this component".into(),
+            ));
+        }
         let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
         ota::rollback(&mut *nv, self.bank_set).map_err(map_ota_error)?;
         // Clear flash transfer state after rollback
@@ -764,6 +1140,8 @@ static DID_REGISTRY: &[DidEntry] = &[
     DidEntry { id: "min_security_ver", did: did::DID_MIN_SECURITY_VER, name: "Min Security Version", data_type: "uint32", writable: false },
     DidEntry { id: "current_security_ver", did: did::DID_CURRENT_SECURITY_VER, name: "Current Security Version", data_type: "uint32", writable: false },
     DidEntry { id: "boot_count", did: did::DID_BOOT_COUNT, name: "Boot Count", data_type: "uint8", writable: false },
+    DidEntry { id: "guest_state", did: did::DID_GUEST_STATE, name: "Guest State", data_type: "string", writable: false },
+    DidEntry { id: "heartbeat_seq", did: did::DID_HEARTBEAT_SEQ, name: "Heartbeat Seq", data_type: "uint32", writable: false },
 ];
 
 fn resolve_param(param_id: &str) -> Option<(u16, Option<&'static DidEntry>)> {
@@ -822,6 +1200,47 @@ fn map_ota_error(e: ota::OtaError) -> BackendError {
             ))
         }
         other => BackendError::Internal(format!("{other}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Guest health (ivshmem shared memory)
+// ---------------------------------------------------------------------------
+
+struct GuestHealth {
+    guest_state: u32,
+    hb_seq: u32,
+}
+
+/// Read guest health from ivshmem shared memory file.
+/// Layout from cvc-vm-spec vhealth_regs.h: heartbeat at offset 0x800.
+fn read_guest_health(shm_path: &std::path::Path) -> Option<GuestHealth> {
+    const HB_OFFSET: usize = 0x800;
+    const HB_MAGIC: u32 = 0x4842_5448; // "HBTH"
+
+    let data = std::fs::read(shm_path).ok()?;
+    if data.len() < HB_OFFSET + 0x20 {
+        return None;
+    }
+
+    let magic = u32::from_le_bytes(data[HB_OFFSET..HB_OFFSET + 4].try_into().ok()?);
+    if magic != HB_MAGIC {
+        return None;
+    }
+
+    let hb_seq = u32::from_le_bytes(data[HB_OFFSET + 0x08..HB_OFFSET + 0x0C].try_into().ok()?);
+    let guest_state = u32::from_le_bytes(data[HB_OFFSET + 0x0C..HB_OFFSET + 0x10].try_into().ok()?);
+
+    Some(GuestHealth { guest_state, hb_seq })
+}
+
+fn guest_state_str(state: u32) -> &'static str {
+    match state {
+        0 => "booting",
+        1 => "running",
+        2 => "degraded",
+        3 => "shutting_down",
+        _ => "unknown",
     }
 }
 
