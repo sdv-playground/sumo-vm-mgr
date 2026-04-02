@@ -19,7 +19,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::health::HealthStatus;
-use crate::manager::{ManagerError, VmManager};
+use crate::manager::{self, ManagerError, VmManager};
 
 type SharedManager = Arc<Mutex<VmManager>>;
 
@@ -68,19 +68,61 @@ async fn stop_vm(
     State(mgr): State<SharedManager>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let mut mgr = mgr.lock().await;
-    match mgr.stop_vm(&name) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
-        Err(e) => error_response(e),
+    // Phase 1: signal shutdown (fast, under lock)
+    let stop_handle = {
+        let mut mgr = mgr.lock().await;
+        match mgr.initiate_stop(&name) {
+            Ok(sh) => sh,
+            Err(e) => return error_response(e),
+        }
+    };
+    // Lock is released here — health/list remain responsive
+
+    // Phase 2: wait for process to exit (blocking, NO lock held)
+    if let Some(pid) = stop_handle.pid {
+        let timeout = stop_handle.timeout_secs;
+        tokio::task::spawn_blocking(move || {
+            manager::wait_for_exit(pid, timeout);
+        }).await.ok();
     }
+
+    // Phase 3: force-kill if needed + cleanup (fast, under lock)
+    {
+        let mut mgr = mgr.lock().await;
+        mgr.finalize_stop(&name);
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
 async fn restart_vm(
     State(mgr): State<SharedManager>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    // Stop phase (same 3-phase pattern as stop_vm)
+    let stop_handle = {
+        let mut mgr = mgr.lock().await;
+        match mgr.initiate_stop(&name) {
+            Ok(sh) => Some(sh),
+            Err(ManagerError::NotRunning(_)) => None,
+            Err(e) => return error_response(e),
+        }
+    };
+
+    if let Some(sh) = stop_handle {
+        if let Some(pid) = sh.pid {
+            let timeout = sh.timeout_secs;
+            tokio::task::spawn_blocking(move || {
+                manager::wait_for_exit(pid, timeout);
+            }).await.ok();
+        }
+        let mut mgr = mgr.lock().await;
+        mgr.finalize_stop(&name);
+    }
+
+    // Start phase
     let mut mgr = mgr.lock().await;
-    match mgr.restart_vm(&name) {
+    match mgr.start_vm(&name) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
         Err(e) => error_response(e),
     }
