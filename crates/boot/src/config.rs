@@ -151,8 +151,6 @@ pub enum DeviceConfig {
     },
     #[serde(rename = "hsm")]
     Hsm {
-        #[serde(default = "default_hsm_backend")]
-        backend: String,
         /// Keystore path
         #[serde(default)]
         keystore: Option<String>,
@@ -176,7 +174,6 @@ pub enum DeviceConfig {
 }
 
 fn default_backend() -> String { "simulated".to_string() }
-fn default_hsm_backend() -> String { "vsock".to_string() }
 
 impl DeviceConfig {
     /// Whether this device uses ivshmem shared memory for host-guest communication.

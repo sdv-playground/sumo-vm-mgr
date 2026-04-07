@@ -278,8 +278,6 @@ pub enum DeviceConfig {
     },
     #[serde(rename = "hsm")]
     Hsm {
-        #[serde(default = "default_hsm_backend")]
-        backend: String,
         #[serde(default)]
         keystore: Option<String>,
     },
@@ -295,7 +293,6 @@ pub enum DeviceConfig {
 }
 
 fn default_device_backend() -> String { "simulated".to_string() }
-fn default_hsm_backend() -> String { "vsock".to_string() }
 
 impl DeviceConfig {
     pub fn needs_ivshmem(&self) -> bool {

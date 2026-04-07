@@ -241,19 +241,22 @@ impl QemuRunner {
             }
         }
 
-        // vsock for HSM
+        // vsock for HSM (required — no TCP fallback)
         let vsock_device = match arch {
             Arch::Aarch64 => "vhost-vsock-device",
             Arch::X86_64 => "vhost-vsock-pci",
         };
         for dev in &def.devices {
-            if let DeviceConfig::Hsm { backend, .. } = dev {
-                if backend == "vsock" && Path::new("/dev/vhost-vsock").exists() {
-                    args.extend_from_slice(&[
-                        "-device".into(),
-                        format!("{vsock_device},guest-cid=3"),
-                    ]);
+            if matches!(dev, DeviceConfig::Hsm { .. }) {
+                if !Path::new("/dev/vhost-vsock").exists() {
+                    return Err(RunnerError::Config(
+                        "/dev/vhost-vsock not found — load vhost_vsock module".into(),
+                    ));
                 }
+                args.extend_from_slice(&[
+                    "-device".into(),
+                    format!("{vsock_device},guest-cid=3"),
+                ]);
             }
         }
 
@@ -396,18 +399,13 @@ impl VmRunner for QemuRunner {
                 }
             }
 
-            // HSM has its own transport (vsock/tcp), not ivshmem
-            if let DeviceConfig::Hsm { backend, keystore } = dev {
-                if backend == "vsock" || backend == "tcp" {
-                    let bin = self.sim_binary("vhsm-test-ssd", sim_dir)?;
-                    let ks = keystore.as_deref().unwrap_or("/tmp/vhsm-keys");
-                    let mut cmd = Command::new(&bin);
-                    cmd.arg("--keystore").arg(ks).arg("--tcp").arg("127.0.0.1:5555");
-                    if backend == "vsock" && Path::new("/dev/vhost-vsock").exists() {
-                        cmd.arg("--port").arg("5555");
-                    }
-                    self.start_process("vhsm-test-ssd", &mut cmd)?;
-                }
+            // HSM uses vsock only — no TCP fallback
+            if let DeviceConfig::Hsm { keystore } = dev {
+                let bin = self.sim_binary("vhsm-test-ssd", sim_dir)?;
+                let ks = keystore.as_deref().unwrap_or("/tmp/vhsm-keys");
+                let mut cmd = Command::new(&bin);
+                cmd.arg("--keystore").arg(ks).arg("--port").arg("5555");
+                self.start_process("vhsm-test-ssd", &mut cmd)?;
             }
         }
 

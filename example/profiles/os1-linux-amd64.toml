@@ -45,7 +45,6 @@ backend = "native"
 
 [[devices]]
 type = "hsm"
-backend = "vsock"
 keystore = "/tmp/vhsm-keys"
 
 [[devices]]
