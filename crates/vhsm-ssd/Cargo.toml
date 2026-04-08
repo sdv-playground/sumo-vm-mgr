@@ -13,6 +13,11 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["verifying", "der"] }
 rand = "0.8"
 
+[dev-dependencies]
+p256 = { version = "0.13", features = ["ecdsa"] }
+ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
+rand = { version = "0.8", features = ["std"] }
+
 [[bin]]
 name = "vhsm-ssd"
 path = "src/main.rs"

@@ -113,7 +113,7 @@ impl LinuxSimHsm {
     }
 
     /// Write the keystore files from a parsed CBOR payload.
-    fn write_keystore(&self, ks: &HsmKeystore) -> Result<(), HsmError> {
+    pub fn write_keystore(&self, ks: &HsmKeystore) -> Result<(), HsmError> {
         let keys_dir = self.keys_dir();
         std::fs::create_dir_all(&keys_dir)
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;

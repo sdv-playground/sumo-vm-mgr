@@ -126,8 +126,13 @@ fn main() {
                 transports.push(Transport::Tcp(listener));
             }
             Err(e) => {
-                eprintln!("error: TCP bind to {addr} failed: {e}");
-                std::process::exit(1);
+                // Non-fatal if vsock is already listening
+                if transports.is_empty() {
+                    eprintln!("error: TCP bind to {addr} failed: {e}");
+                    std::process::exit(1);
+                } else {
+                    tracing::warn!(addr, error = %e, "TCP bind failed, continuing with vsock only");
+                }
             }
         }
     }

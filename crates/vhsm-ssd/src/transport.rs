@@ -53,8 +53,19 @@ pub struct TcpTransport {
 
 impl TcpTransport {
     pub fn bind(addr: &str) -> io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
+        // Accept bare port number (e.g., "5556") as shorthand for "127.0.0.1:5556"
+        let addr = if addr.contains(':') {
+            addr.to_string()
+        } else {
+            format!("127.0.0.1:{addr}")
+        };
+        let listener = TcpListener::bind(&addr)?;
         Ok(Self { listener })
+    }
+
+    /// Get the local port (useful when bound to port 0).
+    pub fn local_port(&self) -> u16 {
+        self.listener.local_addr().unwrap().port()
     }
 
     pub fn accept(&self) -> io::Result<Connection> {
