@@ -280,6 +280,10 @@ pub enum DeviceConfig {
     Hsm {
         #[serde(default)]
         keystore: Option<String>,
+        #[serde(default)]
+        keygen_bin: Option<String>,
+        #[serde(default = "default_hsm_port")]
+        port: u16,
     },
     #[serde(rename = "network")]
     Network {
@@ -293,6 +297,7 @@ pub enum DeviceConfig {
 }
 
 fn default_device_backend() -> String { "simulated".to_string() }
+fn default_hsm_port() -> u16 { 5555 }
 
 impl DeviceConfig {
     pub fn needs_ivshmem(&self) -> bool {

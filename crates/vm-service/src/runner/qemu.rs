@@ -399,14 +399,9 @@ impl VmRunner for QemuRunner {
                 }
             }
 
-            // HSM uses vsock only — no TCP fallback
-            if let DeviceConfig::Hsm { keystore } = dev {
-                let bin = self.sim_binary("vhsm-test-ssd", sim_dir)?;
-                let ks = keystore.as_deref().unwrap_or("/tmp/vhsm-keys");
-                let mut cmd = Command::new(&bin);
-                cmd.arg("--keystore").arg(ks).arg("--port").arg("5555");
-                self.start_process("vhsm-test-ssd", &mut cmd)?;
-            }
+            // HSM vsock device is added in build_qemu_args().
+            // The HSM service (vhsm-test-ssd) is managed by the
+            // orchestrator — shared across VMs, not per-runner.
         }
 
         // Small delay for processes to initialize

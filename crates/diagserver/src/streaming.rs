@@ -16,11 +16,14 @@ use sumo_onboard::decryptor::StreamingDecryptor;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
-use crate::manifest_provider::{ManifestProvider, ValidatedFirmware};
+use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware};
 
 use sovd_core::{BackendError, PackageStream};
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Maximum envelope size we'll buffer for non-firmware manifests (e.g. HSM keys).
+const HSM_ENVELOPE_MAX: u64 = 100 * 1024;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -48,10 +51,42 @@ pub async fn process_envelope_stream(
     tokio::pin!(reader);
 
     // Step 1: Parse CBOR envelope header, get payload stream
-    let (header_bytes, payload_len) = parse_envelope_header(&mut reader).await?;
+    let (header_bytes, payload_len, map_entry_count) = parse_envelope_header(&mut reader).await?;
 
     // Step 2: Validate using header-only envelope (no payload)
     let validated = validate_header(manifest_provider, &header_bytes, min_security_ver, bank_set)?;
+
+    // HSM key manifests: pass raw envelope through to LinuxSimHsm.
+    // The integrated payload may use a non-"#firmware" key (e.g. "#hsm-keys"),
+    // in which case the full envelope is already buffered in header_bytes
+    // (payload_len == 0). If it uses "#firmware", read the remaining payload
+    // and reconstruct.
+    if validated.manifest_type == ManifestType::HsmKeys {
+        let raw_envelope = if payload_len == 0 {
+            // Full envelope already buffered (integrated payload key != "#firmware")
+            if header_bytes.len() as u64 > HSM_ENVELOPE_MAX {
+                return Err(BackendError::InvalidRequest(format!(
+                    "HSM key envelope too large: {} bytes (max {HSM_ENVELOPE_MAX})",
+                    header_bytes.len()
+                )));
+            }
+            header_bytes
+        } else {
+            if payload_len > HSM_ENVELOPE_MAX {
+                return Err(BackendError::InvalidRequest(format!(
+                    "HSM key envelope too large: {payload_len} bytes (max {HSM_ENVELOPE_MAX})"
+                )));
+            }
+            let mut payload = vec![0u8; payload_len as usize];
+            reader.read_exact(&mut payload).await.map_err(map_io)?;
+            rebuild_envelope_with_payload(&header_bytes, map_entry_count, &payload)?
+        };
+
+        // Re-validate with full envelope so raw_envelope is set correctly
+        return manifest_provider
+            .validate(&raw_envelope, min_security_ver)
+            .map_err(|e| BackendError::InvalidRequest(format!("manifest validation: {e}")));
+    }
 
     // If no payload (CRL manifest), return early
     if payload_len == 0 {
@@ -92,12 +127,13 @@ pub async fn process_envelope_stream(
 
     let has_encryption = manifest.encryption_info(0).is_some();
 
-    // Set up decryptor if needed
+    // Set up decryptor if needed — snapshot keys from provider (owned, safe across async)
     let suit_trust_anchor = manifest_provider
-        .trust_anchor()
-        .ok_or_else(|| BackendError::Internal("no trust anchor for streaming".into()))?
-        .to_vec();
-    let suit_device_key = manifest_provider.device_key().map(|k| k.to_vec());
+        .software_authority_key()
+        .ok_or_else(|| BackendError::Internal(
+            "no software authority key for streaming — HSM not yet provisioned".into(),
+        ))?;
+    let suit_device_key = manifest_provider.device_decryption_key();
 
     // Spawn the sync processing pipeline in a blocking thread
     let process_handle = tokio::task::spawn_blocking(move || {
@@ -145,11 +181,13 @@ pub async fn process_envelope_stream(
     // Return validated firmware with empty image_data (already written to disk)
     Ok(ValidatedFirmware {
         bank_set: validated.bank_set,
+        manifest_type: validated.manifest_type,
         image_meta: validated.image_meta,
         image_data: Vec::new(), // Already written to disk
         version_display: validated.version_display,
         image_sha256: Some(image_hash),
         image_size: Some(image_size as u64),
+        raw_envelope: None,
     })
 }
 
@@ -166,9 +204,10 @@ pub async fn process_envelope_stream(
 ///
 /// We buffer the small entries (auth ~200B, manifest ~500B) and return
 /// the payload length so the caller can stream it.
+/// Returns (header_bytes_without_firmware, payload_length, original_map_entry_count).
 async fn parse_envelope_header<R: AsyncRead + Unpin>(
     reader: &mut R,
-) -> Result<(Vec<u8>, u64), BackendError> {
+) -> Result<(Vec<u8>, u64, u64), BackendError> {
     // We'll buffer the entire header portion. The header is small (<8KB typically).
     // Strategy: read CBOR incrementally. First read the map header, then iterate entries.
     // For auth (key 2) and manifest (key 3): buffer the value.
@@ -290,11 +329,10 @@ async fn parse_envelope_header<R: AsyncRead + Unpin>(
 
     // Rebuild header as valid CBOR: reduce the map entry count by 1 (dropped #firmware)
     if payload_len > 0 {
-        // We need to fix the map entry count in the header
         let header_bytes = rebuild_header_without_firmware(&header_buf, map_entry_count)?;
-        Ok((header_bytes, payload_len))
+        Ok((header_bytes, payload_len, map_entry_count))
     } else {
-        Ok((header_buf, 0))
+        Ok((header_buf, 0, map_entry_count))
     }
 }
 
@@ -340,6 +378,61 @@ fn rebuild_header_without_firmware(
 
     // Copy remaining entries as-is
     result.extend_from_slice(&raw[pos..]);
+    Ok(result)
+}
+
+/// Reconstruct a full SUIT envelope from the stripped header + payload.
+///
+/// `header_without_firmware` has map count = original - 1 and no #firmware entry.
+/// This restores the original count and appends `#firmware: bstr(payload)`.
+fn rebuild_envelope_with_payload(
+    header_without_firmware: &[u8],
+    original_count: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>, BackendError> {
+    let mut result = Vec::with_capacity(header_without_firmware.len() + payload.len() + 32);
+
+    let mut pos = 0;
+    let first = header_without_firmware[pos];
+    let (major, additional) = (first >> 5, first & 0x1f);
+    pos += 1;
+
+    if major == 6 {
+        // Tag — copy tag header
+        result.push(first);
+        let (_tag_val, bytes_consumed) = decode_cbor_uint(additional, &header_without_firmware[pos..]);
+        result.extend_from_slice(&header_without_firmware[pos..pos + bytes_consumed]);
+        pos += bytes_consumed;
+
+        // Skip the (N-1) map header
+        let map_byte = header_without_firmware[pos];
+        pos += 1;
+        let (_, map_add) = (map_byte >> 5, map_byte & 0x1f);
+        let (_, map_bytes_consumed) = decode_cbor_uint(map_add, &header_without_firmware[pos..]);
+        pos += map_bytes_consumed;
+
+        // Write restored map header with original count
+        encode_cbor_uint(5, original_count, &mut result);
+    } else if major == 5 {
+        // Skip the (N-1) map count
+        let (_, bytes_consumed) = decode_cbor_uint(additional, &header_without_firmware[pos..]);
+        pos += bytes_consumed;
+
+        encode_cbor_uint(5, original_count, &mut result);
+    } else {
+        return Err(BackendError::Internal("unexpected header structure".into()));
+    }
+
+    // Copy existing map entries
+    result.extend_from_slice(&header_without_firmware[pos..]);
+
+    // Append "#firmware": bstr(payload)
+    let key = b"#firmware";
+    encode_cbor_uint(3, key.len() as u64, &mut result); // text string key
+    result.extend_from_slice(key);
+    encode_cbor_uint(2, payload.len() as u64, &mut result); // byte string value
+    result.extend_from_slice(payload);
+
     Ok(result)
 }
 

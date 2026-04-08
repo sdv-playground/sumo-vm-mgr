@@ -23,7 +23,7 @@ use sovd_core::models::*;
 use sovd_core::PackageStream;
 
 use crate::did;
-use crate::manifest_provider::{ManifestProvider, ValidatedFirmware};
+use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware};
 use crate::ota;
 use crate::sovd::security::SecurityProvider;
 
@@ -137,6 +137,10 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// Set to Transferring during receive_package_stream so the campaign
     /// viewer can see that a firmware download is in progress.
     upload_phase: Mutex<Option<FlashState>>,
+    /// Optional HSM provider — when set, HSM key material manifests
+    /// (component_id `["hsm", "keys"]`) are routed to this provider
+    /// instead of being written as a disk image.
+    hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
 }
 
 impl<D: BlockDevice + Send + 'static> VmBackend<D> {
@@ -225,7 +229,14 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             vm_service_socket,
             images_dir,
             upload_phase: Mutex::new(None),
+            hsm_provider: None,
         }
+    }
+
+    /// Set an HSM provider for routing key material manifests.
+    pub fn with_hsm_provider(mut self, provider: Arc<Mutex<dyn hsm::HsmProvider>>) -> Self {
+        self.hsm_provider = Some(provider);
+        self
     }
 
     fn next_id(&self) -> String {
@@ -685,7 +696,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     async fn start_flash(&self, package_id: &str) -> BackendResult<String> {
         self.require_flash_access()?;
 
-        let (meta, image_data, image_size, pre_sha256, pre_size) = {
+        let (meta, image_data, image_size, pre_sha256, pre_size, manifest_type, raw_envelope) = {
             let packages = self.packages.lock().unwrap();
             let p = packages
                 .get(package_id)
@@ -701,8 +712,56 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 size,
                 p.validated.image_sha256,
                 p.validated.image_size,
+                p.validated.manifest_type,
+                p.validated.raw_envelope.clone(),
             )
         };
+
+        // HSM key material — route to HsmProvider, skip normal image write
+        if manifest_type == ManifestType::HsmKeys {
+            let envelope = raw_envelope.as_deref().ok_or_else(|| {
+                BackendError::Internal("HSM key manifest missing raw envelope".into())
+            })?;
+            let hsm = self.hsm_provider.as_ref().ok_or_else(|| {
+                BackendError::Internal("no HSM provider configured for key provisioning".into())
+            })?;
+            {
+                let mut hsm_guard = hsm.lock()
+                    .map_err(|_| BackendError::Internal("HSM provider lock".into()))?;
+                hsm_guard
+                    .provision(envelope)
+                    .map_err(|e| BackendError::Internal(format!("HSM provision: {e}")))?;
+
+                // After provisioning, load software authority + device key from HSM
+                match (
+                    hsm_guard.get_public_key(hsm::KeyRole::SoftwareAuthority),
+                    hsm_guard.get_private_key(hsm::KeyRole::DeviceDecryption),
+                ) {
+                    (Ok(sw_key), Ok(dk)) => {
+                        self.manifest_provider.update_keys(sw_key, Some(dk));
+                        tracing::info!("loaded software authority and device key from HSM");
+                    }
+                    (Err(e), _) | (_, Err(e)) => {
+                        tracing::warn!("HSM provisioned but failed to load keys: {e}");
+                    }
+                }
+            }
+
+            // Update NV metadata (security_version, fw_version) via single-bank path
+            let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let _result = ota::install(&mut *nv, self.bank_set, &[], &meta, true)
+                .map_err(map_ota_error)?;
+
+            let transfer_id = self.next_id();
+            let mut ft = self.flash_transfer.lock().unwrap();
+            *ft = Some(FlashTransferState {
+                transfer_id: transfer_id.clone(),
+                package_id: package_id.to_string(),
+                state: FlashState::AwaitingExit,
+                image_size: 0,
+            });
+            return Ok(transfer_id);
+        }
 
         // Streaming path: image_data is empty but image was already written to disk
         let is_streamed = image_data.is_empty() && pre_sha256.is_some();

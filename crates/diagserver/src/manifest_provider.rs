@@ -6,9 +6,20 @@
 use nv_store::types::BankSet;
 use crate::ota::ImageMeta;
 
+/// Manifest sub-type — determines how the payload is handled after validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestType {
+    /// Normal firmware image — write to bank (os1, os2, hyp, hsm firmware, qtd).
+    Firmware,
+    /// HSM key material — route to HsmProvider::provision() with raw envelope.
+    HsmKeys,
+}
+
 /// Result of successful manifest validation — ready for OTA install.
 pub struct ValidatedFirmware {
     pub bank_set: BankSet,
+    /// Manifest sub-type (firmware image vs HSM key material).
+    pub manifest_type: ManifestType,
     pub image_meta: ImageMeta,
     pub image_data: Vec<u8>,
     pub version_display: String,
@@ -16,6 +27,9 @@ pub struct ValidatedFirmware {
     pub image_sha256: Option<[u8; 32]>,
     /// Image size in bytes (set by streaming path).
     pub image_size: Option<u64>,
+    /// Raw SUIT envelope bytes — passed through for HSM key manifests
+    /// so the HSM provider can handle decrypt/decompress internally.
+    pub raw_envelope: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -65,13 +79,19 @@ pub trait ManifestProvider: Send + Sync {
         self.validate(data, min_security_ver)
     }
 
-    /// Access the trust anchor bytes for streaming decryptor setup.
-    fn trust_anchor(&self) -> Option<&[u8]> {
+    /// Snapshot the software authority trust anchor for streaming decryptor setup.
+    /// Returns owned bytes — callers may hold these across async boundaries.
+    fn software_authority_key(&self) -> Option<Vec<u8>> {
         None
     }
 
-    /// Access the device key bytes for streaming decryptor setup.
-    fn device_key(&self) -> Option<&[u8]> {
+    /// Snapshot the device decryption key for streaming decryptor setup.
+    /// Returns owned bytes — callers may hold these across async boundaries.
+    fn device_decryption_key(&self) -> Option<Vec<u8>> {
         None
     }
+
+    /// Update software authority and device key after HSM provisioning.
+    /// Default is no-op for providers that don't support dynamic key updates.
+    fn update_keys(&self, _sw_authority: Vec<u8>, _device_key: Option<Vec<u8>>) {}
 }
