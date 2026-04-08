@@ -23,6 +23,8 @@
 /// - `status`: query HSM firmware health, key slot count, etc.
 
 use crate::{HsmError, HsmProvider, HsmStatus, KeyInfo, KeyRole};
+#[cfg(feature = "crypto")]
+use crate::HsmCryptoProvider;
 
 pub struct QnxHsm;
 
@@ -59,5 +61,39 @@ impl HsmProvider for QnxHsm {
 
     fn get_public_key(&self, _role: KeyRole) -> Result<Vec<u8>, HsmError> {
         Err(HsmError::NotSupported("QNX HSM not implemented".into()))
+    }
+}
+
+#[cfg(feature = "crypto")]
+impl HsmCryptoProvider for QnxHsm {
+    fn sign(&self, _key_id: &str, _data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
+    fn verify(&self, _key_id: &str, _data: &[u8], _sig: &[u8]) -> Result<bool, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
+    fn encrypt(&self, _key_id: &str, _plaintext: &[u8]) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
+    fn decrypt(&self, _key_id: &str, _ciphertext: &[u8]) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
+    fn derive(&self, _key_id: &str, _context: &[u8], _len: usize) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
+    fn random(&self, _len: usize) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
+    fn get_certificate_der(&self, _key_id: &str) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
+    fn get_public_key_der(&self, _key_id: &str) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
+    fn get_key_info(&self, _key_id: &str) -> Result<KeyInfo, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
+    fn get_identity_pubkey(&self, _guest_id: &str) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
     }
 }

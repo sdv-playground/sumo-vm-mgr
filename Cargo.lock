@@ -414,6 +414,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
+ "rand_core",
  "typenum",
 ]
 
@@ -844,11 +845,17 @@ dependencies = [
 name = "hsm"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "ciborium",
  "coset",
+ "ecdsa",
+ "hkdf",
  "libc",
+ "p256",
+ "rand",
  "serde",
  "serde_bytes",
+ "sha2",
  "sumo-codec",
  "sumo-crypto",
  "sumo-onboard",
@@ -2252,6 +2259,19 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vhsm-ssd"
+version = "0.1.0"
+dependencies = [
+ "ecdsa",
+ "hsm",
+ "libc",
+ "p256",
+ "rand",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "vm-boot"

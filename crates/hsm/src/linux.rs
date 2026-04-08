@@ -65,7 +65,7 @@ impl LinuxSimHsm {
     }
 
     /// Path to the manifest file inside the keystore.
-    fn manifest_path(&self) -> PathBuf {
+    pub(crate) fn manifest_path(&self) -> PathBuf {
         self.keystore_path.join("manifest")
     }
 
@@ -75,8 +75,13 @@ impl LinuxSimHsm {
     }
 
     /// Keys subdirectory.
-    fn keys_dir(&self) -> PathBuf {
+    pub(crate) fn keys_dir(&self) -> PathBuf {
         self.keystore_path.join("keys")
+    }
+
+    /// Keystore root directory.
+    pub(crate) fn keystore_path(&self) -> &Path {
+        &self.keystore_path
     }
 
     /// Load the current security_version from provision_state.
@@ -232,7 +237,7 @@ impl LinuxSimHsm {
     }
 
     /// Parse the manifest file to extract key information.
-    fn parse_manifest(&self) -> Result<Vec<KeyInfo>, HsmError> {
+    pub(crate) fn parse_manifest(&self) -> Result<Vec<KeyInfo>, HsmError> {
         let manifest = std::fs::read_to_string(self.manifest_path())
             .map_err(|e| HsmError::KeystoreError(format!("read manifest: {e}")))?;
 
@@ -255,13 +260,57 @@ impl LinuxSimHsm {
                 }
             };
             let has_certificate = parts[3] != "-";
+
+            // Parse optional ACL fields (index 4+)
+            let mut allowed_guests = None;
+            let mut allowed_ops = None;
+            for part in parts.iter().skip(4) {
+                if let Some(guests) = part.strip_prefix("allowed_guests=") {
+                    allowed_guests = Some(
+                        guests.split(',').map(|s| s.to_string()).collect(),
+                    );
+                } else if let Some(ops) = part.strip_prefix("allowed_ops=") {
+                    allowed_ops = Some(
+                        ops.split(',').map(|s| s.to_string()).collect(),
+                    );
+                }
+            }
+
             keys.push(KeyInfo {
                 key_id: parts[0].to_string(),
                 key_type,
                 has_certificate,
+                allowed_guests,
+                allowed_ops,
             });
         }
         Ok(keys)
+    }
+
+    /// Parse the identities file. Returns (guest_id, pubkey_relative_path) pairs.
+    pub(crate) fn parse_identities(&self) -> Result<Vec<(String, PathBuf)>, HsmError> {
+        let path = self.keystore_path.join("identities");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| HsmError::KeystoreError(format!("read identities: {e}")))?;
+
+        let mut identities = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                identities.push((
+                    parts[0].to_string(),
+                    PathBuf::from(parts[1]),
+                ));
+            }
+        }
+        Ok(identities)
     }
 
     /// Check if the daemon process is still alive.
@@ -692,7 +741,7 @@ fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, HsmError> {
 // --- PEM decoding helpers (for loading stored KEK) ---
 
 /// Extract the raw 32-byte EC-P256 scalar from a SEC1 PEM private key.
-fn extract_ec_scalar_from_pem(pem: &str) -> Result<Vec<u8>, HsmError> {
+pub(crate) fn extract_ec_scalar_from_pem(pem: &str) -> Result<Vec<u8>, HsmError> {
     let der = decode_pem(pem, "EC PRIVATE KEY")?;
 
     // SEC1 ECPrivateKey: SEQUENCE { INTEGER(1), OCTET STRING(scalar), ... }
@@ -707,7 +756,7 @@ fn extract_ec_scalar_from_pem(pem: &str) -> Result<Vec<u8>, HsmError> {
 
 /// Extract (x, y) coordinates from a SubjectPublicKeyInfo PEM public key.
 /// Returns (32-byte x, 32-byte y).
-fn extract_ec_public_from_pem(pem: &str) -> Result<(Vec<u8>, Vec<u8>), HsmError> {
+pub(crate) fn extract_ec_public_from_pem(pem: &str) -> Result<(Vec<u8>, Vec<u8>), HsmError> {
     let der = decode_pem(pem, "PUBLIC KEY")?;
 
     // SPKI: SEQUENCE { SEQUENCE { OID, OID }, BIT STRING { 0x00, 0x04, x, y } }
@@ -734,7 +783,7 @@ fn extract_ec_public_from_pem(pem: &str) -> Result<(Vec<u8>, Vec<u8>), HsmError>
 }
 
 /// Decode a PEM block with the given label, returning raw DER bytes.
-fn decode_pem(pem: &str, expected_label: &str) -> Result<Vec<u8>, HsmError> {
+pub(crate) fn decode_pem(pem: &str, expected_label: &str) -> Result<Vec<u8>, HsmError> {
     let begin = format!("-----BEGIN {expected_label}-----");
     let end = format!("-----END {expected_label}-----");
 

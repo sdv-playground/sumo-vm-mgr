@@ -13,6 +13,8 @@ pub enum HsmError {
     DecryptionFailed(String),
     RollbackRejected { current: u64, attempted: u64 },
     NotSupported(String),
+    CryptoError(String),
+    KeyNotFound(String),
 }
 
 impl std::fmt::Display for HsmError {
@@ -32,6 +34,8 @@ impl std::fmt::Display for HsmError {
                 write!(f, "rollback rejected: security_version {attempted} <= current {current}")
             }
             HsmError::NotSupported(s) => write!(f, "not supported: {s}"),
+            HsmError::CryptoError(s) => write!(f, "crypto error: {s}"),
+            HsmError::KeyNotFound(s) => write!(f, "key not found: {s}"),
         }
     }
 }
@@ -94,6 +98,10 @@ pub struct KeyInfo {
     pub key_id: String,
     pub key_type: KeyType,
     pub has_certificate: bool,
+    /// Guest IDs allowed to use this key. None = all guests.
+    pub allowed_guests: Option<Vec<String>>,
+    /// Operations allowed on this key. None = all ops.
+    pub allowed_ops: Option<Vec<String>>,
 }
 
 /// Status of the HSM subsystem.

@@ -13,6 +13,8 @@ pub mod types;
 pub mod payload;
 pub mod linux;
 pub mod qnx;
+#[cfg(feature = "crypto")]
+pub mod crypto;
 
 pub use types::*;
 
@@ -73,4 +75,45 @@ pub trait HsmProvider: Send {
         let _ = role;
         Err(HsmError::NotSupported("private key export".into()))
     }
+}
+
+/// Crypto operations — keys never leave the HSM.
+///
+/// Guest-facing services (vhsm-ssd) delegate all crypto here.
+/// On production hardware, the implementation routes to the HSM
+/// firmware — private keys never leave the secure boundary.
+///
+/// On Linux simulation, `LinuxSimHsm` reads PEM keys from the
+/// keystore and performs operations in software via RustCrypto.
+pub trait HsmCryptoProvider: Send + Sync {
+    /// ECDSA-SHA256 sign with EC-P256 key. Returns DER-encoded signature.
+    fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError>;
+
+    /// ECDSA-SHA256 verify with EC-P256 key. Returns true if valid.
+    fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError>;
+
+    /// AES-256-GCM encrypt. Returns `iv(12) || ciphertext || tag(16)`.
+    fn encrypt(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, HsmError>;
+
+    /// AES-256-GCM decrypt. Input is `iv(12) || ciphertext || tag(16)`.
+    fn decrypt(&self, key_id: &str, ciphertext: &[u8]) -> Result<Vec<u8>, HsmError>;
+
+    /// HKDF-SHA256 derivation. AES-256 key as IKM, context as info.
+    fn derive(&self, key_id: &str, context: &[u8], len: usize) -> Result<Vec<u8>, HsmError>;
+
+    /// OS CSPRNG random bytes.
+    fn random(&self, len: usize) -> Result<Vec<u8>, HsmError>;
+
+    /// Retrieve X.509 certificate as raw DER bytes.
+    fn get_certificate_der(&self, key_id: &str) -> Result<Vec<u8>, HsmError>;
+
+    /// Retrieve public key as SubjectPublicKeyInfo DER bytes.
+    fn get_public_key_der(&self, key_id: &str) -> Result<Vec<u8>, HsmError>;
+
+    /// Get key metadata including ACL information.
+    fn get_key_info(&self, key_id: &str) -> Result<KeyInfo, HsmError>;
+
+    /// Retrieve guest identity public key (uncompressed EC point, 65 bytes).
+    /// Used by REGISTER challenge-response verification.
+    fn get_identity_pubkey(&self, guest_id: &str) -> Result<Vec<u8>, HsmError>;
 }

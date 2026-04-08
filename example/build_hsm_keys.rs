@@ -27,8 +27,8 @@ use sumo_offboard::ImageManifestBuilder;
 
 use hsm::payload::*;
 
-/// Number of "application" key slots (in addition to 4 well-known slots).
-const NUM_APP_SLOTS: usize = 96;
+/// Number of "application" key slots (in addition to 4 well-known + 3 test slots).
+const NUM_APP_SLOTS: usize = 93;
 
 /// Guest identities that can register with the HSM.
 const GUESTS: &[&str] = &["bali-vm-1", "bali-vm-2", "bali-vm-3"];
@@ -100,9 +100,9 @@ fn main() {
     // ---------------------------------------------------------------
     // 1. Generate key slots
     // ---------------------------------------------------------------
-    println!("[hsm-keys] generating {} key slots...", NUM_APP_SLOTS + 4);
+    println!("[hsm-keys] generating {} key slots...", NUM_APP_SLOTS + 7);
 
-    let mut slots = Vec::with_capacity(NUM_APP_SLOTS + 4);
+    let mut slots = Vec::with_capacity(NUM_APP_SLOTS + 7);
 
     // Slot 0: Real KEK (EC-P256) — its public key encrypts future envelopes
     let (kek_priv, kek_pub) = generate_ec_p256_raw();
@@ -155,9 +155,51 @@ fn main() {
         allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_CERT, OP_GET_PUBKEY]),
     });
 
+    // ---------------------------------------------------------------
+    // Test keys (matching vhsm-test / test_all.sh expectations)
+    // ---------------------------------------------------------------
+
+    // "mykey" — EC-P256 for sign/verify tests
+    let (priv_key, pub_key) = generate_ec_p256_raw();
+    slots.push(KeySlotDef {
+        key_id: "mykey".to_string(),
+        key_type: KEY_TYPE_EC_P256,
+        private_key: priv_key,
+        public_key: Some(pub_key),
+        certificate: Some(dummy_self_signed_cert(&crypto)),
+        allowed_guests: Some(vec!["bali-vm-1".into()]),
+        allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_CERT, OP_GET_PUBKEY]),
+    });
+
+    // "storage-key" — AES-256 for encrypt/decrypt/derive tests
+    let mut aes_data = vec![0u8; 32];
+    crypto.random_bytes(&mut aes_data).unwrap();
+    slots.push(KeySlotDef {
+        key_id: "storage-key".to_string(),
+        key_type: KEY_TYPE_AES_256,
+        private_key: aes_data,
+        public_key: None,
+        certificate: None,
+        allowed_guests: Some(vec!["bali-vm-1".into()]),
+        allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT, OP_DERIVE]),
+    });
+
+    // "restricted-key" — ACL test: only bali-vm-2 can use it
+    let mut aes_restricted = vec![0u8; 32];
+    crypto.random_bytes(&mut aes_restricted).unwrap();
+    slots.push(KeySlotDef {
+        key_id: "restricted-key".to_string(),
+        key_type: KEY_TYPE_AES_256,
+        private_key: aes_restricted,
+        public_key: None,
+        certificate: None,
+        allowed_guests: Some(vec!["bali-vm-2".into()]),
+        allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT]),
+    });
+
     // Generate remaining application slots
     for i in 0..NUM_APP_SLOTS {
-        let slot_num = i + 4;
+        let slot_num = i + 7;
         if i % 3 == 0 {
             let mut key_data = vec![0u8; 32];
             crypto.random_bytes(&mut key_data).unwrap();
