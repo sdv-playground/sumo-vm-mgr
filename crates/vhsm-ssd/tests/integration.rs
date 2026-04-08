@@ -63,31 +63,40 @@ fn read_response(r: &mut dyn Read) -> (u8, u32, u32, Vec<u8>) {
     (op, seq, status, result)
 }
 
-/// REGISTER with challenge-response. Returns 32-byte session token.
-fn register(stream: &mut TcpStream, identity_priv_path: &Path, guest_id: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(guest_id.as_bytes());
-    payload.push(0); // null terminator
-    payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // sw_version
-    payload.extend_from_slice(&[0xAA; 32]); // nonce
+/// PROVISION_IDENTITY + REGISTER. Returns 32-byte session token.
+fn provision_and_register(stream: &mut TcpStream, guest_id: &str) -> Vec<u8> {
+    // Step 0: PROVISION_IDENTITY — get per-boot identity key from SSD
+    let mut prov_payload = Vec::new();
+    prov_payload.extend_from_slice(guest_id.as_bytes());
+    prov_payload.push(0);
+    write_request(stream, Op::ProvisionIdentity as u8, 0, 0, "", &prov_payload);
+    let (_, _, status, scalar) = read_response(stream);
+    assert_eq!(status, StatusCode::Success as u32, "provision_identity failed");
+    assert_eq!(scalar.len(), 32, "expected 32-byte EC scalar");
 
-    // Phase 1: get challenge
-    write_request(stream, Op::Register as u8, 0, 1, "", &payload);
+    let signing_key =
+        p256::ecdsa::SigningKey::from_bytes(scalar.as_slice().into()).unwrap();
+
+    // Step 1: REGISTER phase 1 — get challenge
+    let mut reg_payload = Vec::new();
+    reg_payload.extend_from_slice(guest_id.as_bytes());
+    reg_payload.push(0);
+    reg_payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // sw_version
+    reg_payload.extend_from_slice(&[0xAA; 32]); // nonce
+
+    write_request(stream, Op::Register as u8, 0, 1, "", &reg_payload);
     let (op, seq, status, challenge) = read_response(stream);
     assert_eq!(op, Op::Register as u8);
     assert_eq!(seq, 1);
     assert_eq!(status, StatusCode::Success as u32, "register phase 1 failed");
     assert_eq!(challenge.len(), 64);
 
-    // Phase 2: sign (challenge || guest_id || ssd_nonce)
+    // Step 2: REGISTER phase 2 — sign challenge
     let mut message = Vec::new();
     message.extend_from_slice(&challenge[0..32]);
     message.extend_from_slice(guest_id.as_bytes());
     message.extend_from_slice(&challenge[32..64]);
 
-    let scalar = std::fs::read(identity_priv_path).unwrap();
-    let signing_key =
-        p256::ecdsa::SigningKey::from_bytes(scalar.as_slice().into()).unwrap();
     let signature: ecdsa::der::Signature<p256::NistP256> = {
         use ecdsa::signature::Signer;
         signing_key.sign(&message)
@@ -119,7 +128,6 @@ fn with_token(token: &[u8], data: &[u8]) -> Vec<u8> {
 struct TestFixture {
     port: u16,
     keystore_path: PathBuf,
-    identity_priv_path: PathBuf,
     _handle: std::thread::JoinHandle<()>,
 }
 
@@ -129,10 +137,8 @@ impl TestFixture {
         let pid = std::process::id();
         let keystore_path =
             std::env::temp_dir().join(format!("vhsm-ssd-test-{pid}-{id}"));
-        let identity_priv_path = keystore_path.join("identity-bali-vm-1.scalar");
 
-        // Create keystore with real keys
-        Self::build_keystore(&keystore_path, &identity_priv_path);
+        Self::build_keystore(&keystore_path);
 
         let hsm = LinuxSimHsm::new(
             PathBuf::from("unused"),
@@ -178,7 +184,6 @@ impl TestFixture {
         Self {
             port,
             keystore_path,
-            identity_priv_path,
             _handle: handle,
         }
     }
@@ -189,24 +194,18 @@ impl TestFixture {
         s
     }
 
-    /// Register as bali-vm-1, return session token.
+    /// Provision identity + register as bali-vm-1, return session token.
     fn register(&self, stream: &mut TcpStream) -> Vec<u8> {
-        register(stream, &self.identity_priv_path, "bali-vm-1")
+        provision_and_register(stream, "bali-vm-1")
     }
 
-    fn build_keystore(path: &Path, identity_priv_path: &Path) {
+    fn build_keystore(path: &Path) {
         use hsm::payload::*;
         use p256::ecdsa::SigningKey;
         use rand::RngCore;
 
         let _ = std::fs::remove_dir_all(path);
         std::fs::create_dir_all(path).unwrap();
-
-        // Generate identity key for bali-vm-1
-        let identity_key = SigningKey::random(&mut rand::rngs::OsRng);
-        std::fs::write(identity_priv_path, identity_key.to_bytes().as_slice())
-            .unwrap();
-        let identity_pub = identity_key.verifying_key().to_encoded_point(false);
 
         // Generate "mykey" EC signing key
         let mykey = SigningKey::random(&mut rand::rngs::OsRng);
@@ -225,23 +224,10 @@ impl TestFixture {
         let mut restricted_key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut restricted_key);
 
-        // Second identity (bali-vm-2) — we won't sign with it
-        let vm2_key = SigningKey::random(&mut rand::rngs::OsRng);
-        let vm2_pub = vm2_key.verifying_key().to_encoded_point(false);
-
         let ks = HsmKeystore {
             schema_version: SCHEMA_VERSION,
             security_version: 1,
-            identities: vec![
-                IdentityDef {
-                    identity_id: "bali-vm-1".into(),
-                    public_key: identity_pub.as_bytes().to_vec(),
-                },
-                IdentityDef {
-                    identity_id: "bali-vm-2".into(),
-                    public_key: vm2_pub.as_bytes().to_vec(),
-                },
-            ],
+            identities: vec![],
             slots: vec![
                 KeySlotDef {
                     key_id: "mykey".into(),
@@ -289,7 +275,6 @@ impl TestFixture {
 
 impl Drop for TestFixture {
     fn drop(&mut self) {
-        // Connect-and-drop to unblock the accept, then cleanup
         let _ = TcpStream::connect(format!("127.0.0.1:{}", self.port));
         let _ = std::fs::remove_dir_all(&self.keystore_path);
     }

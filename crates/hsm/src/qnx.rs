@@ -93,7 +93,4 @@ impl HsmCryptoProvider for QnxHsm {
     fn get_key_info(&self, _key_id: &str) -> Result<KeyInfo, HsmError> {
         Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
     }
-    fn get_identity_pubkey(&self, _guest_id: &str) -> Result<Vec<u8>, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
-    }
 }

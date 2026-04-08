@@ -6,6 +6,7 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 
 /// A connection that can be read from and written to.
 pub struct Connection {
@@ -163,36 +164,38 @@ impl VsockListener {
                 "vsock connection accepted"
             );
 
-            let stream = VsockStream::from_raw_fd(client_fd);
-            let reader = Box::new(stream.try_clone()?);
-            let writer = Box::new(stream);
+            let shared = VsockBidi::new(client_fd);
+            let reader = Box::new(shared.clone());
+            let writer = Box::new(shared);
             Ok(Connection { reader, writer })
         }
     }
 }
 
-/// Wrapper around a vsock socket fd for Read/Write.
-struct VsockStream {
-    fd: RawFd,
+/// Shared vsock socket — single fd used for both Read and Write.
+/// Clone shares the same underlying fd (via Arc). OwnedFd closes on last drop.
+#[derive(Clone)]
+struct VsockBidi {
+    fd: Arc<OwnedFd>,
 }
 
-impl VsockStream {
-    fn from_raw_fd(fd: RawFd) -> Self {
-        Self { fd }
-    }
-
-    fn try_clone(&self) -> io::Result<Self> {
-        let new_fd = unsafe { libc::dup(self.fd) };
-        if new_fd < 0 {
-            return Err(io::Error::last_os_error());
+impl VsockBidi {
+    fn new(raw_fd: RawFd) -> Self {
+        Self {
+            fd: Arc::new(unsafe { OwnedFd::from_raw_fd(raw_fd) }),
         }
-        Ok(Self { fd: new_fd })
     }
 }
 
-impl Read for VsockStream {
+impl Read for VsockBidi {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe {
+            libc::read(
+                self.fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
         if n < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -201,9 +204,15 @@ impl Read for VsockStream {
     }
 }
 
-impl Write for VsockStream {
+impl Write for VsockBidi {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+        let n = unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+            )
+        };
         if n < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -213,14 +222,6 @@ impl Write for VsockStream {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
-    }
-}
-
-impl Drop for VsockStream {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
     }
 }
 

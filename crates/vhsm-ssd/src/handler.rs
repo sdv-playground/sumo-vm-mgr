@@ -18,17 +18,31 @@ pub fn handle_request(
     };
 
     match op {
-        Op::Register => handle_register(req, sessions, crypto),
+        Op::ProvisionIdentity => handle_provision_identity(req, sessions),
+        Op::Register => handle_register(req, sessions),
         Op::Status => handle_status(req, sessions, key_count),
         _ => handle_crypto_op(req, op, sessions, crypto),
     }
 }
 
-fn handle_register(
-    req: &Request,
-    sessions: &mut SessionManager,
-    crypto: &dyn HsmCryptoProvider,
-) -> Response {
+fn handle_provision_identity(req: &Request, sessions: &mut SessionManager) -> Response {
+    // Parse guest_id\0 from payload
+    let null_pos = match req.payload.iter().position(|&b| b == 0) {
+        Some(p) if p > 0 && p <= 127 => p,
+        _ => return Response::err(req.op, req.seq, StatusCode::InvalidRequest),
+    };
+
+    let guest_id = match String::from_utf8(req.payload[..null_pos].to_vec()) {
+        Ok(id) => id,
+        Err(_) => return Response::err(req.op, req.seq, StatusCode::InvalidRequest),
+    };
+
+    let scalar = sessions.provision_identity(&guest_id);
+    tracing::info!(guest = %guest_id, "identity key provisioned (per-boot)");
+    Response::ok(req.op, req.seq, scalar)
+}
+
+fn handle_register(req: &Request, sessions: &mut SessionManager) -> Response {
     if req.flags & FLAG_REGISTER_RESPONSE != 0 {
         // Phase 2: verify signature
         let guest_id = match sessions.pending_guest_id() {
@@ -36,9 +50,12 @@ fn handle_register(
             None => return Response::err(req.op, req.seq, StatusCode::InvalidRequest),
         };
 
-        let identity_pubkey = match crypto.get_identity_pubkey(&guest_id) {
-            Ok(pk) => pk,
-            Err(_) => return Response::err(req.op, req.seq, StatusCode::AccessDenied),
+        let identity_pubkey = match sessions.get_provisioned_pubkey(&guest_id) {
+            Some(pk) => pk.to_vec(),
+            None => {
+                tracing::warn!(guest = %guest_id, "no provisioned identity — call PROVISION_IDENTITY first");
+                return Response::err(req.op, req.seq, StatusCode::AccessDenied);
+            }
         };
 
         match sessions.register_phase2(&req.payload, &identity_pubkey) {
@@ -55,14 +72,11 @@ fn handle_register(
         // Phase 1: generate challenge
         match sessions.register_phase1(&req.payload) {
             Ok((guest_id, challenge_response)) => {
-                // Verify guest identity exists before sending challenge
-                match crypto.get_identity_pubkey(&guest_id) {
-                    Ok(_) => Response::ok(req.op, req.seq, challenge_response),
-                    Err(_) => {
-                        tracing::warn!(guest = %guest_id, "unknown guest identity");
-                        Response::err(req.op, req.seq, StatusCode::AccessDenied)
-                    }
+                if sessions.get_provisioned_pubkey(&guest_id).is_none() {
+                    tracing::warn!(guest = %guest_id, "no provisioned identity — call PROVISION_IDENTITY first");
+                    return Response::err(req.op, req.seq, StatusCode::AccessDenied);
                 }
+                Response::ok(req.op, req.seq, challenge_response)
             }
             Err(status) => Response::err(req.op, req.seq, status),
         }
@@ -211,6 +225,6 @@ fn handle_crypto_op(
                 }
             }
         },
-        Op::Register | Op::Status => unreachable!(),
+        Op::ProvisionIdentity | Op::Register | Op::Status => unreachable!(),
     }
 }

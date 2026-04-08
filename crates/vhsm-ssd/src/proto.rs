@@ -22,6 +22,7 @@ pub enum Op {
     Random = 0x08,
     Register = 0x10,
     Status = 0x11,
+    ProvisionIdentity = 0x12,
 }
 
 impl Op {
@@ -37,6 +38,7 @@ impl Op {
             0x08 => Some(Op::Random),
             0x10 => Some(Op::Register),
             0x11 => Some(Op::Status),
+            0x12 => Some(Op::ProvisionIdentity),
             _ => None,
         }
     }
@@ -51,7 +53,7 @@ impl Op {
             Op::Derive => Some("DERIVE"),
             Op::GetCert => Some("GET_CERT"),
             Op::GetPubkey => Some("GET_PUBKEY"),
-            Op::Random | Op::Register | Op::Status => None,
+            Op::Random | Op::Register | Op::Status | Op::ProvisionIdentity => None,
         }
     }
 }

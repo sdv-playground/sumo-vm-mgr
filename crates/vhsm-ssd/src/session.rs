@@ -9,6 +9,8 @@
 ///
 /// All subsequent ops must include session token (FLAG_SESSION_TOKEN).
 
+use std::collections::HashMap;
+
 use crate::proto::*;
 use rand::RngCore;
 
@@ -18,6 +20,8 @@ pub struct SessionManager {
     session: Option<([u8; SESSION_TOKEN_LEN], String)>,
     /// Pending REGISTER challenge
     pending: Option<PendingChallenge>,
+    /// Per-boot identity public keys: guest_id -> 65-byte uncompressed EC point
+    identity_keys: HashMap<String, Vec<u8>>,
     /// Server start time for uptime reporting
     start_time: std::time::Instant,
 }
@@ -33,6 +37,7 @@ impl SessionManager {
         Self {
             session: None,
             pending: None,
+            identity_keys: HashMap::new(),
             start_time,
         }
     }
@@ -40,6 +45,24 @@ impl SessionManager {
     /// Server uptime in seconds.
     pub fn uptime_secs(&self) -> u32 {
         self.start_time.elapsed().as_secs() as u32
+    }
+
+    /// Generate a per-boot identity key pair for a guest.
+    /// Returns the 32-byte private scalar (to send to guest).
+    /// Stores the 65-byte uncompressed public key for REGISTER verification.
+    pub fn provision_identity(&mut self, guest_id: &str) -> Vec<u8> {
+        use p256::ecdsa::SigningKey;
+
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let pk = sk.verifying_key().to_encoded_point(false);
+        self.identity_keys
+            .insert(guest_id.to_string(), pk.as_bytes().to_vec());
+        sk.to_bytes().to_vec()
+    }
+
+    /// Look up provisioned identity public key for REGISTER verification.
+    pub fn get_provisioned_pubkey(&self, guest_id: &str) -> Option<&[u8]> {
+        self.identity_keys.get(guest_id).map(|v| v.as_slice())
     }
 
     /// Handle REGISTER phase 1: parse guest_id, generate challenge.

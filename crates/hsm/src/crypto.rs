@@ -8,9 +8,7 @@
 /// Key material never leaves this module — callers (vhsm-ssd) only
 /// see operation results (signatures, ciphertexts, etc.).
 
-use crate::linux::{
-    decode_pem, extract_ec_public_from_pem, extract_ec_scalar_from_pem, LinuxSimHsm,
-};
+use crate::linux::{decode_pem, extract_ec_scalar_from_pem, LinuxSimHsm};
 use crate::{HsmCryptoProvider, HsmError, HsmProvider, KeyInfo, KeyType};
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
@@ -181,32 +179,6 @@ impl HsmCryptoProvider for LinuxSimHsm {
             .ok_or_else(|| HsmError::KeyNotFound(key_id.to_string()))
     }
 
-    fn get_identity_pubkey(&self, guest_id: &str) -> Result<Vec<u8>, HsmError> {
-        if !self.is_provisioned()? {
-            return Err(HsmError::NotProvisioned);
-        }
-        let identities = self.parse_identities()?;
-        let (_id, rel_path) = identities
-            .into_iter()
-            .find(|(id, _)| id == guest_id)
-            .ok_or_else(|| {
-                HsmError::KeyNotFound(format!("identity '{guest_id}' not found"))
-            })?;
-
-        // rel_path is relative to keystore root (e.g., "keys/bali-vm-1.pub")
-        let pub_path = self.keystore_path().join(&rel_path);
-        let pem = std::fs::read_to_string(&pub_path).map_err(|e| {
-            HsmError::KeystoreError(format!("read {}: {e}", pub_path.display()))
-        })?;
-        let (x, y) = extract_ec_public_from_pem(&pem)?;
-
-        // Return uncompressed EC point: 0x04 || x(32) || y(32)
-        let mut point = Vec::with_capacity(65);
-        point.push(0x04);
-        point.extend_from_slice(&x);
-        point.extend_from_slice(&y);
-        Ok(point)
-    }
 }
 
 // --- Internal key loading helpers ---

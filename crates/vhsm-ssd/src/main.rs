@@ -181,22 +181,24 @@ fn accept_loop(transport: &Transport, crypto: &dyn HsmCryptoProvider, key_count:
             }
         };
 
-        // Per-connection session
         let mut sessions = SessionManager::new(start_time);
 
-        // Request loop for this connection
         loop {
             let req = match codec::read_request(conn.reader()) {
                 Ok(r) => r,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    tracing::debug!("connection closed");
-                    break;
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => {
-                    tracing::warn!(error = %e, "read error, closing connection");
+                    tracing::debug!(error = %e, "connection closed");
                     break;
                 }
             };
+
+            tracing::debug!(
+                op = req.op,
+                seq = req.seq,
+                key_id = %req.key_id,
+                "request"
+            );
 
             let resp = handler::handle_request(&req, &mut sessions, crypto, key_count);
 

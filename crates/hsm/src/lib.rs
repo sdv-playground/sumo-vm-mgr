@@ -112,8 +112,4 @@ pub trait HsmCryptoProvider: Send + Sync {
 
     /// Get key metadata including ACL information.
     fn get_key_info(&self, key_id: &str) -> Result<KeyInfo, HsmError>;
-
-    /// Retrieve guest identity public key (uncompressed EC point, 65 bytes).
-    /// Used by REGISTER challenge-response verification.
-    fn get_identity_pubkey(&self, guest_id: &str) -> Result<Vec<u8>, HsmError>;
 }

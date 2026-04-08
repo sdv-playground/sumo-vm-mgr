@@ -79,11 +79,6 @@ impl LinuxSimHsm {
         self.keystore_path.join("keys")
     }
 
-    /// Keystore root directory.
-    pub(crate) fn keystore_path(&self) -> &Path {
-        &self.keystore_path
-    }
-
     /// Load the current security_version from provision_state.
     fn load_security_version(&self) -> Result<u64, HsmError> {
         let path = self.state_path();
@@ -285,32 +280,6 @@ impl LinuxSimHsm {
             });
         }
         Ok(keys)
-    }
-
-    /// Parse the identities file. Returns (guest_id, pubkey_relative_path) pairs.
-    pub(crate) fn parse_identities(&self) -> Result<Vec<(String, PathBuf)>, HsmError> {
-        let path = self.keystore_path.join("identities");
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| HsmError::KeystoreError(format!("read identities: {e}")))?;
-
-        let mut identities = Vec::new();
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                identities.push((
-                    parts[0].to_string(),
-                    PathBuf::from(parts[1]),
-                ));
-            }
-        }
-        Ok(identities)
     }
 
     /// Check if the daemon process is still alive.
