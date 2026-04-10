@@ -1,0 +1,20 @@
+component_id: ["hsm", "keys"]
+sequence_number: ${SEQ}
+security_version: ${SECVER}
+signing_key: ${KEYS_DIR}/signing.key
+
+payload:
+  file: "-"
+  uri: "#hsm-keys"
+  compress: true
+  encrypt:
+    device_keys: ["${KEYS_DIR}/hsm-kek.pub"]
+
+output:
+  manifest: ${MANIFEST_PATH}
+
+metadata:
+  version: "${VERSION}"
+  vendor_name: "vm-mgr"
+  model_name: "HSM-Keys"
+  description: "${DESCRIPTION}"

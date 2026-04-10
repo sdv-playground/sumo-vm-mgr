@@ -1,0 +1,18 @@
+component_id: "${COMPONENT}"
+sequence_number: ${SEQ}
+security_version: ${SECVER}
+signing_key: ${KEYS_DIR}/signing.key
+
+payload:
+  digest: "${FW_DIGEST}"
+  size: ${FW_SIZE}
+
+output:
+  manifest: ${MANIFEST_PATH}
+
+metadata:
+  version: "${VERSION}"
+  vendor_name: "vm-mgr"
+  model_name: "${MODEL_NAME}"
+  model_info: "${MODEL_INFO}"
+  description: "${DESCRIPTION}"

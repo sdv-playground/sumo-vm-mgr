@@ -1,0 +1,10 @@
+component_id: "${COMPONENT}"
+sequence_number: ${SEQ}
+security_version: ${SECVER}
+signing_key: ${KEYS_DIR}/signing.key
+
+output:
+  manifest: ${MANIFEST_PATH}
+
+metadata:
+  description: "CRL: block security_version < ${SECVER}"

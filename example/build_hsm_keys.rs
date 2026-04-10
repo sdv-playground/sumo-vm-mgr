@@ -4,14 +4,23 @@
 /// envelopes use the well-known factory KEK (scalar=1, public=G).
 /// Re-provision envelopes use the real KEK from slot 0.
 ///
-/// Output:
-///   keys/hsm-kek.pub              — real KEK public key (COSE_Key CBOR)
-///   keys/hsm-kek.key              — real KEK full key (for decryption tests)
-///   output/hsm-keys-v1.suit       — factory envelope (encrypted with factory KEK)
-///   output/hsm-keys-v2.suit       — re-provision envelope (encrypted with real KEK)
+/// Output (default mode):
+///   <output-dir>/hsm-keys-v1.suit — factory envelope (encrypted with factory KEK)
+///   <output-dir>/hsm-keys-v2.suit — re-provision envelope (encrypted with real KEK)
+///   <keys-dir>/hsm-kek.pub        — real KEK public key (COSE_Key CBOR)
+///   <keys-dir>/hsm-kek.key        — real KEK full key (for decryption tests)
+///
+/// Output (--cbor-only mode):
+///   stdout                         — raw CBOR keystore (pipe to sumo-tool build --manifest)
+///   <keys-dir>/hsm-kek.pub        — real KEK public key
+///   <keys-dir>/hsm-kek.key        — real KEK full key
 ///
 /// Run with:
 ///   cargo run --example build_hsm_keys -- --signing-key <path> --device-key <path> --output-dir <path>
+///
+/// Or pipe to sumo-tool:
+///   cargo run --example build_hsm_keys -- --cbor-only --signing-key <path> --device-key <path> \
+///     | sumo-tool build --manifest hsm-keys.yaml
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,11 +36,22 @@ use sumo_offboard::ImageManifestBuilder;
 
 use hsm::payload::*;
 
-/// Number of "application" key slots (in addition to 4 well-known + 3 test slots).
-const NUM_APP_SLOTS: usize = 93;
+/// Number of "application" key slots (in addition to 5 well-known + 3 test slots).
+const NUM_APP_SLOTS: usize = 92;
 
 /// Guest identities that can register with the HSM.
 const GUESTS: &[&str] = &["bali-vm-1", "bali-vm-2", "bali-vm-3"];
+
+fn usage() {
+    eprintln!("Usage: build_hsm_keys --signing-key <path> --device-key <path> [--output-dir <path>] [--cbor-only]");
+    eprintln!();
+    eprintln!("  --signing-key <path>   Signing key (COSE_Key CBOR) — used for sw-authority slot");
+    eprintln!("  --device-key <path>    Device key (ECDH P-256) — used for device-decrypt slot");
+    eprintln!("  --output-dir <path>    Directory for .suit output files (required unless --cbor-only)");
+    eprintln!("  --cbor-only            Write raw CBOR keystore to stdout, skip SUIT wrapping.");
+    eprintln!("                         KEK key files are still written to --output-dir or example/keys/.");
+    eprintln!("                         Pipe to: sumo-tool build --manifest hsm-keys.yaml");
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -39,6 +59,7 @@ fn main() {
     let mut signing_key_path: Option<String> = None;
     let mut device_key_path: Option<String> = None;
     let mut output_dir_path: Option<String> = None;
+    let mut cbor_only = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -54,33 +75,49 @@ fn main() {
                 output_dir_path = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--cbor-only" => {
+                cbor_only = true;
+                i += 1;
+            }
             other => {
-                eprintln!("Usage: build_hsm_keys --signing-key <path> --device-key <path> --output-dir <path>");
-                eprintln!("Unknown argument: {other}");
+                usage();
+                eprintln!("\nUnknown argument: {other}");
                 std::process::exit(1);
             }
         }
     }
 
     let signing_key_path = signing_key_path.unwrap_or_else(|| {
-        eprintln!("Usage: build_hsm_keys --signing-key <path> --device-key <path> --output-dir <path>");
-        eprintln!("Error: --signing-key is required");
+        usage();
+        eprintln!("\nError: --signing-key is required");
         std::process::exit(1);
     });
     let device_key_path = device_key_path.unwrap_or_else(|| {
-        eprintln!("Usage: build_hsm_keys --signing-key <path> --device-key <path> --output-dir <path>");
-        eprintln!("Error: --device-key is required (ECDH P-256 for firmware decryption)");
+        usage();
+        eprintln!("\nError: --device-key is required (ECDH P-256 for firmware decryption)");
         std::process::exit(1);
     });
-    let output_dir = PathBuf::from(output_dir_path.unwrap_or_else(|| {
-        eprintln!("Usage: build_hsm_keys --signing-key <path> --device-key <path> --output-dir <path>");
-        eprintln!("Error: --output-dir is required");
-        std::process::exit(1);
-    }));
 
-    let keys_dir = Path::new("example").join("keys");
+    let output_dir = if let Some(ref p) = output_dir_path {
+        PathBuf::from(p)
+    } else if !cbor_only {
+        usage();
+        eprintln!("\nError: --output-dir is required (or use --cbor-only)");
+        std::process::exit(1);
+    } else {
+        PathBuf::new() // not used in cbor-only mode
+    };
+
+    let keys_dir = if let Some(ref p) = output_dir_path {
+        // Write KEK files next to output
+        PathBuf::from(p)
+    } else {
+        Path::new("example").join("keys")
+    };
     fs::create_dir_all(&keys_dir).unwrap();
-    fs::create_dir_all(&output_dir).unwrap();
+    if !cbor_only {
+        fs::create_dir_all(&output_dir).unwrap();
+    }
 
     let crypto = RustCryptoBackend::new();
 
@@ -100,9 +137,9 @@ fn main() {
     // ---------------------------------------------------------------
     // 1. Generate key slots
     // ---------------------------------------------------------------
-    println!("[hsm-keys] generating {} key slots...", NUM_APP_SLOTS + 7);
+    println!("[hsm-keys] generating {} key slots...", NUM_APP_SLOTS + 8);
 
-    let mut slots = Vec::with_capacity(NUM_APP_SLOTS + 7);
+    let mut slots = Vec::with_capacity(NUM_APP_SLOTS + 8);
 
     // Slot 0: Real KEK (EC-P256) — its public key encrypts future envelopes
     let (kek_priv, kek_pub) = generate_ec_p256_raw();
@@ -153,6 +190,18 @@ fn main() {
         certificate: Some(dummy_self_signed_cert(&crypto)),
         allowed_guests: Some(vec!["bali-vm-1".into()]),
         allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_CERT, OP_GET_PUBKEY]),
+    });
+
+    // Slot 4: JWT signing key for jwt-mgr
+    let (priv_key, pub_key) = generate_ec_p256_raw();
+    slots.push(KeySlotDef {
+        key_id: "jwt-signing".to_string(),
+        key_type: KEY_TYPE_EC_P256,
+        private_key: priv_key,
+        public_key: Some(pub_key),
+        certificate: None,
+        allowed_guests: Some(vec!["bali-vm-1".into()]),
+        allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
     });
 
     // ---------------------------------------------------------------
@@ -262,9 +311,47 @@ fn main() {
     };
 
     let cbor = encode(&keystore).unwrap();
-    println!("[hsm-keys] CBOR payload: {} bytes", cbor.len());
+    eprintln!("[hsm-keys] CBOR payload: {} bytes", cbor.len());
 
     let digest = crypto.sha256(&cbor);
+
+    // ---------------------------------------------------------------
+    // Export KEK key files (needed for encryption by external tools)
+    // ---------------------------------------------------------------
+    let (kek_priv_raw, kek_pub_ref) = (kek_priv_bytes(&slots[0]), &kek_pub);
+    let real_kek_cose = build_device_cose_key(
+        &kek_priv_raw,
+        &kek_pub_ref[1..33],
+        &kek_pub_ref[33..65],
+    );
+    let real_kek_pub_cose = build_public_cose_key(
+        &kek_pub_ref[1..33],
+        &kek_pub_ref[33..65],
+    );
+
+    let kek_pub_path = keys_dir.join("hsm-kek.pub");
+    fs::write(&kek_pub_path, &real_kek_pub_cose).unwrap();
+    let kek_key_path = keys_dir.join("hsm-kek.key");
+    fs::write(&kek_key_path, &real_kek_cose).unwrap();
+    eprintln!("[hsm-keys] KEK public key: {}", kek_pub_path.display());
+    eprintln!("[hsm-keys] KEK private key: {}", kek_key_path.display());
+
+    // ---------------------------------------------------------------
+    // --cbor-only: write raw CBOR to stdout, skip SUIT envelope wrapping
+    // ---------------------------------------------------------------
+    if cbor_only {
+        use std::io::Write;
+        std::io::stdout().write_all(&cbor).unwrap();
+        std::io::stdout().flush().unwrap();
+        eprintln!(
+            "[hsm-keys] wrote {} bytes CBOR to stdout ({} slots, {} identities)",
+            cbor.len(),
+            keystore.slots.len(),
+            keystore.identities.len(),
+        );
+        eprintln!("[hsm-keys] pipe to: sumo-tool build --manifest <yaml>");
+        return;
+    }
 
     // ---------------------------------------------------------------
     // 4. Factory envelope (compressed + encrypted with factory KEK)
@@ -299,27 +386,7 @@ fn main() {
         factory_path.display(), factory_envelope.len());
 
     // ---------------------------------------------------------------
-    // 5. Export real KEK (slot 0) as COSE_Key files
-    // ---------------------------------------------------------------
-    let real_kek_cose = build_device_cose_key(
-        &kek_priv_bytes(&slots[0]),
-        &kek_pub.as_slice()[1..33],
-        &kek_pub.as_slice()[33..65],
-    );
-    let real_kek_pub_cose = build_public_cose_key(
-        &kek_pub.as_slice()[1..33],
-        &kek_pub.as_slice()[33..65],
-    );
-
-    let kek_pub_path = keys_dir.join("hsm-kek.pub");
-    fs::write(&kek_pub_path, &real_kek_pub_cose).unwrap();
-    let kek_key_path = keys_dir.join("hsm-kek.key");
-    fs::write(&kek_key_path, &real_kek_cose).unwrap();
-
-    println!("[hsm-keys] KEK public key: {}", kek_pub_path.display());
-
-    // ---------------------------------------------------------------
-    // 6. Re-provision envelope (compressed + encrypted with real KEK)
+    // 5. Re-provision envelope (compressed + encrypted with real KEK)
     // ---------------------------------------------------------------
     println!("\n[hsm-keys] === Re-provision envelope (encrypted with real KEK) ===");
 
@@ -346,7 +413,7 @@ fn main() {
         reprov_path.display(), reprov_envelope.len());
 
     // ---------------------------------------------------------------
-    // 7. Summary
+    // 6. Summary
     // ---------------------------------------------------------------
     println!("\n=== HSM Key Provisioning Artifacts ===");
     println!();

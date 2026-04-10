@@ -90,7 +90,7 @@ cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --quiet
 # 3. Generate SUIT keys and demo firmware (if keys don't exist)
 if [ ! -f "$TRUST_ANCHOR" ]; then
     echo "[vm-mgr] generating SUIT signing keys and demo firmware..."
-    cargo run --manifest-path "$ROOT_DIR/Cargo.toml" --example build --quiet
+    bash "$SCRIPT_DIR/build.sh"
 else
     echo "[vm-mgr] using existing keys in $KEYS_DIR"
 fi
