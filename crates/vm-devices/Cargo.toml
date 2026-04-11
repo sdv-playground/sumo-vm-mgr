@@ -1,0 +1,17 @@
+[package]
+name = "vm-devices"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side device simulators for virtual CAN, health, and time"
+
+[dependencies]
+libc = "0.2"
+tracing = "0.1"
+
+[features]
+default = ["health", "time", "can"]
+health = []
+time = []
+can = []
+
+[dev-dependencies]

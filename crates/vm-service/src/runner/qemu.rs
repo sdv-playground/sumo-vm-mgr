@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::*;
@@ -23,6 +25,8 @@ pub struct QemuRunner {
     sockets: Vec<PathBuf>,
     /// Health monitor for the current VM.
     health_monitor: Option<HealthMonitor>,
+    /// Cancel flags for Rust simulator threads.
+    sim_cancellers: Vec<Arc<AtomicBool>>,
 }
 
 impl QemuRunner {
@@ -34,6 +38,7 @@ impl QemuRunner {
             host_processes: Vec::new(),
             sockets: Vec::new(),
             health_monitor: None,
+            sim_cancellers: Vec::new(),
         }
     }
 
@@ -92,6 +97,58 @@ impl QemuRunner {
             child,
         });
         Ok(pid)
+    }
+
+    /// Start the Rust health simulator on a background thread.
+    fn start_health_sim(&mut self, vm_name: &str) -> Result<(), RunnerError> {
+        use vm_devices::transport::ivshmem::{IvshmemSharedMemory, NullDoorbell};
+        use vm_devices::clock::system::SystemClock;
+        use vm_devices::health;
+
+        let shm = IvshmemSharedMemory::open_by_name(vm_name, "health")
+            .map_err(|e| RunnerError::ProcessFailed(format!("health shm: {e}")))?;
+        let clock = Arc::new(SystemClock::new());
+        let sim = health::HealthSim::new(shm, NullDoorbell, clock, health::default_sensors());
+
+        // Init header immediately (guest driver probes before sim loop starts)
+        sim.init();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        std::thread::Builder::new()
+            .name("health-sim".into())
+            .spawn(move || sim.run(&cancel_clone))
+            .map_err(|e| RunnerError::ProcessFailed(format!("health-sim thread: {e}")))?;
+        self.sim_cancellers.push(cancel);
+        tracing::info!("started Rust health-sim for {vm_name}");
+        Ok(())
+    }
+
+    /// Start the Rust time simulator on a background thread.
+    fn start_time_sim(&mut self, vm_name: &str) -> Result<(), RunnerError> {
+        use vm_devices::transport::ivshmem::{IvshmemSharedMemory, NullDoorbell};
+        use vm_devices::clock::system::SystemClock;
+        use vm_devices::time::TimeSim;
+
+        let shm = IvshmemSharedMemory::open_by_name(vm_name, "time")
+            .map_err(|e| RunnerError::ProcessFailed(format!("time shm: {e}")))?;
+        let clock = Arc::new(SystemClock::new());
+        let mut sim = TimeSim::new(shm, NullDoorbell, clock)
+            .with_sync_guest_id(1)
+            .with_min_adjust_interval(std::time::Duration::from_secs(2));
+
+        // Init header immediately
+        sim.init();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        std::thread::Builder::new()
+            .name("time-sim".into())
+            .spawn(move || sim.run(&cancel_clone))
+            .map_err(|e| RunnerError::ProcessFailed(format!("time-sim thread: {e}")))?;
+        self.sim_cancellers.push(cancel);
+        tracing::info!("started Rust time-sim for {vm_name}");
+        Ok(())
     }
 
     /// Build the QEMU command line from a VM definition.
@@ -354,41 +411,19 @@ impl VmRunner for QemuRunner {
             }
         }
 
-        // Write magic values to shared memory for non-simulated devices
+        // Start Rust device simulators (health, time) or write magic headers
         for dev in &def.devices {
-            if dev.needs_ivshmem() && !dev.needs_simulator() {
-                if let (Some(magic), Some(label)) = (dev.ivshmem_magic(), dev.ivshmem_label()) {
-                    ivshmem::write_shm_magic(name, &label, magic);
+            if !dev.needs_ivshmem() { continue; }
+            match dev {
+                DeviceConfig::Health { .. } => {
+                    self.start_health_sim(name)?;
                 }
-            }
-        }
-
-        // Start host-side simulators
-        for dev in &def.devices {
-            if dev.needs_simulator() {
-                match dev {
-                    DeviceConfig::Health { .. } => {
-                        if let Some(sock) = &ivshmem.health {
-                            let bin = self.sim_binary("health-sim", sim_dir)?;
-                            self.start_process(
-                                "health-sim",
-                                Command::new(&bin).arg(sock),
-                            )?;
-                        }
-                    }
-                    DeviceConfig::Time { .. } => {
-                        if let Some(sock) = &ivshmem.time {
-                            let bin = self.sim_binary("time-sim", sim_dir)?;
-                            self.start_process(
-                                "time-sim",
-                                Command::new(&bin)
-                                    .arg(sock)
-                                    .arg("--sync-guest-id").arg("1")
-                                    .arg("--min-adjust-interval").arg("2"),
-                            )?;
-                        }
-                    }
-                    DeviceConfig::Can { index, .. } => {
+                DeviceConfig::Time { .. } => {
+                    self.start_time_sim(name)?;
+                }
+                DeviceConfig::Can { index, .. } => {
+                    // CAN bridge still uses C simulator for now (Phase 4)
+                    if dev.needs_simulator() {
                         if let Some(sock) = ivshmem.can.get(index) {
                             let bin = self.sim_binary("qnx-host-sim", sim_dir)?;
                             let can_id = format!("0x{:X}", (*index as u32 + 1) * 0x100);
@@ -397,15 +432,16 @@ impl VmRunner for QemuRunner {
                                 Command::new(&bin).arg(sock).arg(&can_id),
                             )?;
                         }
+                    } else {
+                        ivshmem::write_shm_magic(name, &format!("can{index}"), 0x4E414356);
                     }
-                    _ => {}
                 }
+                _ => {}
             }
-
-            // HSM vsock device is added in build_qemu_args().
-            // The HSM service (vhsm-test-ssd) is managed by the
-            // orchestrator — shared across VMs, not per-runner.
         }
+
+        // HSM vsock device is added in build_qemu_args().
+        // The HSM service (vhsm-ssd) is managed by the orchestrator.
 
         // Small delay for processes to initialize
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -467,6 +503,12 @@ impl VmRunner for QemuRunner {
     }
 
     fn cleanup(&mut self) {
+        // Signal Rust simulator threads to stop
+        for cancel in &self.sim_cancellers {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.sim_cancellers.clear();
+
         for proc in self.host_processes.iter_mut().rev() {
             let _ = proc.child.kill();
             let _ = proc.child.wait();

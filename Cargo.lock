@@ -2285,6 +2285,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vm-devices"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tracing",
+]
+
+[[package]]
 name = "vm-diagserver"
 version = "0.1.0"
 dependencies = [
@@ -2334,6 +2342,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vm-devices",
 ]
 
 [[package]]
