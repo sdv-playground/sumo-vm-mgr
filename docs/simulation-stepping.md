@@ -52,12 +52,12 @@ let ctrl = SimController::with_qmp(clock.clone(), 100_000_000, qmp);
 
 ### Debugger Stepping Across RT↔HP Boundary
 
-When the M7 real-time side hits a breakpoint:
+When the real-time side hits a breakpoint:
 
 ```
 1. ctrl.pause()        # Guest halts — CLOCK_MONOTONIC frozen
                        # No timeouts expire, no watchdogs fire
-2. Debug M7 code       # Take as long as needed
+2. Debug RT code       # Take as long as needed
 3. ctrl.resume(0)      # Guest resumes, unaware it was paused
 ```
 
