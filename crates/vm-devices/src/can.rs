@@ -66,6 +66,7 @@ impl std::fmt::Display for CanError {
 /// CAN bridge between ivshmem shared memory rings and a host CAN backend.
 pub struct CanBridge<S: SharedMemory, B: CanBackend> {
     shm: S,
+    doorbell: Box<dyn crate::transport::Doorbell>,
     backend: B,
     ring_size: u32,
     rx_base: usize,  // host→guest ring offset in shm
@@ -73,10 +74,11 @@ pub struct CanBridge<S: SharedMemory, B: CanBackend> {
 }
 
 impl<S: SharedMemory, B: CanBackend> CanBridge<S, B> {
-    pub fn new(shm: S, backend: B) -> Self {
+    pub fn new(shm: S, doorbell: Box<dyn crate::transport::Doorbell>, backend: B) -> Self {
         let half = shm.len() / 2;
         Self {
             shm,
+            doorbell,
             backend,
             ring_size: 4096,
             rx_base: 0,
@@ -115,11 +117,17 @@ impl<S: SharedMemory, B: CanBackend> CanBridge<S, B> {
 
             // Forward from backend to RX ring (host→guest)
             let mut frame = CanFrame::default();
+            let mut wrote_rx = false;
             while let Ok(true) = self.backend.try_recv(&mut frame) {
                 if let Err(e) = self.rx_write(&frame) {
                     tracing::warn!("CAN RX ring write failed: {e}");
                     break;
                 }
+                wrote_rx = true;
+            }
+            // Ring doorbell to wake guest NAPI after batch
+            if wrote_rx {
+                let _ = self.doorbell.notify();
             }
 
             std::thread::sleep(Duration::from_millis(1));
@@ -232,7 +240,7 @@ mod tests {
     #[test]
     fn init_writes_ring_headers() {
         let shm = MemSharedMemory::new(1024 * 1024);
-        let bridge = CanBridge::new(shm, NullBackend::new());
+        let bridge = CanBridge::new(shm, Box::new(crate::transport::mem::MemDoorbell), NullBackend::new());
         bridge.init();
 
         // RX ring header
@@ -247,7 +255,7 @@ mod tests {
     #[test]
     fn rx_write_and_read_roundtrip() {
         let shm = MemSharedMemory::new(1024 * 1024);
-        let bridge = CanBridge::new(shm, NullBackend::new());
+        let bridge = CanBridge::new(shm, Box::new(crate::transport::mem::MemDoorbell), NullBackend::new());
         bridge.init();
 
         let frame = make_frame(0x123, &[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -267,7 +275,7 @@ mod tests {
     #[test]
     fn tx_read_returns_none_when_empty() {
         let shm = MemSharedMemory::new(1024 * 1024);
-        let bridge = CanBridge::new(shm, NullBackend::new());
+        let bridge = CanBridge::new(shm, Box::new(crate::transport::mem::MemDoorbell), NullBackend::new());
         bridge.init();
 
         assert!(bridge.tx_read().is_none());
@@ -276,7 +284,7 @@ mod tests {
     #[test]
     fn tx_read_returns_guest_written_frame() {
         let shm = MemSharedMemory::new(1024 * 1024);
-        let bridge = CanBridge::new(shm, NullBackend::new());
+        let bridge = CanBridge::new(shm, Box::new(crate::transport::mem::MemDoorbell), NullBackend::new());
         bridge.init();
 
         // Simulate guest writing to TX ring
@@ -303,7 +311,7 @@ mod tests {
     #[test]
     fn rx_ring_full_returns_error() {
         let shm = MemSharedMemory::new(1024 * 1024);
-        let bridge = CanBridge::new(shm, NullBackend::new());
+        let bridge = CanBridge::new(shm, Box::new(crate::transport::mem::MemDoorbell), NullBackend::new());
         bridge.init();
 
         // Simulate tail at 0, fill ring to capacity-1

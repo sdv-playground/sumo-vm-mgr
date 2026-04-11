@@ -153,7 +153,8 @@ impl QemuRunner {
 
     /// Start the Rust CAN bridge on a background thread.
     fn start_can_bridge(&mut self, vm_name: &str, index: u8, ifname: &str) -> Result<(), RunnerError> {
-        use vm_devices::transport::ivshmem::IvshmemSharedMemory;
+        use vm_devices::transport::ivshmem::{IvshmemSharedMemory, connect_ivshmem_server, NullDoorbell};
+        use vm_devices::transport::Doorbell;
         use vm_devices::can::{CanBridge, socketcan::SocketCanBackend};
 
         let label = format!("can{index}");
@@ -161,8 +162,22 @@ impl QemuRunner {
             .map_err(|e| RunnerError::ProcessFailed(format!("CAN shm: {e}")))?;
         let backend = SocketCanBackend::open(ifname)
             .map_err(|e| RunnerError::ProcessFailed(format!("CAN socket {ifname}: {e}")))?;
-        let mut bridge = CanBridge::new(shm, backend);
 
+        // Connect to ivshmem-server to get the guest's eventfd for doorbell.
+        // This wakes guest NAPI when we write frames to the RX ring.
+        let sock_path = crate::ivshmem::socket_path(vm_name, &label);
+        let doorbell: Box<dyn Doorbell> = match connect_ivshmem_server(&sock_path) {
+            Ok(db) => {
+                tracing::info!("CAN bridge can{index}: got guest doorbell from ivshmem-server");
+                Box::new(db)
+            }
+            Err(e) => {
+                tracing::warn!("CAN bridge can{index}: no doorbell ({e}), RX may be delayed");
+                Box::new(NullDoorbell)
+            }
+        };
+
+        let mut bridge = CanBridge::new(shm, doorbell, backend);
         bridge.init();
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -446,9 +461,8 @@ impl VmRunner for QemuRunner {
                 DeviceConfig::Time { .. } => {
                     self.start_time_sim(name)?;
                 }
-                DeviceConfig::Can { index, interface, .. } => {
-                    let ifname = interface.as_deref().unwrap_or("vcan1");
-                    self.start_can_bridge(name, *index, ifname)?;
+                DeviceConfig::Can { .. } => {
+                    // CAN bridges start after QEMU launches (need guest peer for doorbell)
                 }
                 _ => {}
             }
@@ -478,6 +492,16 @@ impl VmRunner for QemuRunner {
         let has_health = def.devices.iter().any(|d| matches!(d, DeviceConfig::Health { .. }));
         if has_health {
             self.health_monitor = Some(HealthMonitor::new(name));
+        }
+
+        // Start CAN bridges now that QEMU is connected to ivshmem-server
+        // (we need the guest peer's eventfd for the doorbell)
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for dev in &def.devices {
+            if let DeviceConfig::Can { index, interface, .. } = dev {
+                let ifname = interface.as_deref().unwrap_or("vcan1");
+                self.start_can_bridge(name, *index, ifname)?;
+            }
         }
 
         Ok(VmHandle { name: name.to_string(), pid: Some(pid) })
