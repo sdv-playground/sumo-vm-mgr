@@ -13,3 +13,6 @@ pub mod health;
 
 #[cfg(feature = "time")]
 pub mod time;
+
+#[cfg(feature = "can")]
+pub mod can;

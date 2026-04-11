@@ -151,6 +151,31 @@ impl QemuRunner {
         Ok(())
     }
 
+    /// Start the Rust CAN bridge on a background thread.
+    fn start_can_bridge(&mut self, vm_name: &str, index: u8, ifname: &str) -> Result<(), RunnerError> {
+        use vm_devices::transport::ivshmem::IvshmemSharedMemory;
+        use vm_devices::can::{CanBridge, socketcan::SocketCanBackend};
+
+        let label = format!("can{index}");
+        let shm = IvshmemSharedMemory::open_by_name(vm_name, &label)
+            .map_err(|e| RunnerError::ProcessFailed(format!("CAN shm: {e}")))?;
+        let backend = SocketCanBackend::open(ifname)
+            .map_err(|e| RunnerError::ProcessFailed(format!("CAN socket {ifname}: {e}")))?;
+        let mut bridge = CanBridge::new(shm, backend);
+
+        bridge.init();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        std::thread::Builder::new()
+            .name(format!("can-bridge-{index}"))
+            .spawn(move || bridge.run(&cancel_clone))
+            .map_err(|e| RunnerError::ProcessFailed(format!("can-bridge thread: {e}")))?;
+        self.sim_cancellers.push(cancel);
+        tracing::info!("started Rust CAN bridge for {vm_name} can{index} <-> {ifname}");
+        Ok(())
+    }
+
     /// Build the QEMU command line from a VM definition.
     fn build_qemu_args(
         &self,
@@ -421,20 +446,9 @@ impl VmRunner for QemuRunner {
                 DeviceConfig::Time { .. } => {
                     self.start_time_sim(name)?;
                 }
-                DeviceConfig::Can { index, .. } => {
-                    // CAN bridge still uses C simulator for now (Phase 4)
-                    if dev.needs_simulator() {
-                        if let Some(sock) = ivshmem.can.get(index) {
-                            let bin = self.sim_binary("qnx-host-sim", sim_dir)?;
-                            let can_id = format!("0x{:X}", (*index as u32 + 1) * 0x100);
-                            self.start_process(
-                                &format!("qnx-host-sim-can{index}"),
-                                Command::new(&bin).arg(sock).arg(&can_id),
-                            )?;
-                        }
-                    } else {
-                        ivshmem::write_shm_magic(name, &format!("can{index}"), 0x4E414356);
-                    }
+                DeviceConfig::Can { index, interface, .. } => {
+                    let ifname = interface.as_deref().unwrap_or("vcan1");
+                    self.start_can_bridge(name, *index, ifname)?;
                 }
                 _ => {}
             }
