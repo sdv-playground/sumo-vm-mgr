@@ -137,6 +137,11 @@ impl HandleTable {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Get the most recently added entry.
+    pub fn last(&self) -> Option<&HandleEntry> {
+        self.entries.last()
+    }
 }
 
 #[cfg(test)]

@@ -101,6 +101,12 @@ pub trait HsmCryptoProvider: Send + Sync {
     /// AES-256-GCM decrypt. Input is `iv(12) || ciphertext || tag(16)`.
     fn decrypt(&self, key_id: &str, ciphertext: &[u8]) -> Result<Vec<u8>, HsmError>;
 
+    /// AES-CMAC generate. Returns 16-byte MAC tag.
+    fn mac_generate(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError>;
+
+    /// AES-CMAC verify. Returns true if MAC is valid.
+    fn mac_verify(&self, key_id: &str, data: &[u8], mac: &[u8]) -> Result<bool, HsmError>;
+
     /// HKDF-SHA256 derivation. AES-256 key as IKM, context as info.
     fn derive(&self, key_id: &str, context: &[u8], len: usize) -> Result<Vec<u8>, HsmError>;
 

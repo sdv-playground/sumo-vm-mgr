@@ -183,14 +183,8 @@ fn handle_crypto_with_handle(
             }
         },
         Op::MacGenerate => {
-            // data = data_len(4) + data
-            if data.len() < 4 {
-                return Response::err(req.op, req.session_id, StatusCode::InvalidParam);
-            }
-            let mac_data = &data[4..];
-            // TODO: call crypto.mac_generate() when trait is extended
-            // For now, use HKDF-derive as placeholder for CMAC
-            match crypto.derive(key_id, mac_data, 16) {
+            // payload: data (variable length)
+            match crypto.mac_generate(key_id, data) {
                 Ok(mac) => Response::ok(req.op, req.session_id, mac),
                 Err(e) => {
                     tracing::warn!(key = %key_id, error = %e, "mac_generate failed");
@@ -199,8 +193,24 @@ fn handle_crypto_with_handle(
             }
         },
         Op::MacVerify => {
-            // TODO: implement MAC verify when trait is extended
-            Response::err(req.op, req.session_id, StatusCode::Internal)
+            // payload: mac_len(4) + mac + data
+            if data.len() < 4 {
+                return Response::err(req.op, req.session_id, StatusCode::InvalidParam);
+            }
+            let mac_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+            if data.len() < 4 + mac_len {
+                return Response::err(req.op, req.session_id, StatusCode::InvalidParam);
+            }
+            let mac_tag = &data[4..4 + mac_len];
+            let mac_data = &data[4 + mac_len..];
+            match crypto.mac_verify(key_id, mac_data, mac_tag) {
+                Ok(true) => Response::ok(req.op, req.session_id, Vec::new()),
+                Ok(false) => Response::err(req.op, req.session_id, StatusCode::CryptoError),
+                Err(e) => {
+                    tracing::warn!(key = %key_id, error = %e, "mac_verify failed");
+                    Response::err(req.op, req.session_id, StatusCode::CryptoError)
+                }
+            }
         },
         _ => Response::err(req.op, req.session_id, StatusCode::InvalidParam),
     }

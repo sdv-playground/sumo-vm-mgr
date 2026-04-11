@@ -19,6 +19,8 @@ use vhsm_ssd::policy::Policy;
 use vhsm_ssd::proto::*;
 use vhsm_ssd::transport::VsockListener;
 
+use secstore::{FileBackend, LinuxSimEncryptor, Secstore, KeyMetadata};
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -32,6 +34,7 @@ fn main() {
     let mut vsock_port: Option<u32> = None;
     let mut policy_path: Option<PathBuf> = None;
     let mut allow_cids: Vec<u32> = Vec::new();
+    let mut persist_dir: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -51,6 +54,10 @@ fn main() {
                 policy_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--persist-dir" if i + 1 < args.len() => {
+                persist_dir = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
             "--allow-cid" if i + 1 < args.len() => {
                 let cid: u32 = args[i + 1].parse().unwrap_or_else(|_| {
                     eprintln!("invalid --allow-cid: {}", args[i + 1]);
@@ -65,6 +72,7 @@ fn main() {
                 eprintln!("  --keystore <path>   HSM keystore directory (required)");
                 eprintln!("  --port <port>       vsock port (default: {})", VHSM_PORT);
                 eprintln!("  --policy <path>     Binary policy file");
+                eprintln!("  --persist-dir <dir>  Persist dynamic handles to this directory");
                 eprintln!("  --allow-cid <cid>   Allow this CID all operations (repeatable, dev/test)");
                 std::process::exit(0);
             }
@@ -128,11 +136,43 @@ fn main() {
     let policy = Arc::new(policy);
 
     // Initialize handle table with well-known handles from keystore
-    let handle_table = Arc::new(Mutex::new(init_handle_table(&*crypto)));
+    let mut table = init_handle_table(&*crypto);
+
+    // Set up secstore for dynamic handle persistence (optional)
+    let store: Option<Arc<Secstore<LinuxSimEncryptor, FileBackend>>> =
+        persist_dir.as_ref().map(|dir| {
+            let s = Secstore::new(
+                LinuxSimEncryptor::default_test(),
+                FileBackend::new(dir),
+            );
+            // Load persisted dynamic handles
+            match s.load_all() {
+                Ok(metas) => {
+                    for m in &metas {
+                        let mut label = [0u8; LABEL_LEN];
+                        let bytes = m.label.as_bytes();
+                        let copy_len = bytes.len().min(LABEL_LEN - 1);
+                        label[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                        table.allocate(
+                            &m.key_id, m.algorithm, m.permitted_ops,
+                            m.owner_cid, m.persistent, &label,
+                        );
+                    }
+                    tracing::info!(count = metas.len(), "loaded persisted handles");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load persisted handles");
+                }
+            }
+            Arc::new(s)
+        });
+
+    let handle_table = Arc::new(Mutex::new(table));
 
     tracing::info!(
         keystore = %keystore_path.display(),
         handles = handle_table.lock().unwrap().len(),
+        persist = persist_dir.is_some(),
         "vhsm-ssd v2 starting"
     );
 
@@ -179,10 +219,40 @@ fn main() {
                 "request"
             );
 
+            let table_len_before = handle_table.lock().unwrap().len();
+
             let resp = {
                 let mut table = handle_table.lock().unwrap();
                 handler::handle_request(&req, peer_cid, &mut table, &policy, &*crypto)
             };
+
+            // Persist if a dynamic handle was added (KEY_GENERATE success)
+            if let Some(ref s) = store {
+                let table = handle_table.lock().unwrap();
+                if table.len() > table_len_before {
+                    // New handle was added — find and persist it
+                    if let Some(entry) = table.last() {
+                        if entry.persistent {
+                            let label_str = std::str::from_utf8(&entry.label)
+                                .unwrap_or("")
+                                .trim_end_matches('\0')
+                                .to_string();
+                            let meta = KeyMetadata {
+                                vhsm_handle: entry.handle,
+                                key_id: entry.key_id.clone(),
+                                algorithm: entry.algorithm,
+                                permitted_ops: entry.permitted_ops,
+                                owner_cid: entry.owner_cid,
+                                persistent: true,
+                                label: label_str,
+                            };
+                            if let Err(e) = s.store(&meta) {
+                                tracing::warn!(handle = entry.handle, error = %e, "failed to persist handle");
+                            }
+                        }
+                    }
+                }
+            }
 
             if let Err(e) = codec::write_response(conn.writer(), &resp) {
                 tracing::warn!(cid = peer_cid, error = %e, "write error, closing connection");

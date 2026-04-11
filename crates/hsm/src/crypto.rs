@@ -112,6 +112,40 @@ impl HsmCryptoProvider for LinuxSimHsm {
             .map_err(|e| HsmError::CryptoError(format!("AES-GCM decrypt: {e}")))
     }
 
+    fn mac_generate(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        use cmac::{Cmac, Mac};
+
+        let key_info = self.get_key_info(key_id)?;
+        if key_info.key_type != KeyType::Aes256 {
+            return Err(HsmError::CryptoError(format!(
+                "mac_generate requires AES-256 key, got {}", key_info.key_type
+            )));
+        }
+
+        let raw_key = load_aes_key(self, key_id)?;
+        let mut mac = <Cmac<aes::Aes256> as Mac>::new_from_slice(&raw_key)
+            .map_err(|e| HsmError::CryptoError(format!("invalid AES key for CMAC: {e}")))?;
+        mac.update(data);
+        Ok(mac.finalize().into_bytes().to_vec())
+    }
+
+    fn mac_verify(&self, key_id: &str, data: &[u8], tag: &[u8]) -> Result<bool, HsmError> {
+        use cmac::{Cmac, Mac};
+
+        let key_info = self.get_key_info(key_id)?;
+        if key_info.key_type != KeyType::Aes256 {
+            return Err(HsmError::CryptoError(format!(
+                "mac_verify requires AES-256 key, got {}", key_info.key_type
+            )));
+        }
+
+        let raw_key = load_aes_key(self, key_id)?;
+        let mut mac = <Cmac<aes::Aes256> as Mac>::new_from_slice(&raw_key)
+            .map_err(|e| HsmError::CryptoError(format!("invalid AES key for CMAC: {e}")))?;
+        mac.update(data);
+        Ok(mac.verify_slice(tag).is_ok())
+    }
+
     fn derive(&self, key_id: &str, context: &[u8], len: usize) -> Result<Vec<u8>, HsmError> {
         let key_info = self.get_key_info(key_id)?;
         if key_info.key_type != KeyType::Aes256 {

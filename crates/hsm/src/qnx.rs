@@ -82,6 +82,12 @@ impl HsmCryptoProvider for QnxHsm {
     fn decrypt(&self, _key_id: &str, _ciphertext: &[u8]) -> Result<Vec<u8>, HsmError> {
         Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
     }
+    fn mac_generate(&self, _key_id: &str, _data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
+    fn mac_verify(&self, _key_id: &str, _data: &[u8], _mac: &[u8]) -> Result<bool, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+    }
     fn derive(&self, _key_id: &str, _context: &[u8], _len: usize) -> Result<Vec<u8>, HsmError> {
         Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
     }

@@ -335,6 +335,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmac"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8543454e3c3f5126effff9cd44d562af4e31fb8ce1cc0d3dcd8f084515dbc1aa"
+dependencies = [
+ "cipher",
+ "dbl",
+ "digest",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -452,6 +463,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "dbl"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd2735a791158376708f9347fe8faba9667589d82427ef3aed6794a8981de3d9"
+dependencies = [
+ "generic-array",
 ]
 
 [[package]]
@@ -845,8 +865,10 @@ dependencies = [
 name = "hsm"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "ciborium",
+ "cmac",
  "coset",
  "ecdsa",
  "hkdf",
@@ -2276,6 +2298,7 @@ dependencies = [
  "libc",
  "p256",
  "rand",
+ "secstore",
  "tracing",
  "tracing-subscriber",
 ]

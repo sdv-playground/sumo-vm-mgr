@@ -23,8 +23,10 @@ aes-gcm = { version = "0.10", optional = true }
 hkdf = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 rand = { version = "0.8", optional = true }
+cmac = { version = "0.7", optional = true }
+aes = { version = "0.8", optional = true }
 
 [features]
 default = ["suit"]
 suit = ["dep:sumo-onboard", "dep:sumo-crypto", "dep:sumo-codec"]
-crypto = ["dep:p256", "dep:ecdsa", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:rand"]
+crypto = ["dep:p256", "dep:ecdsa", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:rand", "dep:cmac", "dep:aes"]
