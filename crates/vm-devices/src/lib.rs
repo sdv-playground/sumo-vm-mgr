@@ -7,6 +7,7 @@
 pub mod transport;
 pub mod clock;
 pub mod regs;
+pub mod qmp;
 
 #[cfg(feature = "health")]
 pub mod health;

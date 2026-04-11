@@ -95,19 +95,39 @@ impl Clock for SimulationClock {
 ///
 /// Holds a `SimulationClock` and provides methods to advance time.
 /// All device loops block on `clock.wait_tick()` between iterations.
+///
+/// When combined with a QMP client, `pause()` and `resume()` also
+/// freeze/unfreeze the QEMU vCPUs, stopping `CLOCK_MONOTONIC` inside
+/// the guest. This makes debugger stepping across RT↔HP boundaries
+/// safe — no monotonic timeouts expire while paused.
 pub struct SimController {
     clock: std::sync::Arc<SimulationClock>,
     step_ns: u64,
+    qmp: Option<Mutex<crate::qmp::QmpClient>>,
 }
 
 impl SimController {
-    /// Create a controller with a fixed step size.
+    /// Create a controller with a fixed step size (no QMP).
     pub fn new(clock: std::sync::Arc<SimulationClock>, step_ns: u64) -> Self {
-        Self { clock, step_ns }
+        Self { clock, step_ns, qmp: None }
     }
 
-    /// Advance by one step.
+    /// Create a controller with QMP integration for vCPU pause/resume.
+    pub fn with_qmp(
+        clock: std::sync::Arc<SimulationClock>,
+        step_ns: u64,
+        qmp: crate::qmp::QmpClient,
+    ) -> Self {
+        Self { clock, step_ns, qmp: Some(Mutex::new(qmp)) }
+    }
+
+    /// Advance by one step. Resumes vCPUs if paused.
     pub fn step(&self) {
+        // Resume vCPUs if we have QMP and they're paused
+        if let Some(ref qmp) = self.qmp {
+            let mut q = qmp.lock().unwrap();
+            let _ = q.cont();
+        }
         self.clock.advance(self.step_ns);
     }
 
@@ -115,6 +135,55 @@ impl SimController {
     pub fn step_n(&self, n: u64) {
         for _ in 0..n {
             self.clock.advance(self.step_ns);
+        }
+    }
+
+    /// Pause guest vCPUs + freeze simulation time.
+    ///
+    /// `CLOCK_MONOTONIC` inside the guest stops (vCPUs halted via QMP).
+    /// vtime registers are frozen (no more `update_time()` calls).
+    /// Safe to single-step the RT side without guest timeouts firing.
+    pub fn pause(&self) -> Result<(), String> {
+        if let Some(ref qmp) = self.qmp {
+            let mut q = qmp.lock().unwrap();
+            q.stop().map_err(|e| format!("QMP stop: {e}"))?;
+            tracing::info!(mono_ns = self.clock.now_mono_ns(), "simulation paused (vCPUs halted)");
+            Ok(())
+        } else {
+            // No QMP — just stop stepping (vtime freezes, but CLOCK_MONOTONIC still runs)
+            tracing::warn!("pause without QMP: vtime frozen but CLOCK_MONOTONIC still running");
+            Ok(())
+        }
+    }
+
+    /// Resume guest vCPUs + optionally advance simulation time.
+    ///
+    /// If `elapsed_ns` > 0, advances vtime by that amount before resuming,
+    /// so the guest sees consistent time progression. If 0, the guest
+    /// perceives no time passed (useful for debugger stepping).
+    pub fn resume(&self, elapsed_ns: u64) -> Result<(), String> {
+        if elapsed_ns > 0 {
+            self.clock.advance(elapsed_ns);
+        }
+        if let Some(ref qmp) = self.qmp {
+            let mut q = qmp.lock().unwrap();
+            q.cont().map_err(|e| format!("QMP cont: {e}"))?;
+            tracing::info!(
+                mono_ns = self.clock.now_mono_ns(),
+                elapsed_ns,
+                "simulation resumed"
+            );
+        }
+        Ok(())
+    }
+
+    /// Check if guest is currently running.
+    pub fn is_running(&self) -> bool {
+        if let Some(ref qmp) = self.qmp {
+            let mut q = qmp.lock().unwrap();
+            q.is_running().unwrap_or(true)
+        } else {
+            true
         }
     }
 

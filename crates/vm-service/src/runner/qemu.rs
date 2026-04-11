@@ -226,6 +226,13 @@ impl QemuRunner {
             "-no-reboot".into(),
         ]);
 
+        // QMP socket for vCPU pause/resume (simulation stepping)
+        let qmp_sock = format!("/tmp/vm-svc-{name}-qmp.sock");
+        args.extend_from_slice(&[
+            "-qmp".into(),
+            format!("unix:{qmp_sock},server,nowait"),
+        ]);
+
         // Kernel — resolved from image_dir + images.kernel
         if let Some(kernel_path) = def.kernel_path() {
             args.extend_from_slice(&[
