@@ -12,6 +12,7 @@ use vm_diagserver::backend::{VmBackend, ComponentConfig};
 use vm_diagserver::sovd::security::TestSecurityProvider;
 use vm_diagserver::suit_provider::SuitProvider;
 
+use axum::response::IntoResponse;
 use hsm::{HsmProvider, KeyRole};
 use hsm::linux::LinuxSimHsm;
 
@@ -33,7 +34,7 @@ async fn main() {
         eprintln!("  --vm-service-socket: Unix socket for vm-service lifecycle control");
         eprintln!("  --hsm-daemon:      path to vhsm-test-ssd binary");
         eprintln!("  --hsm-keystore:    HSM keystore directory (default: /tmp/vhsm-keys)");
-        eprintln!("  --hsm-port:        HSM vsock port (default: 5555)");
+        eprintln!("  --hsm-port:        HSM vsock port (default: 5100)");
         eprintln!("  bind-addr defaults to 0.0.0.0:8080");
         eprintln!();
         eprintln!("Software authority and device decryption keys are loaded from HSM after provisioning.");
@@ -52,7 +53,7 @@ async fn main() {
     let mut vm_service_socket: Option<PathBuf> = None;
     let mut hsm_daemon_path: Option<PathBuf> = None;
     let mut hsm_keystore_path = PathBuf::from("/tmp/vhsm-keys");
-    let mut hsm_port: u16 = 5555;
+    let mut hsm_port: u16 = 5100;
     let mut bind_addr = "0.0.0.0:8080";
     let mut i = 3;
     while i < args.len() {
@@ -155,6 +156,11 @@ async fn main() {
             tracing::info!("HSM not yet provisioned — firmware flash disabled until HSM provisioning");
         }
 
+        // Ensure device key pair exists (generates on first boot)
+        if let Err(e) = provider.ensure_device_key() {
+            tracing::warn!("failed to ensure device key: {e}");
+        }
+
         Some(Arc::new(Mutex::new(provider)))
     };
 
@@ -196,6 +202,61 @@ async fn main() {
 
     let state = sovd_api::AppState::new(backends);
     let router = sovd_api::create_router(state);
+
+    // Add CSR endpoint for device provisioning (gated by UNPROVISIONED state)
+    let csr_hsm = hsm_provider.clone();
+    let csr_keystore = hsm_keystore_path.clone();
+    let csr_port = hsm_port;
+    let router = router.route(
+        "/vehicle/v1/components/hsm/csr",
+        axum::routing::get(move || {
+            let hsm = csr_hsm.clone();
+            let keystore = csr_keystore.clone();
+            async move {
+                let Some(hsm) = hsm else {
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "HSM provider not configured".to_string(),
+                    ).into_response();
+                };
+                let state = hsm.lock().unwrap().provisioning_state();
+                match state {
+                    Ok(hsm::ProvisioningState::Provisioned) => {
+                        (axum::http::StatusCode::FORBIDDEN, "device already provisioned".to_string())
+                            .into_response()
+                    }
+                    Ok(hsm::ProvisioningState::Unprovisioned) => {
+                        // Create a temporary crypto provider to generate the CSR
+                        let tmp_hsm = LinuxSimHsm::new(
+                            PathBuf::from("unused"),
+                            keystore,
+                            csr_port,
+                            Vec::new(),
+                        );
+                        use hsm::HsmCryptoProvider;
+                        match tmp_hsm.generate_csr("device-decrypt", "cvc-vm-device") {
+                            Ok(csr_der) => {
+                                tracing::info!("CSR generated for device-decrypt ({} bytes)", csr_der.len());
+                                (
+                                    [(axum::http::header::CONTENT_TYPE, "application/pkcs10")],
+                                    csr_der,
+                                ).into_response()
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "CSR generation failed");
+                                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("CSR error: {e}"))
+                                    .into_response()
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("HSM error: {e}"))
+                            .into_response()
+                    }
+                }
+            }
+        }),
+    );
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await

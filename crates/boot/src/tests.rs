@@ -642,7 +642,7 @@ fn device_needs_ivshmem() {
     assert!(!DeviceConfig::Can { index: 0, backend: "host-passthrough".into(), interface: Some("vcan0".into()) }.needs_ivshmem());
 
     // HSM, Network, Disk, Console never need ivshmem
-    assert!(!DeviceConfig::Hsm { keystore: None, keygen_bin: None, port: 5555 }.needs_ivshmem());
+    assert!(!DeviceConfig::Hsm { keystore: None, keygen_bin: None, port: 5100 }.needs_ivshmem());
     assert!(!DeviceConfig::Network { mac: None, ssh_port: None }.needs_ivshmem());
     assert!(!DeviceConfig::Disk { role: "data".into(), path: "d.img".into(), readonly: false }.needs_ivshmem());
     assert!(!DeviceConfig::Console.needs_ivshmem());
@@ -662,7 +662,7 @@ fn device_needs_simulator() {
     assert!(!DeviceConfig::Can { index: 0, backend: "host-passthrough".into(), interface: Some("vcan0".into()) }.needs_simulator());
 
     // Non-ivshmem devices never need a simulator (via this method)
-    assert!(!DeviceConfig::Hsm { keystore: None, keygen_bin: None, port: 5555 }.needs_simulator());
+    assert!(!DeviceConfig::Hsm { keystore: None, keygen_bin: None, port: 5100 }.needs_simulator());
     assert!(!DeviceConfig::Network { mac: None, ssh_port: None }.needs_simulator());
     assert!(!DeviceConfig::Console.needs_simulator());
 }

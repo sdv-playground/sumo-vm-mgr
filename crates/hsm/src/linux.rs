@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 use crate::payload::{self, HsmKeystore, KeySlotDef, KEY_TYPE_AES_256, KEY_TYPE_EC_P256};
-use crate::{HsmError, HsmProvider, HsmStatus, KeyInfo, KeyRole, KeyType};
+use crate::{HsmError, HsmProvider, HsmStatus, KeyInfo, KeyRole, KeyType, ProvisioningState};
 
 pub struct LinuxSimHsm {
     /// Path to `vhsm-test-ssd` binary.
@@ -77,6 +77,37 @@ impl LinuxSimHsm {
     /// Keys subdirectory.
     pub(crate) fn keys_dir(&self) -> PathBuf {
         self.keystore_path.join("keys")
+    }
+
+    /// Ensure the device key pair exists. Called on first use.
+    /// Generates EC-P256 key pair if `keys/device-decrypt.priv` does not exist.
+    /// This runs regardless of provisioning state — the device key exists before
+    /// any key bundle is installed.
+    #[cfg(feature = "crypto")]
+    pub fn ensure_device_key(&self) -> Result<(), HsmError> {
+        let priv_path = self.keys_dir().join("device-decrypt.priv");
+        if priv_path.exists() {
+            return Ok(());
+        }
+
+        // Create keys directory if needed
+        std::fs::create_dir_all(self.keys_dir())
+            .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
+
+        // Generate EC-P256 key pair
+        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let scalar = sk.to_bytes();
+        let pk = sk.verifying_key().to_encoded_point(false);
+
+        write_pem_ec_private(&priv_path, &scalar)
+            .map_err(|e| HsmError::KeystoreError(format!("write device key: {e}")))?;
+
+        let pub_path = self.keys_dir().join("device-decrypt.pub");
+        write_pem_ec_public(&pub_path, pk.as_bytes())
+            .map_err(|e| HsmError::KeystoreError(format!("write device pubkey: {e}")))?;
+
+        tracing::info!("device key pair generated (first boot)");
+        Ok(())
     }
 
     /// Load the current security_version from provision_state.
@@ -138,9 +169,20 @@ impl LinuxSimHsm {
     fn write_key_files(&self, slot: &KeySlotDef, keys_dir: &Path) -> Result<(), HsmError> {
         match slot.key_type {
             KEY_TYPE_EC_P256 => {
-                // Write raw private key scalar
                 let priv_path = keys_dir.join(format!("{}.priv", slot.key_id));
-                write_pem_ec_private(&priv_path, &slot.private_key)?;
+                if slot.private_key.is_empty() {
+                    // CSR-based provisioning: device already generated this key.
+                    // Preserve the locally-generated private key.
+                    if !priv_path.exists() {
+                        return Err(HsmError::KeystoreError(format!(
+                            "key bundle has empty private_key for '{}' but no local key exists",
+                            slot.key_id
+                        )));
+                    }
+                    tracing::debug!(key_id = %slot.key_id, "preserving locally-generated private key");
+                } else {
+                    write_pem_ec_private(&priv_path, &slot.private_key)?;
+                }
 
                 // Write public key if available
                 if let Some(ref pub_key) = slot.public_key {
@@ -677,6 +719,14 @@ impl HsmProvider for LinuxSimHsm {
 
         Ok(build_private_cose_key(&scalar, &x, &y))
     }
+
+    fn provisioning_state(&self) -> Result<ProvisioningState, HsmError> {
+        if self.manifest_path().exists() {
+            Ok(ProvisioningState::Provisioned)
+        } else {
+            Ok(ProvisioningState::Unprovisioned)
+        }
+    }
 }
 
 impl Drop for LinuxSimHsm {
@@ -1049,7 +1099,7 @@ mod tests {
         let hsm = LinuxSimHsm::new(
             PathBuf::from("/dev/null"),
             tmp.clone(),
-            5555,
+            5100,
             Vec::new(),
         );
 
@@ -1118,7 +1168,7 @@ mod tests {
         let hsm = LinuxSimHsm::new(
             PathBuf::from("/dev/null"),
             tmp.clone(),
-            5555,
+            5100,
             Vec::new(),
         );
 

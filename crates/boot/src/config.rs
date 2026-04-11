@@ -178,7 +178,7 @@ pub enum DeviceConfig {
 }
 
 fn default_backend() -> String { "simulated".to_string() }
-fn default_hsm_port() -> u16 { 5555 }
+fn default_hsm_port() -> u16 { 5100 }
 
 impl DeviceConfig {
     /// Whether this device uses ivshmem shared memory for host-guest communication.

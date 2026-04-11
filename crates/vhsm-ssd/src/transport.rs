@@ -1,10 +1,8 @@
-/// Transport abstraction — vsock + TCP.
+/// Transport abstraction — vsock only.
 ///
-/// vsock is Linux-only (AF_VSOCK). TCP is for dev/test without vsock.
-/// QNX can add its own transport implementation later.
+/// Each connection carries the peer CID for identity/policy lookup.
 
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
@@ -12,6 +10,8 @@ use std::sync::Arc;
 pub struct Connection {
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
+    /// Peer vsock CID (identity for policy lookup).
+    peer_cid: u32,
 }
 
 impl Connection {
@@ -22,59 +22,9 @@ impl Connection {
     pub fn writer(&mut self) -> &mut dyn Write {
         &mut *self.writer
     }
-}
 
-/// Transport listener that accepts connections.
-pub enum Transport {
-    Vsock(VsockListener),
-    Tcp(TcpTransport),
-}
-
-impl Transport {
-    pub fn accept(&self) -> io::Result<Connection> {
-        match self {
-            Transport::Vsock(v) => v.accept(),
-            Transport::Tcp(t) => t.accept(),
-        }
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            Transport::Vsock(_) => "vsock",
-            Transport::Tcp(_) => "tcp",
-        }
-    }
-}
-
-// --- TCP transport ---
-
-pub struct TcpTransport {
-    listener: TcpListener,
-}
-
-impl TcpTransport {
-    pub fn bind(addr: &str) -> io::Result<Self> {
-        // Accept bare port number (e.g., "5556") as shorthand for "127.0.0.1:5556"
-        let addr = if addr.contains(':') {
-            addr.to_string()
-        } else {
-            format!("127.0.0.1:{addr}")
-        };
-        let listener = TcpListener::bind(&addr)?;
-        Ok(Self { listener })
-    }
-
-    /// Get the local port (useful when bound to port 0).
-    pub fn local_port(&self) -> u16 {
-        self.listener.local_addr().unwrap().port()
-    }
-
-    pub fn accept(&self) -> io::Result<Connection> {
-        let (stream, peer) = self.listener.accept()?;
-        tracing::info!("TCP connection from {peer}");
-        let reader = Box::new(stream.try_clone()?);
-        let writer = Box::new(stream);
-        Ok(Connection { reader, writer })
+    pub fn peer_cid(&self) -> u32 {
+        self.peer_cid
     }
 }
 
@@ -136,7 +86,7 @@ impl VsockListener {
                 return Err(io::Error::last_os_error());
             }
 
-            let ret = libc::listen(fd, 4);
+            let ret = libc::listen(fd, 8);
             if ret < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -158,8 +108,10 @@ impl VsockListener {
                 return Err(io::Error::last_os_error());
             }
 
+            let peer_cid = addr.svm_cid;
+
             tracing::info!(
-                cid = addr.svm_cid,
+                cid = peer_cid,
                 port = self.port,
                 "vsock connection accepted"
             );
@@ -167,8 +119,16 @@ impl VsockListener {
             let shared = VsockBidi::new(client_fd);
             let reader = Box::new(shared.clone());
             let writer = Box::new(shared);
-            Ok(Connection { reader, writer })
+            Ok(Connection {
+                reader,
+                writer,
+                peer_cid,
+            })
         }
+    }
+
+    pub fn port(&self) -> u32 {
+        self.port
     }
 }
 
@@ -222,14 +182,5 @@ impl Write for VsockBidi {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
-    }
-}
-
-/// Convert a TcpStream to a Connection.
-impl From<TcpStream> for Connection {
-    fn from(stream: TcpStream) -> Self {
-        let reader = Box::new(stream.try_clone().unwrap());
-        let writer = Box::new(stream);
-        Connection { reader, writer }
     }
 }

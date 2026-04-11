@@ -28,7 +28,7 @@ sumo-onboard = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch
 sumo-processor = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 sumo-crypto = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 sumo-codec = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
-hsm = { path = "../hsm" }
+hsm = { path = "../hsm", features = ["crypto"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -29,6 +29,8 @@ const HB_FLAGS_OFF: usize = HB_OFFSET + 0x18;
 
 const GUEST_STATE_RUNNING: u32 = 1;
 const GUEST_STATE_SHUTTING_DOWN: u32 = 3;
+// Reserved for future use — guest can set bit 0 (SERVICES_READY) in hb_flags
+#[allow(dead_code)]
 const HB_FLAG_SERVICES_READY: u32 = 1;
 
 // Host power commands
@@ -122,7 +124,7 @@ impl HealthMonitor {
         let guest_state = u32::from_le_bytes(
             data[HB_GUEST_STATE_OFF..HB_GUEST_STATE_OFF + 4].try_into().unwrap(),
         );
-        let flags = u32::from_le_bytes(
+        let _flags = u32::from_le_bytes(
             data[HB_FLAGS_OFF..HB_FLAGS_OFF + 4].try_into().unwrap(),
         );
 
@@ -148,10 +150,8 @@ impl HealthMonitor {
 
         let status = if guest_state == GUEST_STATE_SHUTTING_DOWN {
             HealthStatus::ShuttingDown
-        } else if guest_state == GUEST_STATE_RUNNING && (flags & HB_FLAG_SERVICES_READY) != 0 {
-            HealthStatus::Running
         } else if guest_state == GUEST_STATE_RUNNING {
-            HealthStatus::Starting
+            HealthStatus::Running
         } else {
             HealthStatus::Unhealthy
         };

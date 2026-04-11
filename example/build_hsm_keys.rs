@@ -43,10 +43,12 @@ const NUM_APP_SLOTS: usize = 92;
 const GUESTS: &[&str] = &["bali-vm-1", "bali-vm-2", "bali-vm-3"];
 
 fn usage() {
-    eprintln!("Usage: build_hsm_keys --signing-key <path> --device-key <path> [--output-dir <path>] [--cbor-only]");
+    eprintln!("Usage: build_hsm_keys --signing-key <path> [--device-key <path>|--device-csr <path>] [--output-dir <path>] [--cbor-only]");
     eprintln!();
     eprintln!("  --signing-key <path>   Signing key (COSE_Key CBOR) — used for sw-authority slot");
-    eprintln!("  --device-key <path>    Device key (ECDH P-256) — used for device-decrypt slot");
+    eprintln!("  --device-key <path>    Device key (ECDH P-256) — used for device-decrypt slot (legacy: pushes private key)");
+    eprintln!("  --device-csr <path>    Device CSR (PKCS#10 DER) — extracts public key for device-decrypt slot.");
+    eprintln!("                         Private key stays on device (CSR-based provisioning).");
     eprintln!("  --output-dir <path>    Directory for .suit output files (required unless --cbor-only)");
     eprintln!("  --cbor-only            Write raw CBOR keystore to stdout, skip SUIT wrapping.");
     eprintln!("                         KEK key files are still written to --output-dir or example/keys/.");
@@ -58,6 +60,7 @@ fn main() {
 
     let mut signing_key_path: Option<String> = None;
     let mut device_key_path: Option<String> = None;
+    let mut device_csr_path: Option<String> = None;
     let mut output_dir_path: Option<String> = None;
     let mut cbor_only = false;
     let mut i = 1;
@@ -69,6 +72,10 @@ fn main() {
             }
             "--device-key" if i + 1 < args.len() => {
                 device_key_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--device-csr" if i + 1 < args.len() => {
+                device_csr_path = Some(args[i + 1].clone());
                 i += 2;
             }
             "--output-dir" if i + 1 < args.len() => {
@@ -92,11 +99,16 @@ fn main() {
         eprintln!("\nError: --signing-key is required");
         std::process::exit(1);
     });
-    let device_key_path = device_key_path.unwrap_or_else(|| {
+    if device_key_path.is_none() && device_csr_path.is_none() {
         usage();
-        eprintln!("\nError: --device-key is required (ECDH P-256 for firmware decryption)");
+        eprintln!("\nError: one of --device-key or --device-csr is required");
         std::process::exit(1);
-    });
+    }
+    if device_key_path.is_some() && device_csr_path.is_some() {
+        usage();
+        eprintln!("\nError: --device-key and --device-csr are mutually exclusive");
+        std::process::exit(1);
+    }
 
     let output_dir = if let Some(ref p) = output_dir_path {
         PathBuf::from(p)
@@ -127,11 +139,21 @@ fn main() {
         CoseKey::from_cose_key_bytes(&bytes).unwrap()
     };
 
-    // Load device key (ECDH P-256) — same key pair used for firmware decryption
-    let device_key = {
+    // Load device key material — either from full key file or from CSR (public only)
+    let (dk_priv, dk_pub) = if let Some(ref csr_path) = device_csr_path {
+        // CSR-based provisioning: extract public key from CSR, no private key
+        let csr_der = fs::read(csr_path)
+            .unwrap_or_else(|e| panic!("failed to read device CSR {csr_path}: {e}"));
+        let pub_key = extract_ec_pubkey_from_csr(&csr_der)
+            .unwrap_or_else(|e| panic!("failed to extract public key from CSR: {e}"));
+        eprintln!("[hsm-keys] device public key extracted from CSR ({} bytes)", pub_key.len());
+        (Vec::new(), pub_key) // empty private key — device holds it
+    } else {
+        let device_key_path = device_key_path.unwrap();
         let bytes = fs::read(&device_key_path)
             .unwrap_or_else(|e| panic!("failed to read device key {device_key_path}: {e}"));
-        CoseKey::from_cose_key_bytes(&bytes).unwrap()
+        let device_key = CoseKey::from_cose_key_bytes(&bytes).unwrap();
+        extract_ec_raw(&device_key)
     };
 
     // ---------------------------------------------------------------
@@ -168,13 +190,13 @@ fn main() {
     });
 
     // Slot 2: Device decryption key — ECDH P-256 for firmware decryption.
-    // Must be the same key pair as device.key so encrypted firmware can be decrypted.
-    let (dk_priv, dk_pub) = extract_ec_raw(&device_key);
+    // With --device-csr: private_key is empty (device generated it locally).
+    // With --device-key: private_key is pushed to device (legacy).
     slots.push(KeySlotDef {
         key_id: "device-decrypt".to_string(),
         key_type: KEY_TYPE_EC_P256,
         private_key: dk_priv,
-        public_key: Some(dk_pub),
+        public_key: Some(dk_pub.clone()),
         certificate: None,
         allowed_guests: None,
         allowed_ops: None, // ECDH key, not signing
@@ -335,6 +357,15 @@ fn main() {
     fs::write(&kek_key_path, &real_kek_cose).unwrap();
     eprintln!("[hsm-keys] KEK public key: {}", kek_pub_path.display());
     eprintln!("[hsm-keys] KEK private key: {}", kek_key_path.display());
+
+    // Export device public key as COSE_Key (needed by sumo-tool --encrypt)
+    let device_pub_cose = build_public_cose_key(
+        &dk_pub[1..33],
+        &dk_pub[33..65],
+    );
+    let device_pub_path = keys_dir.join("device-decrypt.cosekey");
+    fs::write(&device_pub_path, &device_pub_cose).unwrap();
+    eprintln!("[hsm-keys] Device public key (COSE): {}", device_pub_path.display());
 
     // ---------------------------------------------------------------
     // --cbor-only: write raw CBOR to stdout, skip SUIT envelope wrapping
@@ -575,4 +606,53 @@ fn dummy_self_signed_cert(crypto: &RustCryptoBackend) -> Vec<u8> {
     crypto.random_bytes(&mut body).unwrap();
     cert.extend_from_slice(&body);
     cert
+}
+
+/// Extract EC-P256 uncompressed public key (65 bytes) from a PKCS#10 CSR DER.
+///
+/// Minimal parser: walks the ASN.1 to find SubjectPublicKeyInfo → BIT STRING
+/// containing the 65-byte uncompressed point (0x04 || x || y).
+fn extract_ec_pubkey_from_csr(der: &[u8]) -> Result<Vec<u8>, String> {
+    // CertificationRequest ::= SEQUENCE { certificationRequestInfo, ... }
+    // certificationRequestInfo ::= SEQUENCE { version, subject, subjectPKInfo, ... }
+    // subjectPKInfo ::= SEQUENCE { algorithm, BIT STRING { 0x00 || pubkey } }
+    //
+    // We need to find the 65-byte uncompressed point (starts with 0x04).
+    // Strategy: scan for the EC P-256 OID followed by a BIT STRING containing 66 bytes.
+
+    // Look for the P-256 OID: 06 08 2A 86 48 CE 3D 03 01 07
+    let p256_oid: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+
+    let oid_pos = der
+        .windows(p256_oid.len())
+        .position(|w| w == p256_oid)
+        .ok_or_else(|| "P-256 OID not found in CSR".to_string())?;
+
+    // After the OID, find the next BIT STRING (tag 0x03) containing 66 bytes (0x00 + 65)
+    let search_start = oid_pos + p256_oid.len();
+    for i in search_start..der.len().saturating_sub(67) {
+        if der[i] == 0x03 {
+            // Parse length
+            let (len, hdr_size) = if der[i + 1] < 0x80 {
+                (der[i + 1] as usize, 2usize)
+            } else if der[i + 1] == 0x81 && i + 2 < der.len() {
+                (der[i + 2] as usize, 3usize)
+            } else {
+                continue;
+            };
+
+            if len == 66 && i + hdr_size + len <= der.len() {
+                // First byte is unused-bits count (should be 0x00)
+                if der[i + hdr_size] != 0x00 {
+                    continue;
+                }
+                let point = &der[i + hdr_size + 1..i + hdr_size + len];
+                if point[0] == 0x04 && point.len() == 65 {
+                    return Ok(point.to_vec());
+                }
+            }
+        }
+    }
+
+    Err("EC public key point not found in CSR".to_string())
 }

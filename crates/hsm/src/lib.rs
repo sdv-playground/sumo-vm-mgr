@@ -75,6 +75,9 @@ pub trait HsmProvider: Send {
         let _ = role;
         Err(HsmError::NotSupported("private key export".into()))
     }
+
+    /// Get the current provisioning lifecycle state.
+    fn provisioning_state(&self) -> Result<ProvisioningState, HsmError>;
 }
 
 /// Crypto operations — keys never leave the HSM.
@@ -112,4 +115,12 @@ pub trait HsmCryptoProvider: Send + Sync {
 
     /// Get key metadata including ACL information.
     fn get_key_info(&self, key_id: &str) -> Result<KeyInfo, HsmError>;
+
+    /// Generate a PKCS#10 CSR signed by the given key. Returns DER bytes.
+    /// Used for CSR-based device provisioning — device proves possession
+    /// of its private key without exposing it.
+    fn generate_csr(&self, key_id: &str, subject_cn: &str) -> Result<Vec<u8>, HsmError> {
+        let _ = (key_id, subject_cn);
+        Err(HsmError::NotSupported("CSR generation".into()))
+    }
 }

@@ -22,7 +22,7 @@
 ///
 /// - `status`: query HSM firmware health, key slot count, etc.
 
-use crate::{HsmError, HsmProvider, HsmStatus, KeyInfo, KeyRole};
+use crate::{HsmError, HsmProvider, HsmStatus, KeyInfo, KeyRole, ProvisioningState};
 #[cfg(feature = "crypto")]
 use crate::HsmCryptoProvider;
 
@@ -60,6 +60,10 @@ impl HsmProvider for QnxHsm {
     }
 
     fn get_public_key(&self, _role: KeyRole) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported("QNX HSM not implemented".into()))
+    }
+
+    fn provisioning_state(&self) -> Result<ProvisioningState, HsmError> {
         Err(HsmError::NotSupported("QNX HSM not implemented".into()))
     }
 }

@@ -135,22 +135,34 @@ pub async fn process_envelope_stream(
         ))?;
     let suit_device_key = manifest_provider.device_decryption_key();
 
-    // Spawn the sync processing pipeline in a blocking thread
+    // Spawn the sync processing pipeline in a blocking thread.
+    // Wrap in catch_unwind so panics in crypto/codec produce errors, not silent thread death.
     let process_handle = tokio::task::spawn_blocking(move || {
-        process_payload_sync(
-            rx,
-            &header_for_decrypt,
-            has_encryption,
-            &suit_trust_anchor,
-            suit_device_key.as_deref(),
-            &expected_image_digest,
-            image_path_clone.as_deref(),
-        )
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_payload_sync(
+                rx,
+                &header_for_decrypt,
+                has_encryption,
+                &suit_trust_anchor,
+                suit_device_key.as_deref(),
+                &expected_image_digest,
+                image_path_clone.as_deref(),
+            )
+        }))
+        .unwrap_or_else(|panic| {
+            let msg = panic
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(format!("panic in payload processing: {msg}"))
+        })
     });
 
     // Step 4: Stream payload bytes from async reader to sync channel
     let mut remaining = payload_len as usize;
     let mut buf = vec![0u8; 64 * 1024];
+    let mut send_failed = false;
 
     while remaining > 0 {
         let to_read = buf.len().min(remaining);
@@ -161,17 +173,36 @@ pub async fn process_envelope_stream(
             break;
         }
         remaining -= n;
-        tx.send(Bytes::copy_from_slice(&buf[..n])).await.map_err(|_| {
-            BackendError::Internal("payload processing thread died".into())
-        })?;
+        if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+            send_failed = true;
+            break;
+        }
     }
     drop(tx); // Signal EOF
 
-    // Wait for processing to complete
-    let (image_size, image_hash) = process_handle
-        .await
-        .map_err(|e| BackendError::Internal(format!("processing task panicked: {e}")))?
-        .map_err(|e| BackendError::Internal(format!("payload processing failed: {e}")))?;
+    // Wait for processing to complete — this surfaces the real error
+    // if the processing thread failed (bad key, invalid envelope, etc.)
+    let (image_size, image_hash) = match process_handle.await {
+        Ok(Ok(result)) => {
+            if send_failed {
+                // Thread succeeded but we couldn't send all data — shouldn't happen
+                return Err(BackendError::Internal(
+                    "payload stream ended early but processing succeeded".into(),
+                ));
+            }
+            result
+        }
+        Ok(Err(e)) => {
+            return Err(BackendError::Internal(
+                format!("payload processing failed: {e}"),
+            ));
+        }
+        Err(e) => {
+            return Err(BackendError::Internal(
+                format!("payload processing panicked: {e}"),
+            ));
+        }
+    };
 
     tracing::info!(
         image_size,

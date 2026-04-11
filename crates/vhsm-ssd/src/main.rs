@@ -1,22 +1,23 @@
-/// vHSM Secure Storage Daemon — host-side crypto service for guest VMs.
+/// vHSM Secure Storage Daemon (v2) — host-side crypto service for guest VMs.
 ///
-/// Listens on vsock (and optionally TCP) for guest connections.
-/// All crypto operations are performed via HsmCryptoProvider — keys
-/// never leave this process (or the hardware HSM on production).
+/// Listens on vsock for guest connections. Identity is derived from the
+/// peer vsock CID. Access controlled by a per-CID policy.
 ///
 /// Usage:
-///   vhsm-ssd --keystore <path> [--port <vsock_port>] [--tcp [addr:]port]
+///   vhsm-ssd --keystore <path> [--port <vsock_port>] [--policy <path>]
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use hsm::linux::LinuxSimHsm;
 use hsm::{HsmCryptoProvider, HsmProvider};
 
 use vhsm_ssd::codec;
+use vhsm_ssd::handle_table::HandleTable;
 use vhsm_ssd::handler;
-use vhsm_ssd::session::SessionManager;
-use vhsm_ssd::transport::{TcpTransport, Transport, VsockListener};
+use vhsm_ssd::policy::Policy;
+use vhsm_ssd::proto::*;
+use vhsm_ssd::transport::VsockListener;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -29,7 +30,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut keystore_path: Option<PathBuf> = None;
     let mut vsock_port: Option<u32> = None;
-    let mut tcp_addr: Option<String> = None;
+    let mut policy_path: Option<PathBuf> = None;
+    let mut allow_cids: Vec<u32> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -45,20 +47,25 @@ fn main() {
                 }));
                 i += 2;
             }
-            "--tcp" if i + 1 < args.len() => {
-                tcp_addr = Some(args[i + 1].to_string());
+            "--policy" if i + 1 < args.len() => {
+                policy_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
-            "--tcp" => {
-                tcp_addr = Some("127.0.0.1:5555".to_string());
-                i += 1;
+            "--allow-cid" if i + 1 < args.len() => {
+                let cid: u32 = args[i + 1].parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --allow-cid: {}", args[i + 1]);
+                    std::process::exit(1);
+                });
+                allow_cids.push(cid);
+                i += 2;
             }
             "--help" | "-h" => {
-                eprintln!("Usage: vhsm-ssd --keystore <path> [--port <vsock_port>] [--tcp [addr:]port]");
+                eprintln!("Usage: vhsm-ssd --keystore <path> [--port <vsock_port>] [--policy <path>] [--allow-cid <cid>]...");
                 eprintln!();
                 eprintln!("  --keystore <path>   HSM keystore directory (required)");
-                eprintln!("  --port <port>       vsock port (default: 5555)");
-                eprintln!("  --tcp [addr:]port   Also listen on TCP (default: 127.0.0.1:5555)");
+                eprintln!("  --port <port>       vsock port (default: {})", VHSM_PORT);
+                eprintln!("  --policy <path>     Binary policy file");
+                eprintln!("  --allow-cid <cid>   Allow this CID all operations (repeatable, dev/test)");
                 std::process::exit(0);
             }
             other => {
@@ -73,17 +80,14 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Default: vsock port 5555 if no transport specified
-    if vsock_port.is_none() && tcp_addr.is_none() {
-        vsock_port = Some(5555);
-    }
+    let port = vsock_port.unwrap_or(VHSM_PORT);
 
     // Create HSM provider (reads keys from keystore)
     let hsm = LinuxSimHsm::new(
-        PathBuf::from("unused"), // daemon_bin not used
+        PathBuf::from("unused"),
         keystore_path.clone(),
-        vsock_port.unwrap_or(5555) as u16,
-        Vec::new(), // provisioning authority not needed for crypto service
+        port as u16,
+        Vec::new(),
     );
 
     if !hsm.is_provisioned().unwrap_or(false) {
@@ -95,117 +99,125 @@ fn main() {
         std::process::exit(1);
     }
 
-    let key_count = hsm.list_keys().map(|k| k.len() as u32).unwrap_or(0);
     let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(hsm);
+
+    // Load policy
+    let policy = if let Some(ref path) = policy_path {
+        match Policy::load_from_file(path, false) {
+            Ok(p) => {
+                tracing::info!(
+                    path = %path.display(),
+                    entries = p.num_entries(),
+                    "policy loaded"
+                );
+                p
+            }
+            Err(e) => {
+                eprintln!("error: failed to load policy: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else if !allow_cids.is_empty() {
+        tracing::info!("using --allow-cid policy: {:?}", allow_cids);
+        Policy::allow_all(&allow_cids)
+    } else {
+        eprintln!("error: no --policy or --allow-cid specified");
+        eprintln!("       Use --policy <file> for production, or --allow-cid <cid> for dev/test");
+        std::process::exit(1);
+    };
+    let policy = Arc::new(policy);
+
+    // Initialize handle table with well-known handles from keystore
+    let handle_table = Arc::new(Mutex::new(init_handle_table(&*crypto)));
 
     tracing::info!(
         keystore = %keystore_path.display(),
-        keys = key_count,
-        "vhsm-ssd starting"
+        handles = handle_table.lock().unwrap().len(),
+        "vhsm-ssd v2 starting"
     );
 
-    // Build transport list
-    let mut transports: Vec<Transport> = Vec::new();
-
-    if let Some(port) = vsock_port {
-        match VsockListener::bind(port) {
-            Ok(listener) => {
-                tracing::info!(port, "listening on vsock");
-                transports.push(Transport::Vsock(listener));
-            }
-            Err(e) => {
-                tracing::warn!(port, error = %e, "vsock bind failed (AF_VSOCK not available?)");
-            }
+    // Bind vsock
+    let listener = match VsockListener::bind(port) {
+        Ok(l) => {
+            tracing::info!(port, "listening on vsock");
+            l
         }
-    }
-
-    if let Some(ref addr) = tcp_addr {
-        match TcpTransport::bind(addr) {
-            Ok(listener) => {
-                tracing::info!(addr, "listening on TCP");
-                transports.push(Transport::Tcp(listener));
-            }
-            Err(e) => {
-                // Non-fatal if vsock is already listening
-                if transports.is_empty() {
-                    eprintln!("error: TCP bind to {addr} failed: {e}");
-                    std::process::exit(1);
-                } else {
-                    tracing::warn!(addr, error = %e, "TCP bind failed, continuing with vsock only");
-                }
-            }
+        Err(e) => {
+            eprintln!("error: vsock bind to port {port} failed: {e}");
+            eprintln!("       Is vhost_vsock loaded? (modprobe vhost_vsock)");
+            std::process::exit(1);
         }
-    }
+    };
 
-    if transports.is_empty() {
-        eprintln!("error: no transport available (vsock failed and no --tcp)");
-        std::process::exit(1);
-    }
-
-    // For single-transport: simple accept loop
-    // For multiple: use threads
-    if transports.len() == 1 {
-        let transport = transports.pop().unwrap();
-        accept_loop(&transport, &*crypto, key_count);
-    } else {
-        let crypto = Arc::clone(&crypto);
-        let handles: Vec<_> = transports
-            .into_iter()
-            .map(|transport| {
-                let crypto = Arc::clone(&crypto);
-                std::thread::spawn(move || {
-                    accept_loop(&transport, &*crypto, key_count);
-                })
-            })
-            .collect();
-        for h in handles {
-            let _ = h.join();
-        }
-    }
-}
-
-fn accept_loop(transport: &Transport, crypto: &dyn HsmCryptoProvider, key_count: u32) {
-    let start_time = std::time::Instant::now();
-
+    // Accept loop
     loop {
-        let mut conn = match transport.accept() {
+        let mut conn = match listener.accept() {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(
-                    transport = transport.name(),
-                    error = %e,
-                    "accept failed, retrying"
-                );
+                tracing::warn!(error = %e, "accept failed, retrying");
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
         };
 
-        let mut sessions = SessionManager::new(start_time);
+        let peer_cid = conn.peer_cid();
 
         loop {
             let req = match codec::read_request(conn.reader()) {
                 Ok(r) => r,
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => {
-                    tracing::debug!(error = %e, "connection closed");
+                    tracing::debug!(cid = peer_cid, error = %e, "connection closed");
                     break;
                 }
             };
 
             tracing::debug!(
+                cid = peer_cid,
                 op = req.op,
-                seq = req.seq,
-                key_id = %req.key_id,
+                session_id = req.session_id,
                 "request"
             );
 
-            let resp = handler::handle_request(&req, &mut sessions, crypto, key_count);
+            let resp = {
+                let mut table = handle_table.lock().unwrap();
+                handler::handle_request(&req, peer_cid, &mut table, &policy, &*crypto)
+            };
 
             if let Err(e) = codec::write_response(conn.writer(), &resp) {
-                tracing::warn!(error = %e, "write error, closing connection");
+                tracing::warn!(cid = peer_cid, error = %e, "write error, closing connection");
                 break;
             }
         }
+
+        // Clean up dynamic handles for disconnected VM
+        handle_table.lock().unwrap().remove_by_cid(peer_cid);
+        tracing::info!(cid = peer_cid, "connection closed, dynamic handles released");
     }
+}
+
+/// Populate handle table with well-known handles from the keystore.
+fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
+    let mut table = HandleTable::new();
+
+    // Map well-known handles to keystore key_ids.
+    // These match KeyRole in hsm/src/types.rs.
+    let well_known = [
+        (HANDLE_KEK, "kek", ALG_ECC_P256, PERM_ENCRYPT | PERM_DECRYPT),
+        (HANDLE_SW_AUTHORITY, "sw-authority", ALG_ECC_P256, PERM_VERIFY),
+        (HANDLE_DEVICE_DECRYPT, "device-decrypt", ALG_ECC_P256, PERM_DECRYPT | PERM_GET_PUBKEY),
+        (HANDLE_ECU_SIGNING, "ecu-signing", ALG_ECC_P256, PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY | PERM_GET_CERT),
+        (HANDLE_JWT_SIGNING, "jwt-signing", ALG_ECC_P256, PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY),
+        (HANDLE_STORAGE, "storage-key", ALG_AES_256, PERM_ENCRYPT | PERM_DECRYPT),
+    ];
+
+    for (handle, key_id, alg, perms) in &well_known {
+        // Only register if the key exists in the keystore
+        if crypto.get_key_info(key_id).is_ok() {
+            table.register_well_known(*handle, key_id, *alg, *perms);
+            tracing::debug!(handle, key_id, "registered well-known handle");
+        }
+    }
+
+    table
 }

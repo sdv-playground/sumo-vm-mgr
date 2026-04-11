@@ -297,7 +297,7 @@ pub enum DeviceConfig {
 }
 
 fn default_device_backend() -> String { "simulated".to_string() }
-fn default_hsm_port() -> u16 { 5555 }
+fn default_hsm_port() -> u16 { 5100 }
 
 impl DeviceConfig {
     pub fn needs_ivshmem(&self) -> bool {

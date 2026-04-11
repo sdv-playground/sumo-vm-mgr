@@ -253,9 +253,12 @@ impl QemuRunner {
                         "/dev/vhost-vsock not found — load vhost_vsock module".into(),
                     ));
                 }
+                // CID 3+ — unique per VM for CID-based vHSM identity.
+                // Derive stable CID from VM name hash (range 3..65535).
+                let cid = 3 + (name.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32)) % 65533);
                 args.extend_from_slice(&[
                     "-device".into(),
-                    format!("{vsock_device},guest-cid=3"),
+                    format!("{vsock_device},guest-cid={cid}"),
                 ]);
             }
         }

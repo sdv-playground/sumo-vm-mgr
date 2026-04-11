@@ -179,6 +179,25 @@ impl HsmCryptoProvider for LinuxSimHsm {
             .ok_or_else(|| HsmError::KeyNotFound(key_id.to_string()))
     }
 
+    fn generate_csr(&self, key_id: &str, subject_cn: &str) -> Result<Vec<u8>, HsmError> {
+        let priv_path = self.keys_dir().join(format!("{key_id}.priv"));
+        if !priv_path.exists() {
+            return Err(HsmError::KeyNotFound(format!(
+                "no private key for CSR: {key_id}"
+            )));
+        }
+
+        let pem = std::fs::read_to_string(&priv_path)
+            .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", priv_path.display())))?;
+        let scalar = extract_ec_scalar_from_pem(&pem)?;
+
+        let signing_key = SigningKey::from_bytes((&scalar[..]).into())
+            .map_err(|e| HsmError::CryptoError(format!("invalid signing key: {e}")))?;
+        let verifying_key = signing_key.verifying_key();
+        let pub_point = verifying_key.to_encoded_point(false);
+
+        build_pkcs10_csr(subject_cn, pub_point.as_bytes(), &signing_key)
+    }
 }
 
 // --- Internal key loading helpers ---
@@ -200,6 +219,132 @@ fn load_ec_verifying_key(
     let der = decode_pem(&pem, "PUBLIC KEY")?;
     VerifyingKey::from_sec1_bytes(&der[der.len() - 65..])
         .map_err(|e| HsmError::CryptoError(format!("invalid verifying key: {e}")))
+}
+
+/// Build a PKCS#10 CertificationRequest (CSR) DER for EC-P256.
+///
+/// Structure:
+///   SEQUENCE {
+///     CertificationRequestInfo ::= SEQUENCE {
+///       version INTEGER 0
+///       subject Name (SEQUENCE { SET { SEQUENCE { OID cn, UTF8String } } })
+///       subjectPKInfo SubjectPublicKeyInfo
+///       attributes [0] (empty)
+///     }
+///     signatureAlgorithm AlgorithmIdentifier (ecdsa-with-SHA256)
+///     signature BIT STRING
+///   }
+fn build_pkcs10_csr(
+    cn: &str,
+    public_key_uncompressed: &[u8], // 65 bytes (0x04 || x || y)
+    signing_key: &SigningKey,
+) -> Result<Vec<u8>, HsmError> {
+    // --- Build CertificationRequestInfo ---
+    let mut cri = Vec::with_capacity(256);
+
+    // version INTEGER 0
+    cri.extend_from_slice(&[0x02, 0x01, 0x00]);
+
+    // subject: Name = SEQUENCE { SET { SEQUENCE { OID 2.5.4.3 (cn), UTF8String } } }
+    let cn_bytes = cn.as_bytes();
+    let cn_oid: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03]; // OID 2.5.4.3
+    let cn_val_tag: &[u8] = &[0x0C]; // UTF8String tag
+    // inner SEQUENCE: OID + UTF8String
+    let inner_seq_len = cn_oid.len() + 1 + der_len_size(cn_bytes.len()) + cn_bytes.len();
+    // SET wrapping inner SEQUENCE
+    let set_len = 1 + der_len_size(inner_seq_len) + inner_seq_len;
+    // outer SEQUENCE wrapping SET
+    let name_len = 1 + der_len_size(set_len) + set_len;
+
+    cri.push(0x30); // SEQUENCE (Name)
+    push_der_len(&mut cri, name_len);
+    cri.push(0x31); // SET
+    push_der_len(&mut cri, inner_seq_len + 1 + der_len_size(inner_seq_len));
+    cri.push(0x30); // SEQUENCE (AttributeTypeAndValue)
+    push_der_len(&mut cri, inner_seq_len);
+    cri.extend_from_slice(cn_oid);
+    cri.push(cn_val_tag[0]);
+    push_der_len(&mut cri, cn_bytes.len());
+    cri.extend_from_slice(cn_bytes);
+
+    // subjectPKInfo: SubjectPublicKeyInfo for EC-P256
+    // SEQUENCE { SEQUENCE { OID ecPublicKey, OID P-256 }, BIT STRING { 0x00 || uncompressed } }
+    let ec_pk_oid: &[u8] = &[
+        0x30, 0x13, // SEQUENCE (AlgorithmIdentifier)
+        0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, // OID ecPublicKey
+        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, // OID P-256
+    ];
+    let bit_string_len = 1 + public_key_uncompressed.len(); // 0x00 padding + key
+    let spki_inner_len = ec_pk_oid.len() + 1 + der_len_size(bit_string_len) + bit_string_len;
+
+    cri.push(0x30); // SEQUENCE (SubjectPublicKeyInfo)
+    push_der_len(&mut cri, spki_inner_len);
+    cri.extend_from_slice(ec_pk_oid);
+    cri.push(0x03); // BIT STRING
+    push_der_len(&mut cri, bit_string_len);
+    cri.push(0x00); // no unused bits
+    cri.extend_from_slice(public_key_uncompressed);
+
+    // attributes [0] IMPLICIT (empty)
+    cri.extend_from_slice(&[0xA0, 0x00]);
+
+    // Wrap CRI in SEQUENCE
+    let mut cri_seq = Vec::with_capacity(cri.len() + 4);
+    cri_seq.push(0x30);
+    push_der_len(&mut cri_seq, cri.len());
+    cri_seq.extend_from_slice(&cri);
+
+    // --- Sign CRI ---
+    let signature: ecdsa::der::Signature<p256::NistP256> = signing_key.sign(&cri_seq);
+    let sig_bytes = signature.to_bytes();
+
+    // --- Build outer CertificationRequest ---
+    // signatureAlgorithm: ecdsa-with-SHA256
+    let sig_alg: &[u8] = &[
+        0x30, 0x0A, // SEQUENCE (AlgorithmIdentifier)
+        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02, // OID ecdsa-with-SHA256
+    ];
+
+    let bit_sig_len = 1 + sig_bytes.len(); // 0x00 + DER signature
+    let outer_len =
+        cri_seq.len() + sig_alg.len() + 1 + der_len_size(bit_sig_len) + bit_sig_len;
+
+    let mut csr = Vec::with_capacity(outer_len + 4);
+    csr.push(0x30); // SEQUENCE (CertificationRequest)
+    push_der_len(&mut csr, outer_len);
+    csr.extend_from_slice(&cri_seq);
+    csr.extend_from_slice(sig_alg);
+    csr.push(0x03); // BIT STRING
+    push_der_len(&mut csr, bit_sig_len);
+    csr.push(0x00); // no unused bits
+    csr.extend_from_slice(&sig_bytes);
+
+    Ok(csr)
+}
+
+/// Size of a DER length encoding.
+fn der_len_size(len: usize) -> usize {
+    if len < 0x80 {
+        1
+    } else if len < 0x100 {
+        2
+    } else {
+        3
+    }
+}
+
+/// Push a DER length encoding.
+fn push_der_len(buf: &mut Vec<u8>, len: usize) {
+    if len < 0x80 {
+        buf.push(len as u8);
+    } else if len < 0x100 {
+        buf.push(0x81);
+        buf.push(len as u8);
+    } else {
+        buf.push(0x82);
+        buf.push((len >> 8) as u8);
+        buf.push(len as u8);
+    }
 }
 
 fn load_aes_key(hsm: &LinuxSimHsm, key_id: &str) -> Result<Vec<u8>, HsmError> {

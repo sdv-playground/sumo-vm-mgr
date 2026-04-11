@@ -104,6 +104,17 @@ pub struct KeyInfo {
     pub allowed_ops: Option<Vec<String>>,
 }
 
+/// Provisioning lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisioningState {
+    /// Device key exists but no key bundle provisioned yet.
+    /// CSR endpoint is available.
+    Unprovisioned,
+    /// Key bundle installed, all well-known handles populated.
+    /// CSR endpoint returns 403.
+    Provisioned,
+}
+
 /// Status of the HSM subsystem.
 #[derive(Debug)]
 pub struct HsmStatus {
