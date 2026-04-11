@@ -8,5 +8,6 @@ members = [
     "crates/hsm",
     "crates/vhsm-ssd",
     "crates/vm-devices",
+    "crates/secstore",
 ]
 

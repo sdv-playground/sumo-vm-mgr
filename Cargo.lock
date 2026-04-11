@@ -1498,6 +1498,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "secstore"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
