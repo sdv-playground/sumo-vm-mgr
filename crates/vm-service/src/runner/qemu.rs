@@ -65,40 +65,6 @@ impl QemuRunner {
             .unwrap_or_else(|| arch.qemu_binary().to_string())
     }
 
-    fn sim_binary(&self, name: &str, sim_dir: Option<&Path>) -> Result<PathBuf, RunnerError> {
-        if let Some(dir) = sim_dir {
-            let path = dir.join(name);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-        // Fall back to PATH lookup
-        match Command::new("which").arg(name).output() {
-            Ok(out) if out.status.success() => {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                Ok(PathBuf::from(s))
-            }
-            _ => Err(RunnerError::Config(format!(
-                "simulator binary not found: {name} (not in sim_dir or PATH)",
-            ))),
-        }
-    }
-
-    fn start_process(&mut self, name: &str, cmd: &mut Command) -> Result<u32, RunnerError> {
-        let child = cmd
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| RunnerError::ProcessFailed(format!("{name}: {e}")))?;
-        let pid = child.id();
-        self.host_processes.push(HostProcess {
-            name: name.to_string(),
-            child,
-        });
-        Ok(pid)
-    }
-
     /// Start the Rust health simulator on a background thread.
     fn start_health_sim(&mut self, vm_name: &str) -> Result<(), RunnerError> {
         use vm_devices::transport::ivshmem::{IvshmemSharedMemory, NullDoorbell};
@@ -426,7 +392,7 @@ impl QemuRunner {
 
 impl VmRunner for QemuRunner {
     fn start(&mut self, name: &str, def: &VmDefinition) -> Result<VmHandle, RunnerError> {
-        let sim_dir = def.sim_dir.as_deref();
+        let _sim_dir = def.sim_dir.as_deref();
         let mut ivshmem = IvshmemSockets::default();
 
         // Start ivshmem servers for devices that need shared memory

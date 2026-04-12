@@ -9,7 +9,6 @@
 //! - Truncated transfer (stream ends early)
 //! - Wrong encryption key (device key mismatch)
 
-use std::path::Path;
 use std::pin::Pin;
 
 use bytes::Bytes;

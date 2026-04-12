@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use hsm::linux::LinuxSimHsm;
-use hsm::{HsmCryptoProvider, HsmProvider};
+use hsm::HsmCryptoProvider;
 
 use vhsm_ssd::handle_table::HandleTable;
 use vhsm_ssd::handler;

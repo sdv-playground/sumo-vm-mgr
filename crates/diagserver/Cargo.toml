@@ -48,9 +48,5 @@ name = "vm-sovd"
 path = "src/sovd_main.rs"
 
 [[example]]
-name = "build"
-path = "../../example/build.rs"
-
-[[example]]
 name = "build_hsm_keys"
 path = "../../example/build_hsm_keys.rs"

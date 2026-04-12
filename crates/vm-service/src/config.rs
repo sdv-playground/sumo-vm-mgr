@@ -268,20 +268,25 @@ pub enum DeviceConfig {
     },
     #[serde(rename = "health")]
     Health {
+        #[allow(dead_code)] // parsed from YAML config
         #[serde(default = "default_device_backend")]
         backend: String,
     },
     #[serde(rename = "time")]
     Time {
+        #[allow(dead_code)] // parsed from YAML config
         #[serde(default = "default_device_backend")]
         backend: String,
     },
     #[serde(rename = "hsm")]
     Hsm {
+        #[allow(dead_code)] // parsed from YAML config
         #[serde(default)]
         keystore: Option<String>,
+        #[allow(dead_code)] // parsed from YAML config
         #[serde(default)]
         keygen_bin: Option<String>,
+        #[allow(dead_code)] // parsed from YAML config
         #[serde(default = "default_hsm_port")]
         port: u16,
     },
@@ -309,30 +314,4 @@ impl DeviceConfig {
         }
     }
 
-    pub fn needs_simulator(&self) -> bool {
-        match self {
-            DeviceConfig::Health { backend }
-            | DeviceConfig::Time { backend }
-            | DeviceConfig::Can { backend, .. } => backend == "simulated",
-            _ => false,
-        }
-    }
-
-    pub fn ivshmem_label(&self) -> Option<String> {
-        match self {
-            DeviceConfig::Health { .. } if self.needs_ivshmem() => Some("health".into()),
-            DeviceConfig::Time { .. } if self.needs_ivshmem() => Some("time".into()),
-            DeviceConfig::Can { index, .. } if self.needs_ivshmem() => Some(format!("can{index}")),
-            _ => None,
-        }
-    }
-
-    pub fn ivshmem_magic(&self) -> Option<u32> {
-        match self {
-            DeviceConfig::Health { .. } => Some(0x48544C48), // "HLTH"
-            DeviceConfig::Time { .. } => Some(0x54494D45),   // "TIME"
-            DeviceConfig::Can { .. } => Some(0x4E414356),    // "VCAN"
-            _ => None,
-        }
-    }
 }

@@ -924,21 +924,6 @@ fn encode_cbor_uint(major: u8, value: u64, buf: &mut Vec<u8>) {
     }
 }
 
-/// Calculate how many extra bytes a CBOR uint needs (for tracking buffer positions).
-fn temp_for_uint_len(value: u64) -> usize {
-    if value < 24 {
-        0
-    } else if value <= u8::MAX as u64 {
-        1
-    } else if value <= u16::MAX as u64 {
-        2
-    } else if value <= u32::MAX as u64 {
-        4
-    } else {
-        8
-    }
-}
-
 fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize, String> {
     let mut total = 0;
     while total < buf.len() {

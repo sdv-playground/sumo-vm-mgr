@@ -73,17 +73,12 @@ struct StoredPackage {
 
 /// A validated manifest (uploaded separately from payloads).
 struct StoredManifest {
-    id: String,
     raw_bytes: Vec<u8>,
-    validated: ValidatedFirmware,
 }
 
 /// A raw payload saved to disk (uploaded separately from manifest).
 struct StoredPayload {
-    id: String,
     path: std::path::PathBuf,
-    size: u64,
-    sha256: [u8; 32],
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +97,7 @@ enum FlashSessionState {
     /// Manifest received, waiting for payload at component index N.
     AwaitingPayload {
         manifest_bytes: Vec<u8>,
+        #[allow(dead_code)] // TODO: use validated firmware metadata during payload processing
         validated: ValidatedFirmware,
         next_component: usize,
         total_components: usize,
@@ -308,7 +304,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 .unwrap_or(0)
         };
 
-        let validated = crate::streaming::validate_manifest(
+        let _validated = crate::streaming::validate_manifest(
             data,
             self.manifest_provider.as_ref(),
             min_security_ver,
@@ -317,9 +313,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let id = self.next_id();
         let mut manifests = self.manifests.lock().unwrap();
         manifests.insert(id.clone(), StoredManifest {
-            id: id.clone(),
             raw_bytes: data.to_vec(),
-            validated,
         });
 
         tracing::info!(manifest_id = %id, "manifest uploaded and validated");
@@ -340,14 +334,11 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let fname = filename.unwrap_or("payload");
         let path = dir.join(format!("upload-{id}-{fname}"));
 
-        let (size, sha256) = crate::streaming::save_raw_payload(stream, &path).await?;
+        let (size, _sha256) = crate::streaming::save_raw_payload(stream, &path).await?;
 
         let mut payloads = self.payloads.lock().unwrap();
         payloads.insert(id.clone(), StoredPayload {
-            id: id.clone(),
             path,
-            size,
-            sha256,
         });
 
         tracing::info!(payload_id = %id, size, "payload uploaded to disk");
@@ -419,7 +410,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 "processing payload"
             );
 
-            let (size, hash) = crate::streaming::process_raw_payload(
+            let (size, _hash) = crate::streaming::process_raw_payload(
                 &stored_payload.path,
                 &manifest.raw_bytes,
                 comp_idx,
@@ -442,7 +433,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     async fn handle_manifest_upload(
         &self,
         stream: PackageStream,
-        content_length: Option<u64>,
+        _content_length: Option<u64>,
     ) -> BackendResult<String> {
         use futures::StreamExt;
 
@@ -506,7 +497,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     async fn handle_payload_upload(
         &self,
         stream: PackageStream,
-        content_length: Option<u64>,
+        _content_length: Option<u64>,
     ) -> BackendResult<String> {
         // Extract session state
         let (manifest_bytes, comp_idx, total) = {
@@ -566,7 +557,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         );
 
         // Decrypt → decompress → verify → write
-        let (image_size, image_hash) = crate::streaming::process_raw_payload(
+        let (image_size, _image_hash) = crate::streaming::process_raw_payload(
             &raw_path,
             &manifest_bytes,
             comp_idx,
