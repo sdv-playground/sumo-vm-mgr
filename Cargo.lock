@@ -589,6 +589,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastrand"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1069,6 +1075,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1479,6 +1491,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags 2.11.0",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1859,7 +1884,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sumo-codec"
 version = "0.1.0"
-source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#b8a810af0e3d67d3df104ce38089dbb3d7419b25"
+source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#22293c8acf883f52be49c59f84709ed5b9b2a852"
 dependencies = [
  "ciborium",
  "coset",
@@ -1868,7 +1893,7 @@ dependencies = [
 [[package]]
 name = "sumo-crypto"
 version = "0.1.0"
-source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#b8a810af0e3d67d3df104ce38089dbb3d7419b25"
+source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#22293c8acf883f52be49c59f84709ed5b9b2a852"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1889,7 +1914,7 @@ dependencies = [
 [[package]]
 name = "sumo-offboard"
 version = "0.1.0"
-source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#b8a810af0e3d67d3df104ce38089dbb3d7419b25"
+source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#22293c8acf883f52be49c59f84709ed5b9b2a852"
 dependencies = [
  "ciborium",
  "coset",
@@ -1907,7 +1932,7 @@ dependencies = [
 [[package]]
 name = "sumo-onboard"
 version = "0.1.0"
-source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#b8a810af0e3d67d3df104ce38089dbb3d7419b25"
+source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#22293c8acf883f52be49c59f84709ed5b9b2a852"
 dependencies = [
  "ciborium",
  "coset",
@@ -1919,7 +1944,7 @@ dependencies = [
 [[package]]
 name = "sumo-processor"
 version = "0.1.0"
-source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#b8a810af0e3d67d3df104ce38089dbb3d7419b25"
+source = "git+ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git?branch=main#22293c8acf883f52be49c59f84709ed5b9b2a852"
 dependencies = [
  "sumo-codec",
  "sumo-crypto",
@@ -1954,6 +1979,19 @@ name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.2",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "thiserror"
@@ -2351,6 +2389,7 @@ dependencies = [
  "sumo-offboard",
  "sumo-onboard",
  "sumo-processor",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tower",

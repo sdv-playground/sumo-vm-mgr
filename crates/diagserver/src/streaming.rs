@@ -259,119 +259,173 @@ struct PendingPayload {
     len: u64,
 }
 
-/// Parse the SUIT envelope CBOR header from an async reader.
+/// Parse the SUIT envelope CBOR from an async reader.
 ///
-/// Buffers integer-keyed entries (auth, manifest, severable members).
-/// Text-keyed entries (integrated payloads) are NOT buffered — their
-/// key and length are returned so the caller can stream each one.
+/// Reads the envelope as a CBOR map entry by entry. Non-payload entries
+/// (integer-keyed: auth, manifest, severable) are collected as ciborium
+/// Values. Text-keyed entries (integrated payloads) are NOT buffered —
+/// their key and length are returned so the caller can stream each one.
 ///
 /// Returns (header_bytes, pending_payloads, original_map_entry_count).
 async fn parse_envelope_header<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<(Vec<u8>, Vec<PendingPayload>, u64), BackendError> {
-    let initial = read_byte(reader).await?;
-    let mut header_buf = vec![initial];
+    // Buffer enough to read the outer CBOR structure. We read entry by entry:
+    // for non-payload entries, we buffer the raw bytes into a growing vec and
+    // use ciborium to decode each entry. For payload entries, we just record
+    // the key and length.
+    //
+    // Strategy: accumulate all bytes into a buffer. When we encounter a text
+    // key (payload), note the position and skip reading its value bytes.
+    // After all entries, the buffer contains a valid CBOR map minus payloads.
 
+    // Read all bytes for non-payload map entries into this buffer.
+    // We'll also track which entries are payloads vs non-payload.
+    let mut all_bytes = Vec::new();
+    let mut pending_payloads = Vec::new();
+
+    // Read until we have the map header
+    let initial = read_byte(reader).await?;
+    all_bytes.push(initial);
     let (major, additional) = (initial >> 5, initial & 0x1f);
 
+    // Handle optional Tag(107) wrapper
     let map_entry_count;
     if major == 6 {
-        let _tag_val = read_cbor_uint(reader, additional, &mut header_buf).await?;
+        let _tag_val = read_cbor_uint(reader, additional, &mut all_bytes).await?;
         let map_byte = read_byte(reader).await?;
-        header_buf.push(map_byte);
+        all_bytes.push(map_byte);
         let (m, a) = (map_byte >> 5, map_byte & 0x1f);
         if m != 5 {
             return Err(BackendError::Internal("expected CBOR map in envelope".into()));
         }
-        map_entry_count = read_cbor_uint(reader, a, &mut header_buf).await?;
+        map_entry_count = read_cbor_uint(reader, a, &mut all_bytes).await?;
     } else if major == 5 {
-        map_entry_count = read_cbor_uint(reader, additional, &mut header_buf).await?;
+        map_entry_count = read_cbor_uint(reader, additional, &mut all_bytes).await?;
     } else {
         return Err(BackendError::Internal(format!(
             "expected CBOR map or tag, got major type {major}"
         )));
     }
 
-    let mut pending_payloads = Vec::new();
-
+    // Read each map entry
     for _ in 0..map_entry_count {
+        // Peek at the key to determine if this is a payload entry
         let key_byte = read_byte(reader).await?;
-        let (key_major, key_add) = (key_byte >> 5, key_byte & 0x1f);
+        let (key_major, _key_add) = (key_byte >> 5, key_byte & 0x1f);
 
-        match key_major {
-            0 => {
-                // Integer key (auth, manifest, severable) — buffer fully
-                header_buf.push(key_byte);
-                let _key_val = read_cbor_uint(reader, key_add, &mut header_buf).await?;
+        if key_major == 3 {
+            // Text key — this is an integrated payload. Read key name,
+            // read payload length, but DON'T read payload bytes.
+            let mut temp = vec![key_byte];
+            let key_len = read_cbor_uint(reader, _key_add, &mut temp).await?;
+            let mut key_str = vec![0u8; key_len as usize];
+            reader.read_exact(&mut key_str).await.map_err(map_io)?;
+            let key_name = String::from_utf8_lossy(&key_str).to_string();
 
-                let val_byte = read_byte(reader).await?;
-                header_buf.push(val_byte);
-                let (val_major, val_add) = (val_byte >> 5, val_byte & 0x1f);
-                let val_len = read_cbor_uint(reader, val_add, &mut header_buf).await?;
-
-                if val_major == 2 {
-                    let mut data = vec![0u8; val_len as usize];
-                    reader.read_exact(&mut data).await.map_err(map_io)?;
-                    header_buf.extend_from_slice(&data);
-                } else {
-                    let mut skip = vec![0u8; val_len as usize];
-                    reader.read_exact(&mut skip).await.map_err(map_io)?;
-                    header_buf.extend_from_slice(&skip);
-                }
-            }
-            3 => {
-                // Text key — integrated payload. Don't buffer the data.
-                // Read the key name but don't add to header_buf.
-                let mut temp = Vec::new();
-                temp.push(key_byte);
-                let key_len = read_cbor_uint(reader, key_add, &mut temp).await?;
-                let mut key_str = vec![0u8; key_len as usize];
-                reader.read_exact(&mut key_str).await.map_err(map_io)?;
-                let key_name = String::from_utf8_lossy(&key_str).to_string();
-
-                // Read the bstr header for the payload
-                let val_byte = read_byte(reader).await?;
-                let (val_major, val_add) = (val_byte >> 5, val_byte & 0x1f);
-                if val_major != 2 {
-                    return Err(BackendError::Internal(format!(
-                        "expected byte string for {key_name} payload"
-                    )));
-                }
-                let mut temp2 = Vec::new();
-                let payload_len = read_cbor_uint(reader, val_add, &mut temp2).await?;
-
-                pending_payloads.push(PendingPayload {
-                    key: key_name,
-                    len: payload_len,
-                });
-                // The payload data itself remains in the stream — caller reads it.
-            }
-            _ => {
+            let val_byte = read_byte(reader).await?;
+            let (val_major, val_add) = (val_byte >> 5, val_byte & 0x1f);
+            if val_major != 2 {
                 return Err(BackendError::Internal(format!(
-                    "unexpected CBOR key major type {key_major} in envelope"
+                    "expected byte string for {key_name} payload"
                 )));
             }
+            let mut temp2 = Vec::new();
+            let payload_len = read_cbor_uint(reader, val_add, &mut temp2).await?;
+
+            pending_payloads.push(PendingPayload {
+                key: key_name,
+                len: payload_len,
+            });
+            // Payload data stays in the stream for the caller to read.
+        } else {
+            // Non-payload entry — buffer the key + value raw bytes.
+            // We need to read the complete CBOR item (key + value).
+            all_bytes.push(key_byte);
+            read_cbor_key_rest(reader, key_major, _key_add, &mut all_bytes).await?;
+            // Now read the value
+            let val_byte = read_byte(reader).await?;
+            all_bytes.push(val_byte);
+            let (val_major, val_add) = (val_byte >> 5, val_byte & 0x1f);
+            read_cbor_value_rest(reader, val_major, val_add, &mut all_bytes).await?;
         }
     }
 
-    // Rebuild header with reduced map count (exclude payload entries)
-    let payload_count = pending_payloads.len() as u64;
-    let header_bytes = if payload_count > 0 {
-        rebuild_header_without_payloads(&header_buf, map_entry_count, payload_count)?
+    // Rebuild: the buffer has the wrong map count (original N, but only N-P entries).
+    // Rewrite the map header with the correct count.
+    let non_payload_count = map_entry_count - pending_payloads.len() as u64;
+    let header_bytes = if pending_payloads.is_empty() {
+        all_bytes
     } else {
-        header_buf
+        rewrite_map_count(&all_bytes, non_payload_count)?
     };
 
     Ok((header_bytes, pending_payloads, map_entry_count))
 }
 
-/// Rebuild the CBOR header with a corrected map entry count (N-P, excluding P payload entries).
-fn rebuild_header_without_payloads(
-    raw: &[u8],
-    original_count: u64,
-    payload_count: u64,
-) -> Result<Vec<u8>, BackendError> {
-    let new_count = original_count - payload_count;
+/// Read a CBOR key's additional bytes (the key initial byte is already in buf).
+/// SUIT envelope keys are integers (positive/negative) or byte strings.
+async fn read_cbor_key_rest<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    major: u8,
+    additional: u8,
+    buf: &mut Vec<u8>,
+) -> Result<(), BackendError> {
+    match major {
+        0 | 1 => {
+            let _val = read_cbor_uint(reader, additional, buf).await?;
+        }
+        2 => {
+            // Byte string key (digest refs in severable)
+            let len = read_cbor_uint(reader, additional, buf).await?;
+            let mut data = vec![0u8; len as usize];
+            reader.read_exact(&mut data).await.map_err(map_io)?;
+            buf.extend_from_slice(&data);
+        }
+        6 => {
+            // Tag wrapping a key — read tag value, then inner key
+            let _tag = read_cbor_uint(reader, additional, buf).await?;
+            let inner = read_byte(reader).await?;
+            buf.push(inner);
+            let (im, ia) = (inner >> 5, inner & 0x1f);
+            // Inner key is an integer
+            if im == 0 || im == 1 {
+                let _val = read_cbor_uint(reader, ia, buf).await?;
+            }
+        }
+        _ => {
+            return Err(BackendError::Internal(format!(
+                "unexpected CBOR key major type {major}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Read a CBOR value completely into buf (the value initial byte is already in buf).
+/// SUIT envelope values at the top level are always bstr.
+async fn read_cbor_value_rest<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    major: u8,
+    additional: u8,
+    buf: &mut Vec<u8>,
+) -> Result<(), BackendError> {
+    let len = read_cbor_uint(reader, additional, buf).await?;
+    if major == 2 || major == 3 {
+        // Byte/text string — read len bytes
+        let mut data = vec![0u8; len as usize];
+        reader.read_exact(&mut data).await.map_err(map_io)?;
+        buf.extend_from_slice(&data);
+    }
+    // For other types (arrays/maps at top level of envelope), the length
+    // encoding suffices since we buffered it. The actual content follows
+    // but SUIT envelope values are always bstr at the top level.
+    Ok(())
+}
+
+/// Rewrite the CBOR map header to have the given entry count.
+/// The body bytes stay the same — only the count in the map header changes.
+fn rewrite_map_count(raw: &[u8], new_count: u64) -> Result<Vec<u8>, BackendError> {
     let mut result = Vec::with_capacity(raw.len());
 
     let mut pos = 0;
@@ -899,4 +953,118 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize, S
 
 fn map_io(e: io::Error) -> BackendError {
     BackendError::Internal(format!("I/O error: {e}"))
+}
+
+// =============================================================================
+// Raw payload processor (separate manifest + payload uploads)
+// =============================================================================
+
+/// Process a raw payload file using a pre-validated manifest.
+///
+/// Unlike `process_envelope_stream` which parses CBOR, this reads a raw
+/// encrypted byte stream (no CBOR framing) and processes it using the
+/// manifest's encryption_info for the specified component.
+///
+/// Flow: read raw file → decrypt (AES-GCM) → decompress (zstd) → verify hash → write
+pub fn process_raw_payload(
+    payload_path: &Path,
+    manifest_bytes: &[u8],
+    component_index: usize,
+    device_key: Option<&[u8]>,
+    expected_digest: &[u8],
+    output_path: &Path,
+) -> Result<(usize, [u8; 32]), String> {
+    let crypto = RustCryptoBackend::new();
+
+    let envelope = sumo_codec::decode::decode_envelope(manifest_bytes)
+        .map_err(|e| format!("decode manifest: {e:?}"))?;
+    let manifest = sumo_onboard::manifest::Manifest { envelope };
+
+    let has_encryption = manifest.encryption_info(component_index).is_some();
+
+    let file = std::fs::File::open(payload_path)
+        .map_err(|e| format!("open payload {}: {e}", payload_path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+
+    if has_encryption {
+        let dk_bytes = device_key.ok_or("encrypted payload but no device key")?;
+        let dk = coset::CborSerializable::from_slice(dk_bytes)
+            .map_err(|e| format!("invalid device key: {e:?}"))?;
+
+        let decryptor = StreamingDecryptor::new(&manifest, component_index, &dk, &crypto)
+            .map_err(|e| format!("decryptor setup: {e:?}"))?;
+
+        let mut decrypt_reader = DecryptReader::new(reader, decryptor);
+
+        // Detect zstd
+        let mut first_buf = [0u8; 4];
+        let first_n = read_exact_or_eof(&mut decrypt_reader, &mut first_buf)?;
+
+        if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
+            let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
+            process_decompressed(prefixed, expected_digest, Some(output_path))
+        } else {
+            let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
+            process_plain(prefixed, expected_digest, Some(output_path))
+        }
+    } else {
+        // Unencrypted — detect zstd
+        let mut first_buf = [0u8; 4];
+        let first_n = read_exact_or_eof(&mut reader, &mut first_buf)?;
+
+        if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
+            let prefixed = PrefixReader::new(&first_buf[..first_n], reader);
+            process_decompressed(prefixed, expected_digest, Some(output_path))
+        } else {
+            let prefixed = PrefixReader::new(&first_buf[..first_n], reader);
+            process_plain(prefixed, expected_digest, Some(output_path))
+        }
+    }
+}
+
+/// Stream a raw payload from an async stream to disk (no CBOR, no processing).
+/// Just write bytes + compute SHA256 for later verification.
+pub async fn save_raw_payload(
+    stream: PackageStream,
+    output_path: &Path,
+) -> Result<(u64, [u8; 32]), BackendError> {
+    let reader = StreamReader::new(
+        stream.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::Other, e))),
+    );
+    tokio::pin!(reader);
+
+    let mut file = tokio::fs::File::create(output_path).await.map_err(|e| {
+        BackendError::Internal(format!("create {}: {e}", output_path.display()))
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let n = reader.read(&mut buf).await.map_err(|e| {
+            BackendError::Internal(format!("stream read: {e}"))
+        })?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+        tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await.map_err(|e| {
+            BackendError::Internal(format!("write: {e}"))
+        })?;
+        total += n as u64;
+    }
+
+    let hash: [u8; 32] = hasher.finalize().into();
+    Ok((total, hash))
+}
+
+/// Validate a manifest (small CBOR envelope, no payload).
+/// Uses header-only validation — payloads are uploaded separately.
+pub fn validate_manifest(
+    manifest_bytes: &[u8],
+    manifest_provider: &dyn ManifestProvider,
+    min_security_ver: u32,
+) -> Result<ValidatedFirmware, BackendError> {
+    manifest_provider
+        .validate_header_only(manifest_bytes, min_security_ver)
+        .map_err(|e| BackendError::InvalidRequest(format!("manifest validation: {e}")))
 }

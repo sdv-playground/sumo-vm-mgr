@@ -37,6 +37,7 @@ hyper = "1"
 sumo-offboard = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 coset = "0.3"
 ciborium = "0.2"
+tempfile = "3"
 
 [[bin]]
 name = "vm-diagserver"
