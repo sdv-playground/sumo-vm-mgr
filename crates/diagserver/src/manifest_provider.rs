@@ -16,6 +16,7 @@ pub enum ManifestType {
 }
 
 /// Result of successful manifest validation — ready for OTA install.
+#[derive(Clone)]
 pub struct ValidatedFirmware {
     pub bank_set: BankSet,
     /// Manifest sub-type (firmware image vs HSM key material).

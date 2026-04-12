@@ -518,6 +518,24 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 total_components,
             );
 
+            // Store as package so finalize_flash can find it
+            {
+                let mut packages = self.packages.lock().unwrap();
+                packages.insert(id.clone(), StoredPackage {
+                    id: id.clone(),
+                    validated: validated.clone(),
+                    status: PackageStatus::Verified,
+                });
+            }
+
+            // Set package_id on flash transfer
+            {
+                let mut ft = self.flash_transfer.lock().unwrap();
+                if let Some(ref mut t) = *ft {
+                    t.package_id = id.clone();
+                }
+            }
+
             let mut session = self.flash_session.lock().unwrap();
             *session = Some(FlashSessionState::AwaitingPayload {
                 manifest_bytes: data,
