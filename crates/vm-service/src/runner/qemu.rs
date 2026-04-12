@@ -203,16 +203,21 @@ impl QemuRunner {
         let is_qnx = def.os_type == crate::config::OsType::Qnx;
 
         if is_qnx {
-            // QNX: boot from disk image (IFS + QNX6 filesystem in one image).
-            // No separate kernel, no kernel cmdline.
-            let rootfs = def.rootfs_path()
-                .ok_or_else(|| RunnerError::Config(format!(
-                    "{name}: no disk image configured (set images.rootfs in config)"
-                )))?;
-            args.extend_from_slice(&[
-                "-drive".into(),
-                format!("file={},format=raw", rootfs.display()),
-            ]);
+            // QNX: IFS boot disk + QNX6 root filesystem as separate drives.
+            // Boot disk (IFS): loaded by BIOS/IPL into RAM.
+            // Root filesystem: mounted at / by IFS startup script.
+            if let Some(boot) = def.kernel_path() {
+                args.extend_from_slice(&[
+                    "-drive".into(),
+                    format!("file={},format=raw", boot.display()),
+                ]);
+            }
+            if let Some(rootfs) = def.rootfs_path() {
+                args.extend_from_slice(&[
+                    "-drive".into(),
+                    format!("file={},format=raw", rootfs.display()),
+                ]);
+            }
 
             // Extra disks (data partition, etc.)
             for disk in &def.disks {
@@ -301,7 +306,7 @@ impl QemuRunner {
             args.extend_from_slice(&["-append".into(), cmdline]);
         } // end Linux boot
 
-        // Network devices (shared for both OS types)
+        // Network devices (shared for both OS types — spec mandates virtio-net)
         let networks: Vec<_> = def.devices.iter()
             .filter(|d| matches!(d, DeviceConfig::Network { .. }))
             .collect();
