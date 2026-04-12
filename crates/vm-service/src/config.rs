@@ -23,6 +23,9 @@ pub struct VmServiceConfig {
 pub struct VmDefinition {
     /// Backend type: qemu, qnx, or dummy.
     pub backend: BackendType,
+    /// Guest operating system type. Affects boot method, disk layout, device setup.
+    #[serde(default)]
+    pub os_type: OsType,
     /// Target architecture (default: aarch64).
     #[serde(default)]
     pub arch: Option<String>,
@@ -64,6 +67,19 @@ pub struct VmDefinition {
 
 fn default_cpus() -> u32 { 4 }
 fn default_ram() -> u32 { 2048 }
+
+/// Guest OS type — affects boot method, disk layout, and device setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OsType {
+    /// Linux guest: boots with -kernel + -append + rootfs as virtio-blk.
+    /// Supports vcan-shm, vtime, vhealth kernel modules.
+    #[default]
+    Linux,
+    /// QNX guest: boots from disk image (IFS + QNX6 filesystem).
+    /// No separate kernel — bootloader in the disk image.
+    Qnx,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]

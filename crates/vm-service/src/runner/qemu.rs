@@ -199,85 +199,109 @@ impl QemuRunner {
             format!("unix:{qmp_sock},server,nowait"),
         ]);
 
-        // Kernel — resolved from image_dir + images.kernel
-        if let Some(kernel_path) = def.kernel_path() {
+        // Boot mode depends on OS type
+        let is_qnx = def.os_type == crate::config::OsType::Qnx;
+
+        if is_qnx {
+            // QNX: boot from disk image (IFS + QNX6 filesystem in one image).
+            // No separate kernel, no kernel cmdline.
+            let rootfs = def.rootfs_path()
+                .ok_or_else(|| RunnerError::Config(format!(
+                    "{name}: no disk image configured (set images.rootfs in config)"
+                )))?;
             args.extend_from_slice(&[
-                "-kernel".into(),
-                kernel_path.to_string_lossy().into_owned(),
-            ]);
-        }
-
-        // Build kernel cmdline
-        let mut cmdline_parts: Vec<String> = vec![
-            "root=/dev/vda".into(),
-            "rw".into(),
-            format!("console={}", arch.console_device()),
-            "earlycon".into(),
-            "no_console_suspend".into(),
-            "pm_debug_messages".into(),
-        ];
-
-        let can_count = def.can_count();
-        if can_count > 0 {
-            cmdline_parts.push("vcan_shm.backend=ivshmem".into());
-            cmdline_parts.push(format!("vcan_shm.num_devices={can_count}"));
-        }
-
-        if let Some(ref extra) = def.extra_cmdline {
-            cmdline_parts.push(extra.clone());
-        }
-
-        // Extra disks (data, swap — from def.disks, not banked)
-        let blk_device = arch.virtio_device("blk");
-        let mut disk_args: Vec<Vec<String>> = Vec::new();
-
-        for disk in &def.disks {
-            let drive_id = format!("hd_{}", disk.role);
-            let ro = if disk.readonly { ",readonly=on" } else { "" };
-            disk_args.push(vec![
                 "-drive".into(),
-                format!("file={},format=raw,if=none,id={drive_id}{ro}", disk.path.display()),
-                "-device".into(),
-                format!("{blk_device},drive={drive_id}"),
+                format!("file={},format=raw", rootfs.display()),
             ]);
 
-            if disk.role == "swap" {
-                cmdline_parts.push("resume=/dev/vdc".into());
+            // Extra disks (data partition, etc.)
+            for disk in &def.disks {
+                args.extend_from_slice(&[
+                    "-drive".into(),
+                    format!("file={},format=raw", disk.path.display()),
+                ]);
             }
-        }
 
-        // Rootfs image — resolved from image_dir + images.rootfs
-        let rootfs = def.rootfs_path()
-            .ok_or_else(|| RunnerError::Config(format!(
-                "{name}: no rootfs image configured (set images.rootfs in config)"
-            )))?;
-        let rootfs_args = vec![
-            "-drive".into(),
-            format!("file={},format=raw,if=none,id=hd_rootfs", rootfs.display()),
-            "-device".into(),
-            format!("{blk_device},drive=hd_rootfs"),
-        ];
-
-        // Disk ordering depends on architecture:
-        //   aarch64 (reverse): extra disks first, rootfs last → rootfs = /dev/vda
-        //   x86_64  (forward): rootfs first, extra disks after → rootfs = /dev/vda
-        if arch.reverse_disk_order() {
-            for disk in &disk_args {
-                args.extend_from_slice(disk);
-            }
-            args.push("-device".into());
-            args.push(arch.virtio_device("rng"));
-            args.extend_from_slice(&rootfs_args);
         } else {
-            args.extend_from_slice(&rootfs_args);
-            args.push("-device".into());
-            args.push(arch.virtio_device("rng"));
-            for disk in &disk_args {
-                args.extend_from_slice(disk);
-            }
-        }
+            // Linux: kernel + rootfs + cmdline
 
-        // Network devices
+            if let Some(kernel_path) = def.kernel_path() {
+                args.extend_from_slice(&[
+                    "-kernel".into(),
+                    kernel_path.to_string_lossy().into_owned(),
+                ]);
+            }
+
+            let mut cmdline_parts: Vec<String> = vec![
+                "root=/dev/vda".into(),
+                "rw".into(),
+                format!("console={}", arch.console_device()),
+                "earlycon".into(),
+                "no_console_suspend".into(),
+                "pm_debug_messages".into(),
+            ];
+
+            let can_count = def.can_count();
+            if can_count > 0 {
+                cmdline_parts.push("vcan_shm.backend=ivshmem".into());
+                cmdline_parts.push(format!("vcan_shm.num_devices={can_count}"));
+            }
+
+            if let Some(ref extra) = def.extra_cmdline {
+                cmdline_parts.push(extra.clone());
+            }
+            // Extra disks (data, swap — from def.disks, not banked)
+            let blk_device = arch.virtio_device("blk");
+            let mut disk_args: Vec<Vec<String>> = Vec::new();
+
+            for disk in &def.disks {
+                let drive_id = format!("hd_{}", disk.role);
+                let ro = if disk.readonly { ",readonly=on" } else { "" };
+                disk_args.push(vec![
+                    "-drive".into(),
+                    format!("file={},format=raw,if=none,id={drive_id}{ro}", disk.path.display()),
+                    "-device".into(),
+                    format!("{blk_device},drive={drive_id}"),
+                ]);
+
+                if disk.role == "swap" {
+                    cmdline_parts.push("resume=/dev/vdc".into());
+                }
+            }
+
+            let rootfs = def.rootfs_path()
+                .ok_or_else(|| RunnerError::Config(format!(
+                    "{name}: no rootfs image configured (set images.rootfs in config)"
+                )))?;
+            let rootfs_args = vec![
+                "-drive".into(),
+                format!("file={},format=raw,if=none,id=hd_rootfs", rootfs.display()),
+                "-device".into(),
+                format!("{blk_device},drive=hd_rootfs"),
+            ];
+
+            if arch.reverse_disk_order() {
+                for disk in &disk_args {
+                    args.extend_from_slice(disk);
+                }
+                args.push("-device".into());
+                args.push(arch.virtio_device("rng"));
+                args.extend_from_slice(&rootfs_args);
+            } else {
+                args.extend_from_slice(&rootfs_args);
+                args.push("-device".into());
+                args.push(arch.virtio_device("rng"));
+                for disk in &disk_args {
+                    args.extend_from_slice(disk);
+                }
+            }
+
+            // Append kernel cmdline
+            let cmdline = cmdline_parts.join(" ");
+            args.extend_from_slice(&["-append".into(), cmdline]);
+        } // end Linux boot
+
+        // Network devices (shared for both OS types)
         let networks: Vec<_> = def.devices.iter()
             .filter(|d| matches!(d, DeviceConfig::Network { .. }))
             .collect();
@@ -381,10 +405,6 @@ impl QemuRunner {
                 ]);
             }
         }
-
-        // Append kernel cmdline
-        let cmdline = cmdline_parts.join(" ");
-        args.extend_from_slice(&["-append".into(), cmdline]);
 
         Ok(args)
     }
