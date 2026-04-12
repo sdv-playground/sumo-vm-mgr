@@ -71,6 +71,21 @@ struct StoredPackage {
     status: PackageStatus,
 }
 
+/// A validated manifest (uploaded separately from payloads).
+struct StoredManifest {
+    id: String,
+    raw_bytes: Vec<u8>,
+    validated: ValidatedFirmware,
+}
+
+/// A raw payload saved to disk (uploaded separately from manifest).
+struct StoredPayload {
+    id: String,
+    path: std::path::PathBuf,
+    size: u64,
+    sha256: [u8; 32],
+}
+
 // ---------------------------------------------------------------------------
 // Flash transfer tracking
 // ---------------------------------------------------------------------------
@@ -119,6 +134,8 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     manifest_provider: Arc<dyn ManifestProvider>,
     security_provider: Arc<dyn SecurityProvider>,
     packages: Mutex<HashMap<String, StoredPackage>>,
+    manifests: Mutex<HashMap<String, StoredManifest>>,
+    payloads: Mutex<HashMap<String, StoredPayload>>,
     flash_transfer: Mutex<Option<FlashTransferState>>,
     /// The bank the ECU is actually running on. Only changes on ecu_reset().
     /// NV active_bank may differ after install (it's the "next boot" bank).
@@ -221,6 +238,8 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             manifest_provider,
             security_provider,
             packages: Mutex::new(HashMap::new()),
+            manifests: Mutex::new(HashMap::new()),
+            payloads: Mutex::new(HashMap::new()),
             flash_transfer: Mutex::new(None),
             running_bank: Mutex::new(running_bank),
             session: Mutex::new(SessionState::Default),
@@ -244,6 +263,153 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let v = *id;
         *id += 1;
         v.to_string()
+    }
+
+    // =================================================================
+    // Separate manifest + payload upload methods (new flash path)
+    // =================================================================
+
+    /// Upload a manifest (small CBOR envelope without integrated payloads).
+    /// Validates signature + anti-rollback. Returns manifest_id.
+    pub fn receive_manifest(&self, data: &[u8]) -> BackendResult<String> {
+        self.require_flash_access()?;
+
+        let min_security_ver = {
+            let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let rb = *self.running_bank.lock().unwrap();
+            nv.read_fw_meta(self.bank_set, rb)
+                .map(|m| m.min_security_ver)
+                .unwrap_or(0)
+        };
+
+        let validated = crate::streaming::validate_manifest(
+            data,
+            self.manifest_provider.as_ref(),
+            min_security_ver,
+        )?;
+
+        let id = self.next_id();
+        let mut manifests = self.manifests.lock().unwrap();
+        manifests.insert(id.clone(), StoredManifest {
+            id: id.clone(),
+            raw_bytes: data.to_vec(),
+            validated,
+        });
+
+        tracing::info!(manifest_id = %id, "manifest uploaded and validated");
+        Ok(id)
+    }
+
+    /// Upload a raw payload (encrypted bytes, no CBOR).
+    /// Streams to disk + computes SHA256. Returns payload_id.
+    pub async fn receive_payload_stream(
+        &self,
+        stream: PackageStream,
+        filename: Option<&str>,
+    ) -> BackendResult<String> {
+        let id = self.next_id();
+        let dir = self.images_dir.as_ref()
+            .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
+
+        let fname = filename.unwrap_or("payload");
+        let path = dir.join(format!("upload-{id}-{fname}"));
+
+        let (size, sha256) = crate::streaming::save_raw_payload(stream, &path).await?;
+
+        let mut payloads = self.payloads.lock().unwrap();
+        payloads.insert(id.clone(), StoredPayload {
+            id: id.clone(),
+            path,
+            size,
+            sha256,
+        });
+
+        tracing::info!(payload_id = %id, size, "payload uploaded to disk");
+        Ok(id)
+    }
+
+    /// Flash using a pre-uploaded manifest + payload(s).
+    /// Processes each payload through decrypt → decompress → verify → write.
+    pub fn start_flash_multi(
+        &self,
+        manifest_id: &str,
+        payload_ids: &std::collections::HashMap<String, String>, // uri → payload_id
+    ) -> BackendResult<String> {
+        let manifests = self.manifests.lock().unwrap();
+        let manifest = manifests.get(manifest_id)
+            .ok_or_else(|| BackendError::InvalidRequest(format!("manifest {manifest_id} not found")))?;
+
+        let payloads = self.payloads.lock().unwrap();
+
+        // Parse manifest to get component info
+        let envelope = sumo_codec::decode::decode_envelope(&manifest.raw_bytes)
+            .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
+        let suit_manifest = sumo_onboard::manifest::Manifest { envelope };
+
+        let device_key = self.manifest_provider.device_decryption_key();
+
+        let set_name = match self.bank_set {
+            BankSet::Hypervisor => "hyp",
+            BankSet::Os1 => "os1",
+            BankSet::Os2 => "os2",
+            BankSet::Hsm => "hsm",
+            BankSet::Qtd => "qtd",
+        };
+
+        let images_dir = self.images_dir.as_ref()
+            .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
+
+        // Process each payload
+        for (uri, payload_id) in payload_ids {
+            let stored_payload = payloads.get(payload_id)
+                .ok_or_else(|| BackendError::InvalidRequest(format!("payload {payload_id} not found")))?;
+
+            // Find component index by URI
+            let comp_count = suit_manifest.component_count();
+            let comp_idx = (0..comp_count)
+                .find(|&i| suit_manifest.uri(i).map(|u| u == uri.as_str()).unwrap_or(false))
+                .ok_or_else(|| BackendError::InvalidRequest(format!(
+                    "no component with uri={uri} in manifest"
+                )))?;
+
+            let expected_digest = suit_manifest.image_digest(comp_idx)
+                .map(|d| d.0.bytes.clone())
+                .ok_or_else(|| BackendError::Internal(format!(
+                    "no digest for component {comp_idx}"
+                )))?;
+
+            let output_suffix = match uri.as_str() {
+                "#kernel" => format!("{set_name}-kernel-staged.img"),
+                "#firmware" => format!("{set_name}-staged.img"),
+                other => format!("{set_name}-{}-staged.img", other.trim_start_matches('#')),
+            };
+            let output_path = images_dir.join(&output_suffix);
+
+            tracing::info!(
+                uri = %uri,
+                component = comp_idx,
+                payload = %stored_payload.path.display(),
+                output = %output_path.display(),
+                "processing payload"
+            );
+
+            let (size, hash) = crate::streaming::process_raw_payload(
+                &stored_payload.path,
+                &manifest.raw_bytes,
+                comp_idx,
+                device_key.as_deref(),
+                &expected_digest,
+                &output_path,
+            ).map_err(|e| BackendError::Internal(format!(
+                "payload processing ({uri}): {e}"
+            )))?;
+
+            tracing::info!(uri = %uri, size, "payload written: {}", output_path.display());
+        }
+
+        // Create a validated result for the OTA install
+        let transfer_id = self.next_id();
+        Ok(transfer_id)
     }
 
     fn require_flash_access(&self) -> BackendResult<()> {
@@ -693,9 +859,20 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
     // --- Flash ---
 
-    async fn start_flash(&self, package_id: &str) -> BackendResult<String> {
+    async fn start_flash(
+        &self,
+        manifest_id: &str,
+        payload_ids: &std::collections::HashMap<String, String>,
+    ) -> BackendResult<String> {
         self.require_flash_access()?;
 
+        // New multi-file path: process raw payloads using manifest
+        if !payload_ids.is_empty() {
+            return self.start_flash_multi(manifest_id, payload_ids);
+        }
+
+        // Legacy path: single integrated envelope (HSM keys, etc.)
+        let package_id = manifest_id;
         let (meta, image_data, image_size, pre_sha256, pre_size, manifest_type, raw_envelope) = {
             let packages = self.packages.lock().unwrap();
             let p = packages
