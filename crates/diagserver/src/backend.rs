@@ -465,14 +465,59 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             min_security_ver,
         )?;
 
-        // Count components from manifest
+        // Check if this is an integrated envelope (has inline payloads)
         let envelope = sumo_codec::decode::decode_envelope(&data)
             .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
+        let has_integrated = !envelope.integrated_payloads.is_empty();
         let manifest = sumo_onboard::manifest::Manifest { envelope };
         let total_components = manifest.component_count();
 
-        // Transition: AwaitingManifest → AwaitingPayload(0)
-        {
+        let id = self.next_id();
+
+        if has_integrated {
+            // Integrated envelope (HSM keys, small packages) — all data present.
+            // Validate and stage. Actual installation happens at ecu_reset.
+            tracing::info!(manifest_id = %id, "integrated envelope — validating and staging");
+
+            let full_validated = self.manifest_provider
+                .validate(&data, min_security_ver)
+                .map_err(|e| BackendError::InvalidRequest(format!("manifest: {e}")))?;
+
+            // Store as verified+staged package (ready for install at reset time)
+            {
+                let mut packages = self.packages.lock().unwrap();
+                packages.insert(id.clone(), StoredPackage {
+                    id: id.clone(),
+                    validated: full_validated,
+                    status: PackageStatus::Verified,
+                });
+            }
+
+            // Session complete — no payload uploads needed
+            {
+                let mut session = self.flash_session.lock().unwrap();
+                *session = Some(FlashSessionState::Complete);
+            }
+
+            // Flash transfer → AwaitingExit (staged, ready for finalize + reset)
+            {
+                let mut ft = self.flash_transfer.lock().unwrap();
+                if let Some(ref mut t) = *ft {
+                    t.state = FlashState::AwaitingExit;
+                    t.package_id = id.clone();
+                }
+            }
+
+            return Ok(id);
+        } else {
+            // Manifest-only — wait for separate payload uploads
+            tracing::info!(
+                manifest_id = %id,
+                components = total_components,
+                "manifest validated — awaiting {} payload(s)",
+                total_components,
+            );
+
             let mut session = self.flash_session.lock().unwrap();
             *session = Some(FlashSessionState::AwaitingPayload {
                 manifest_bytes: data,
@@ -482,13 +527,6 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             });
         }
 
-        let id = self.next_id();
-        tracing::info!(
-            manifest_id = %id,
-            components = total_components,
-            "manifest validated — awaiting {} payload(s)",
-            total_components,
-        );
         Ok(id)
     }
 
@@ -1312,6 +1350,104 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn finalize_flash(&self) -> BackendResult<()> {
+        // Process staged package (HSM keys, firmware OTA install)
+        let package_id = {
+            let ft = self.flash_transfer.lock().unwrap();
+            ft.as_ref().map(|t| t.package_id.clone()).unwrap_or_default()
+        };
+
+        if !package_id.is_empty() {
+            let packages = self.packages.lock().unwrap();
+            if let Some(p) = packages.get(&package_id) {
+                let manifest_type = p.validated.manifest_type;
+                let raw_envelope = p.validated.raw_envelope.clone();
+                drop(packages);
+
+                // HSM key provisioning
+                if manifest_type == ManifestType::HsmKeys {
+                    if let Some(envelope) = raw_envelope.as_deref() {
+                        if let Some(ref hsm) = self.hsm_provider {
+                            let mut hsm_guard = hsm.lock()
+                                .map_err(|_| BackendError::Internal("HSM lock".into()))?;
+                            hsm_guard.provision(envelope)
+                                .map_err(|e| BackendError::Internal(format!("HSM provision: {e}")))?;
+
+                            // Load keys from HSM into manifest provider
+                            match (
+                                hsm_guard.get_public_key(hsm::KeyRole::SoftwareAuthority),
+                                hsm_guard.get_private_key(hsm::KeyRole::DeviceDecryption),
+                            ) {
+                                (Ok(sw_key), Ok(dk)) => {
+                                    self.manifest_provider.update_keys(sw_key, Some(dk));
+                                    tracing::info!("HSM keys provisioned, software authority loaded");
+                                }
+                                (Ok(sw_key), Err(_)) => {
+                                    self.manifest_provider.update_keys(sw_key, None);
+                                    tracing::info!("HSM keys provisioned (no device key)");
+                                }
+                                _ => {
+                                    tracing::warn!("HSM provisioned but failed to load keys");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Firmware OTA: run install (rename staged files, update NV)
+                if manifest_type == ManifestType::Firmware {
+                    // Staged files already written during payload uploads.
+                    // OTA install (NV update + rename) happens here.
+                    let (meta, sha, size) = {
+                        let pkg = self.packages.lock().unwrap();
+                        let p = pkg.get(&package_id);
+                        (
+                            p.map(|p| p.validated.image_meta.clone()),
+                            p.and_then(|p| p.validated.image_sha256),
+                            p.and_then(|p| p.validated.image_size).unwrap_or(0),
+                        )
+                    };
+                    if let Some(meta) = meta {
+                        let mut nv = self.nv.lock()
+                            .map_err(|_| BackendError::Internal("NV lock".into()))?;
+                        let _ = crate::ota::install_precomputed(
+                            &mut *nv,
+                            self.bank_set,
+                            sha.unwrap_or([0; 32]),
+                            size,
+                            &meta,
+                            self.config.single_bank,
+                        );
+
+                        // Rename staged files to target bank
+                        if let Some(ref images_dir) = self.images_dir {
+                            let set_name = match self.bank_set {
+                                BankSet::Hypervisor => "hyp",
+                                BankSet::Os1 => "os1",
+                                BankSet::Os2 => "os2",
+                                BankSet::Hsm => "hsm",
+                                BankSet::Qtd => "qtd",
+                            };
+                            let rb = *self.running_bank.lock().unwrap();
+                            let target_bank = if rb == nv_store::types::Bank::A { "b" } else { "a" };
+
+                            for suffix in ["staged.img", "kernel-staged.img"] {
+                                let staged = images_dir.join(format!("{set_name}-{suffix}"));
+                                if staged.exists() {
+                                    let target_name = suffix.replace("staged", target_bank);
+                                    let target = images_dir.join(format!("{set_name}-{target_name}"));
+                                    if let Err(e) = std::fs::rename(&staged, &target) {
+                                        tracing::warn!("rename {} → {}: {e}", staged.display(), target.display());
+                                    } else {
+                                        tracing::info!("renamed {} → {}", staged.display(), target.display());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let mut ft = self.flash_transfer.lock().unwrap();
         if let Some(ref mut t) = *ft {
             t.state = FlashState::AwaitingReset;
