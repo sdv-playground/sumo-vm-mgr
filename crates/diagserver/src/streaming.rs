@@ -50,84 +50,46 @@ pub async fn process_envelope_stream(
     );
     tokio::pin!(reader);
 
-    // Step 1: Parse CBOR envelope header, get payload stream
-    let (header_bytes, payload_len, map_entry_count) = parse_envelope_header(&mut reader).await?;
+    // Step 1: Parse CBOR envelope header, collect pending payloads
+    let (header_bytes, pending_payloads, map_entry_count) = parse_envelope_header(&mut reader).await?;
 
     // Step 2: Validate using header-only envelope (no payload)
     let validated = validate_header(manifest_provider, &header_bytes, min_security_ver, bank_set)?;
 
-    // HSM key manifests: pass raw envelope through to LinuxSimHsm.
-    // The integrated payload may use a non-"#firmware" key (e.g. "#hsm-keys"),
-    // in which case the full envelope is already buffered in header_bytes
-    // (payload_len == 0). If it uses "#firmware", read the remaining payload
-    // and reconstruct.
+    // HSM key manifests: small enough to buffer entirely, pass raw to HSM provider.
     if validated.manifest_type == ManifestType::HsmKeys {
-        let raw_envelope = if payload_len == 0 {
-            // Full envelope already buffered (integrated payload key != "#firmware")
-            if header_bytes.len() as u64 > HSM_ENVELOPE_MAX {
-                return Err(BackendError::InvalidRequest(format!(
-                    "HSM key envelope too large: {} bytes (max {HSM_ENVELOPE_MAX})",
-                    header_bytes.len()
-                )));
-            }
-            header_bytes
-        } else {
-            if payload_len > HSM_ENVELOPE_MAX {
-                return Err(BackendError::InvalidRequest(format!(
-                    "HSM key envelope too large: {payload_len} bytes (max {HSM_ENVELOPE_MAX})"
-                )));
-            }
-            let mut payload = vec![0u8; payload_len as usize];
-            reader.read_exact(&mut payload).await.map_err(map_io)?;
-            rebuild_envelope_with_payload(&header_bytes, map_entry_count, &payload)?
-        };
-
-        // Re-validate with full envelope so raw_envelope is set correctly
+        if pending_payloads.is_empty() {
+            // Already fully buffered (no integrated payloads)
+            return manifest_provider
+                .validate(&header_bytes, min_security_ver)
+                .map_err(|e| BackendError::InvalidRequest(format!("manifest validation: {e}")));
+        }
+        // Read the single payload and reconstruct full envelope
+        let pp = &pending_payloads[0];
+        if pp.len > HSM_ENVELOPE_MAX {
+            return Err(BackendError::InvalidRequest(format!(
+                "HSM key envelope too large: {} bytes (max {HSM_ENVELOPE_MAX})", pp.len
+            )));
+        }
+        let mut payload = vec![0u8; pp.len as usize];
+        reader.read_exact(&mut payload).await.map_err(map_io)?;
+        let raw_envelope = rebuild_envelope_with_payload(&header_bytes, map_entry_count, &payload)?;
         return manifest_provider
             .validate(&raw_envelope, min_security_ver)
             .map_err(|e| BackendError::InvalidRequest(format!("manifest validation: {e}")));
     }
 
-    // If no payload (CRL manifest), return early
-    if payload_len == 0 {
+    // If no payloads (CRL manifest), return early
+    if pending_payloads.is_empty() {
         return Ok(validated);
     }
 
-    // Step 3: Build the async→sync processing pipeline via tokio channel.
-    // Using tokio::sync::mpsc so the async send doesn't block the tokio runtime
-    // (std::sync::mpsc::sync_channel::send blocks the thread when full).
-    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
-
-    // Determine image path
-    let image_path = images_dir.map(|dir| {
-        let set_name = match bank_set {
-            BankSet::Hypervisor => "hyp",
-            BankSet::Os1 => "os1",
-            BankSet::Os2 => "os2",
-            BankSet::Hsm => "hsm",
-            BankSet::Qtd => "qtd",
-        };
-        // Target bank is the inactive one — ota::install() will determine this.
-        // For streaming, we write to a temp file and rename at install time.
-        dir.join(format!("{set_name}-staged.img"))
-    });
-
-    // Clone what the blocking task needs
-    let header_for_decrypt = header_bytes.clone();
-    let image_path_clone = image_path.clone();
-
-    // Extract the expected digest from the manifest for verification
+    // Parse manifest to get per-component encryption info and digests
     let envelope = sumo_codec::decode::decode_envelope(&header_bytes)
         .map_err(|_| BackendError::Internal("failed to re-parse envelope header".into()))?;
     let manifest = sumo_onboard::manifest::Manifest { envelope };
-    let expected_image_digest = manifest
-        .image_digest(0)
-        .map(|d| d.0.bytes.clone())
-        .ok_or_else(|| BackendError::Internal("manifest has no image digest".into()))?;
 
-    let has_encryption = manifest.encryption_info(0).is_some();
-
-    // Set up decryptor if needed — snapshot keys from provider (owned, safe across async)
+    // Set up decryptor keys (shared across all components)
     let suit_trust_anchor = manifest_provider
         .software_authority_key()
         .ok_or_else(|| BackendError::Internal(
@@ -135,89 +97,152 @@ pub async fn process_envelope_stream(
         ))?;
     let suit_device_key = manifest_provider.device_decryption_key();
 
-    // Spawn the sync processing pipeline in a blocking thread.
-    // Wrap in catch_unwind so panics in crypto/codec produce errors, not silent thread death.
-    let process_handle = tokio::task::spawn_blocking(move || {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            process_payload_sync(
-                rx,
-                &header_for_decrypt,
-                has_encryption,
-                &suit_trust_anchor,
-                suit_device_key.as_deref(),
-                &expected_image_digest,
-                image_path_clone.as_deref(),
-            )
-        }))
-        .unwrap_or_else(|panic| {
-            let msg = panic
-                .downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            Err(format!("panic in payload processing: {msg}"))
-        })
-    });
-
-    // Step 4: Stream payload bytes from async reader to sync channel
-    let mut remaining = payload_len as usize;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut send_failed = false;
-
-    while remaining > 0 {
-        let to_read = buf.len().min(remaining);
-        let n = reader.read(&mut buf[..to_read]).await.map_err(|e| {
-            BackendError::Internal(format!("stream read error: {e}"))
-        })?;
-        if n == 0 {
-            break;
-        }
-        remaining -= n;
-        if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-            send_failed = true;
-            break;
-        }
-    }
-    drop(tx); // Signal EOF
-
-    // Wait for processing to complete — this surfaces the real error
-    // if the processing thread failed (bad key, invalid envelope, etc.)
-    let (image_size, image_hash) = match process_handle.await {
-        Ok(Ok(result)) => {
-            if send_failed {
-                // Thread succeeded but we couldn't send all data — shouldn't happen
-                return Err(BackendError::Internal(
-                    "payload stream ended early but processing succeeded".into(),
-                ));
-            }
-            result
-        }
-        Ok(Err(e)) => {
-            return Err(BackendError::Internal(
-                format!("payload processing failed: {e}"),
-            ));
-        }
-        Err(e) => {
-            return Err(BackendError::Internal(
-                format!("payload processing panicked: {e}"),
-            ));
-        }
+    let set_name = match bank_set {
+        BankSet::Hypervisor => "hyp",
+        BankSet::Os1 => "os1",
+        BankSet::Os2 => "os2",
+        BankSet::Hsm => "hsm",
+        BankSet::Qtd => "qtd",
     };
 
+    // Map payload keys to component indices by matching URIs in the manifest
+    let component_count = manifest.component_count();
+
+    // Step 3: Process each integrated payload sequentially
+    let mut last_image_size = 0usize;
+    let mut last_image_hash = [0u8; 32];
+
+    for pp in &pending_payloads {
+        // Find which component this payload belongs to (match by URI)
+        let comp_idx = (0..component_count)
+            .find(|&i| manifest.uri(i).map(|u| u == pp.key).unwrap_or(false))
+            .unwrap_or(0);
+
+        let expected_digest = manifest
+            .image_digest(comp_idx)
+            .map(|d| d.0.bytes.clone())
+            .ok_or_else(|| BackendError::Internal(format!(
+                "no digest for component {} (payload {})", comp_idx, pp.key
+            )))?;
+
+        let has_encryption = manifest.encryption_info(comp_idx).is_some();
+
+        // Determine output path based on payload key
+        let image_path = images_dir.map(|dir| {
+            let suffix = match pp.key.as_str() {
+                "#kernel" => format!("{set_name}-kernel-staged.img"),
+                "#firmware" => format!("{set_name}-staged.img"),
+                other => format!("{set_name}-{}-staged.img",
+                    other.trim_start_matches('#')),
+            };
+            dir.join(suffix)
+        });
+
+        tracing::info!(
+            payload_key = %pp.key,
+            component = comp_idx,
+            size = pp.len,
+            path = ?image_path,
+            "streaming component payload"
+        );
+
+        // Build the async→sync processing pipeline
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+
+        let header_for_decrypt = header_bytes.clone();
+        let image_path_clone = image_path.clone();
+        let trust_anchor = suit_trust_anchor.clone();
+        let device_key = suit_device_key.clone();
+        let expected_digest_clone = expected_digest.clone();
+
+        let process_handle = tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                process_payload_sync(
+                    rx,
+                    &header_for_decrypt,
+                    has_encryption,
+                    comp_idx,
+                    &trust_anchor,
+                    device_key.as_deref(),
+                    &expected_digest_clone,
+                    image_path_clone.as_deref(),
+                )
+            }))
+            .unwrap_or_else(|panic| {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                Err(format!("panic in payload processing: {msg}"))
+            })
+        });
+
+        // Stream this payload's bytes to the processing thread
+        let mut remaining = pp.len as usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut send_failed = false;
+
+        while remaining > 0 {
+            let to_read = buf.len().min(remaining);
+            let n = reader.read(&mut buf[..to_read]).await.map_err(|e| {
+                BackendError::Internal(format!("stream read error ({}): {e}", pp.key))
+            })?;
+            if n == 0 {
+                break;
+            }
+            remaining -= n;
+            if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                send_failed = true;
+                break;
+            }
+        }
+        drop(tx);
+
+        let (image_size, image_hash) = match process_handle.await {
+            Ok(Ok(result)) => {
+                if send_failed {
+                    return Err(BackendError::Internal(format!(
+                        "payload stream {} ended early", pp.key
+                    )));
+                }
+                result
+            }
+            Ok(Err(e)) => {
+                return Err(BackendError::Internal(format!(
+                    "payload processing failed ({}): {e}", pp.key
+                )));
+            }
+            Err(e) => {
+                return Err(BackendError::Internal(format!(
+                    "payload processing panicked ({}): {e}", pp.key
+                )));
+            }
+        };
+
+        tracing::info!(
+            payload_key = %pp.key,
+            image_size,
+            "component payload written to disk"
+        );
+
+        last_image_size = image_size;
+        last_image_hash = image_hash;
+    }
+
     tracing::info!(
-        image_size,
-        "streaming SUIT processing complete — firmware written to disk"
+        components = pending_payloads.len(),
+        "all components written to disk"
     );
 
-    // Return validated firmware with empty image_data (already written to disk)
     Ok(ValidatedFirmware {
         bank_set: validated.bank_set,
         manifest_type: validated.manifest_type,
         image_meta: validated.image_meta,
-        image_data: Vec::new(), // Already written to disk
+        image_data: Vec::new(),
         version_display: validated.version_display,
-        image_sha256: Some(image_hash),
-        image_size: Some(image_size as u64),
+        image_sha256: Some(last_image_hash),
+        image_size: Some(last_image_size as u64),
         raw_envelope: None,
     })
 }
@@ -226,34 +251,31 @@ pub async fn process_envelope_stream(
 // CBOR envelope header parser
 // ---------------------------------------------------------------------------
 
+/// An integrated payload pending in the stream (not yet read).
+struct PendingPayload {
+    /// Payload key (e.g., "#firmware", "#kernel").
+    key: String,
+    /// Payload length in bytes.
+    len: u64,
+}
+
 /// Parse the SUIT envelope CBOR header from an async reader.
 ///
-/// Returns (header_bytes, payload_length).
+/// Buffers integer-keyed entries (auth, manifest, severable members).
+/// Text-keyed entries (integrated payloads) are NOT buffered — their
+/// key and length are returned so the caller can stream each one.
 ///
-/// SUIT envelope is a CBOR map:
-///   { 2: bstr(auth), 3: bstr(manifest), "#firmware": bstr(payload) }
-///
-/// We buffer the small entries (auth ~200B, manifest ~500B) and return
-/// the payload length so the caller can stream it.
-/// Returns (header_bytes_without_firmware, payload_length, original_map_entry_count).
+/// Returns (header_bytes, pending_payloads, original_map_entry_count).
 async fn parse_envelope_header<R: AsyncRead + Unpin>(
     reader: &mut R,
-) -> Result<(Vec<u8>, u64, u64), BackendError> {
-    // We'll buffer the entire header portion. The header is small (<8KB typically).
-    // Strategy: read CBOR incrementally. First read the map header, then iterate entries.
-    // For auth (key 2) and manifest (key 3): buffer the value.
-    // For "#firmware": extract payload length, stop buffering.
-
-    // Read the first byte to determine map type
+) -> Result<(Vec<u8>, Vec<PendingPayload>, u64), BackendError> {
     let initial = read_byte(reader).await?;
     let mut header_buf = vec![initial];
 
     let (major, additional) = (initial >> 5, initial & 0x1f);
 
-    // Could be Tag(107, map) or just map
     let map_entry_count;
     if major == 6 {
-        // Tag — read tag value, then the inner map
         let _tag_val = read_cbor_uint(reader, additional, &mut header_buf).await?;
         let map_byte = read_byte(reader).await?;
         header_buf.push(map_byte);
@@ -270,85 +292,59 @@ async fn parse_envelope_header<R: AsyncRead + Unpin>(
         )));
     }
 
-    let mut payload_len: u64 = 0;
+    let mut pending_payloads = Vec::new();
 
     for _ in 0..map_entry_count {
-        // Read key
         let key_byte = read_byte(reader).await?;
         let (key_major, key_add) = (key_byte >> 5, key_byte & 0x1f);
 
         match key_major {
             0 => {
-                // Positive integer key (2 = auth, 3 = manifest, etc.)
+                // Integer key (auth, manifest, severable) — buffer fully
                 header_buf.push(key_byte);
                 let _key_val = read_cbor_uint(reader, key_add, &mut header_buf).await?;
 
-                // Read and buffer the value (bstr)
                 let val_byte = read_byte(reader).await?;
                 header_buf.push(val_byte);
                 let (val_major, val_add) = (val_byte >> 5, val_byte & 0x1f);
                 let val_len = read_cbor_uint(reader, val_add, &mut header_buf).await?;
 
                 if val_major == 2 {
-                    // Byte string — read fully and buffer
                     let mut data = vec![0u8; val_len as usize];
                     reader.read_exact(&mut data).await.map_err(map_io)?;
                     header_buf.extend_from_slice(&data);
                 } else {
-                    // Skip other value types by reading raw bytes
-                    // (severable members etc.)
-                    let skip_len = val_len as usize;
-                    let mut skip = vec![0u8; skip_len];
+                    let mut skip = vec![0u8; val_len as usize];
                     reader.read_exact(&mut skip).await.map_err(map_io)?;
                     header_buf.extend_from_slice(&skip);
                 }
             }
             3 => {
-                // Text string key — could be "#firmware"
-                header_buf.push(key_byte);
-                let key_len = read_cbor_uint(reader, key_add, &mut header_buf).await?;
+                // Text key — integrated payload. Don't buffer the data.
+                // Read the key name but don't add to header_buf.
+                let mut temp = Vec::new();
+                temp.push(key_byte);
+                let key_len = read_cbor_uint(reader, key_add, &mut temp).await?;
                 let mut key_str = vec![0u8; key_len as usize];
                 reader.read_exact(&mut key_str).await.map_err(map_io)?;
-                header_buf.extend_from_slice(&key_str);
-                let key_name = String::from_utf8_lossy(&key_str);
+                let key_name = String::from_utf8_lossy(&key_str).to_string();
 
-                if key_name == "#firmware" {
-                    // Read bstr header for payload length, but DON'T read the payload data
-                    let val_byte = read_byte(reader).await?;
-                    // Don't add to header_buf — we'll reconstruct without payload
-                    let (val_major, val_add) = (val_byte >> 5, val_byte & 0x1f);
-                    if val_major != 2 {
-                        return Err(BackendError::Internal(
-                            "expected byte string for #firmware payload".into(),
-                        ));
-                    }
-                    let mut temp_buf = Vec::new();
-                    payload_len = read_cbor_uint(reader, val_add, &mut temp_buf).await?;
-
-                    // Don't add payload bstr header to header_buf — we build a
-                    // header-only envelope for validation (without #firmware entry).
-                    // Remove the "#firmware" key we just added.
-                    // Actually, simpler: rebuild the header as a CBOR map without #firmware.
-                    // We'll just truncate header_buf to remove the text key.
-                    let key_header_len = 1 + temp_for_uint_len(key_len) + key_len as usize;
-                    header_buf.truncate(header_buf.len() - key_header_len);
-
-                    // We've consumed all non-payload entries at this point
-                    // (SUIT puts #firmware last in the map)
-                    break;
-                } else {
-                    // Other text key — buffer the value
-                    let val_byte = read_byte(reader).await?;
-                    header_buf.push(val_byte);
-                    let (val_major, val_add) = (val_byte >> 5, val_byte & 0x1f);
-                    let val_len = read_cbor_uint(reader, val_add, &mut header_buf).await?;
-
-                    if val_major == 2 {
-                        let mut data = vec![0u8; val_len as usize];
-                        reader.read_exact(&mut data).await.map_err(map_io)?;
-                        header_buf.extend_from_slice(&data);
-                    }
+                // Read the bstr header for the payload
+                let val_byte = read_byte(reader).await?;
+                let (val_major, val_add) = (val_byte >> 5, val_byte & 0x1f);
+                if val_major != 2 {
+                    return Err(BackendError::Internal(format!(
+                        "expected byte string for {key_name} payload"
+                    )));
                 }
+                let mut temp2 = Vec::new();
+                let payload_len = read_cbor_uint(reader, val_add, &mut temp2).await?;
+
+                pending_payloads.push(PendingPayload {
+                    key: key_name,
+                    len: payload_len,
+                });
+                // The payload data itself remains in the stream — caller reads it.
             }
             _ => {
                 return Err(BackendError::Internal(format!(
@@ -358,21 +354,24 @@ async fn parse_envelope_header<R: AsyncRead + Unpin>(
         }
     }
 
-    // Rebuild header as valid CBOR: reduce the map entry count by 1 (dropped #firmware)
-    if payload_len > 0 {
-        let header_bytes = rebuild_header_without_firmware(&header_buf, map_entry_count)?;
-        Ok((header_bytes, payload_len, map_entry_count))
+    // Rebuild header with reduced map count (exclude payload entries)
+    let payload_count = pending_payloads.len() as u64;
+    let header_bytes = if payload_count > 0 {
+        rebuild_header_without_payloads(&header_buf, map_entry_count, payload_count)?
     } else {
-        Ok((header_buf, 0, map_entry_count))
-    }
+        header_buf
+    };
+
+    Ok((header_bytes, pending_payloads, map_entry_count))
 }
 
-/// Rebuild the CBOR header with a corrected map entry count (N-1, excluding #firmware).
-fn rebuild_header_without_firmware(
+/// Rebuild the CBOR header with a corrected map entry count (N-P, excluding P payload entries).
+fn rebuild_header_without_payloads(
     raw: &[u8],
     original_count: u64,
+    payload_count: u64,
 ) -> Result<Vec<u8>, BackendError> {
-    let new_count = original_count - 1;
+    let new_count = original_count - payload_count;
     let mut result = Vec::with_capacity(raw.len());
 
     let mut pos = 0;
@@ -478,6 +477,7 @@ fn process_payload_sync(
     rx: tokio::sync::mpsc::Receiver<Bytes>,
     header_bytes: &[u8],
     has_encryption: bool,
+    component_index: usize,
     _trust_anchor: &[u8],
     device_key: Option<&[u8]>,
     expected_digest: &[u8],
@@ -501,7 +501,7 @@ fn process_payload_sync(
         let dk = coset::CborSerializable::from_slice(dk_bytes)
             .map_err(|e| format!("invalid device key: {e:?}"))?;
 
-        let decryptor = StreamingDecryptor::new(&manifest, 0, &dk, &crypto)
+        let decryptor = StreamingDecryptor::new(&manifest, component_index, &dk, &crypto)
             .map_err(|e| format!("decryptor setup: {e:?}"))?;
 
         let mut decrypt_reader = DecryptReader::new(channel_reader, decryptor);
