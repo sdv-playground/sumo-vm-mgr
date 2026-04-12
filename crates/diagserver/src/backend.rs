@@ -804,21 +804,25 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     Bank::A => "a",
                     Bank::B => "b",
                 };
-                let staged_path = images_dir.join(format!("{set_name}-staged.img"));
-                let target_path = images_dir.join(format!("{set_name}-{bank_name}.img"));
-                if staged_path.exists() {
-                    std::fs::rename(&staged_path, &target_path).map_err(|e| {
-                        BackendError::Internal(format!(
-                            "failed to rename {} → {}: {e}",
+                // Rename staged files to target bank (rootfs + kernel if present)
+                for suffix in ["staged.img", "kernel-staged.img"] {
+                    let staged_path = images_dir.join(format!("{set_name}-{suffix}"));
+                    if staged_path.exists() {
+                        let target_name = suffix.replace("staged", bank_name);
+                        let target_path = images_dir.join(format!("{set_name}-{target_name}"));
+                        std::fs::rename(&staged_path, &target_path).map_err(|e| {
+                            BackendError::Internal(format!(
+                                "failed to rename {} → {}: {e}",
+                                staged_path.display(),
+                                target_path.display()
+                            ))
+                        })?;
+                        tracing::info!(
+                            "renamed {} → {}",
                             staged_path.display(),
                             target_path.display()
-                        ))
-                    })?;
-                    tracing::info!(
-                        "renamed {} → {}",
-                        staged_path.display(),
-                        target_path.display()
-                    );
+                        );
+                    }
                 }
             }
         } else {
