@@ -87,6 +87,30 @@ struct StoredPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Flash session: sequential upload state machine
+// ---------------------------------------------------------------------------
+
+/// Tracks the sequential upload state within a flash session.
+///
+/// After start_flash(): AwaitingManifest
+/// After manifest upload: AwaitingPayload(0)
+/// After payload N: AwaitingPayload(N+1)
+/// After all payloads: Complete
+enum FlashSessionState {
+    /// Waiting for manifest upload (first file in sequence).
+    AwaitingManifest,
+    /// Manifest received, waiting for payload at component index N.
+    AwaitingPayload {
+        manifest_bytes: Vec<u8>,
+        validated: ValidatedFirmware,
+        next_component: usize,
+        total_components: usize,
+    },
+    /// All uploads received.
+    Complete,
+}
+
+// ---------------------------------------------------------------------------
 // Flash transfer tracking
 // ---------------------------------------------------------------------------
 
@@ -136,6 +160,7 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     packages: Mutex<HashMap<String, StoredPackage>>,
     manifests: Mutex<HashMap<String, StoredManifest>>,
     payloads: Mutex<HashMap<String, StoredPayload>>,
+    flash_session: Mutex<Option<FlashSessionState>>,
     flash_transfer: Mutex<Option<FlashTransferState>>,
     /// The bank the ECU is actually running on. Only changes on ecu_reset().
     /// NV active_bank may differ after install (it's the "next boot" bank).
@@ -240,6 +265,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             packages: Mutex::new(HashMap::new()),
             manifests: Mutex::new(HashMap::new()),
             payloads: Mutex::new(HashMap::new()),
+            flash_session: Mutex::new(None),
             flash_transfer: Mutex::new(None),
             running_bank: Mutex::new(running_bank),
             session: Mutex::new(SessionState::Default),
@@ -410,6 +436,182 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         // Create a validated result for the OTA install
         let transfer_id = self.next_id();
         Ok(transfer_id)
+    }
+
+    /// Handle manifest upload (first file in flash session).
+    async fn handle_manifest_upload(
+        &self,
+        stream: PackageStream,
+        content_length: Option<u64>,
+    ) -> BackendResult<String> {
+        use futures::StreamExt;
+
+        // Buffer the manifest entirely (it's small, <100KB)
+        let mut data = Vec::new();
+        let mut stream = stream;
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|e| BackendError::Internal(format!("stream: {e}")))?;
+            data.extend_from_slice(&bytes);
+            if data.len() > 100 * 1024 {
+                return Err(BackendError::InvalidRequest("manifest too large (>100KB)".into()));
+            }
+        }
+
+        tracing::info!(size = data.len(), "manifest uploaded, validating");
+
+        // Validate
+        let min_security_ver = {
+            let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let rb = *self.running_bank.lock().unwrap();
+            nv.read_fw_meta(self.bank_set, rb)
+                .map(|m| m.min_security_ver)
+                .unwrap_or(0)
+        };
+
+        let validated = crate::streaming::validate_manifest(
+            &data,
+            self.manifest_provider.as_ref(),
+            min_security_ver,
+        )?;
+
+        // Count components from manifest
+        let envelope = sumo_codec::decode::decode_envelope(&data)
+            .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
+        let manifest = sumo_onboard::manifest::Manifest { envelope };
+        let total_components = manifest.component_count();
+
+        // Transition: AwaitingManifest → AwaitingPayload(0)
+        {
+            let mut session = self.flash_session.lock().unwrap();
+            *session = Some(FlashSessionState::AwaitingPayload {
+                manifest_bytes: data,
+                validated,
+                next_component: 0,
+                total_components,
+            });
+        }
+
+        let id = self.next_id();
+        tracing::info!(
+            manifest_id = %id,
+            components = total_components,
+            "manifest validated — awaiting {} payload(s)",
+            total_components,
+        );
+        Ok(id)
+    }
+
+    /// Handle payload upload (subsequent files in flash session).
+    /// Streams directly through decrypt → decompress → verify → write to bank.
+    async fn handle_payload_upload(
+        &self,
+        stream: PackageStream,
+        content_length: Option<u64>,
+    ) -> BackendResult<String> {
+        // Extract session state
+        let (manifest_bytes, comp_idx, total) = {
+            let session = self.flash_session.lock().unwrap();
+            match session.as_ref() {
+                Some(FlashSessionState::AwaitingPayload {
+                    manifest_bytes, next_component, total_components, ..
+                }) => (manifest_bytes.clone(), *next_component, *total_components),
+                _ => return Err(BackendError::InvalidRequest("no active flash session".into())),
+            }
+        };
+
+        let device_key = self.manifest_provider.device_decryption_key();
+
+        // Parse manifest for this component's info
+        let envelope = sumo_codec::decode::decode_envelope(&manifest_bytes)
+            .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
+        let manifest = sumo_onboard::manifest::Manifest { envelope };
+
+        let expected_digest = manifest.image_digest(comp_idx)
+            .map(|d| d.0.bytes.clone())
+            .ok_or_else(|| BackendError::Internal(format!(
+                "no digest for component {comp_idx}"
+            )))?;
+
+        let uri = manifest.uri(comp_idx).unwrap_or("#firmware");
+        let set_name = match self.bank_set {
+            BankSet::Hypervisor => "hyp",
+            BankSet::Os1 => "os1",
+            BankSet::Os2 => "os2",
+            BankSet::Hsm => "hsm",
+            BankSet::Qtd => "qtd",
+        };
+
+        let output_suffix = match uri {
+            "#kernel" => format!("{set_name}-kernel-staged.img"),
+            "#firmware" => format!("{set_name}-staged.img"),
+            other => format!("{set_name}-{}-staged.img", other.trim_start_matches('#')),
+        };
+
+        let images_dir = self.images_dir.as_ref()
+            .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
+
+        // Save raw payload to temp file first (needed for process_raw_payload which reads from file)
+        let raw_path = images_dir.join(format!("{set_name}-upload-{comp_idx}.tmp"));
+        let (size, _upload_hash) = crate::streaming::save_raw_payload(stream, &raw_path).await?;
+
+        let output_path = images_dir.join(&output_suffix);
+
+        tracing::info!(
+            component = comp_idx,
+            uri = %uri,
+            size,
+            output = %output_path.display(),
+            "processing payload {}/{}",
+            comp_idx + 1, total,
+        );
+
+        // Decrypt → decompress → verify → write
+        let (image_size, image_hash) = crate::streaming::process_raw_payload(
+            &raw_path,
+            &manifest_bytes,
+            comp_idx,
+            device_key.as_deref(),
+            &expected_digest,
+            &output_path,
+        ).map_err(|e| BackendError::Internal(format!("payload processing: {e}")))?;
+
+        // Clean up temp upload
+        let _ = std::fs::remove_file(&raw_path);
+
+        tracing::info!(
+            component = comp_idx,
+            image_size,
+            "payload written: {}",
+            output_path.display(),
+        );
+
+        // Advance session state
+        let next = comp_idx + 1;
+        {
+            let mut session = self.flash_session.lock().unwrap();
+            if next >= total {
+                // All payloads received
+                *session = Some(FlashSessionState::Complete);
+                tracing::info!("all payloads received — ready for transferexit");
+
+                // Update flash transfer state to AwaitingExit
+                let mut ft = self.flash_transfer.lock().unwrap();
+                if let Some(ref mut t) = *ft {
+                    t.state = FlashState::AwaitingExit;
+                    t.image_size = image_size as u64;
+                }
+            } else {
+                // Update to next component
+                if let Some(FlashSessionState::AwaitingPayload {
+                    ref mut next_component, ..
+                }) = *session {
+                    *next_component = next;
+                }
+            }
+        }
+
+        let id = self.next_id();
+        Ok(id)
     }
 
     fn require_flash_access(&self) -> BackendResult<()> {
@@ -730,6 +932,30 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     ) -> BackendResult<String> {
         self.require_flash_access()?;
 
+        // Check flash session state — determines how to handle this upload
+        let session_state = {
+            let session = self.flash_session.lock().unwrap();
+            match session.as_ref() {
+                Some(FlashSessionState::AwaitingManifest) => Some("manifest"),
+                Some(FlashSessionState::AwaitingPayload { .. }) => Some("payload"),
+                _ => None,
+            }
+        };
+
+        match session_state {
+            Some("manifest") => {
+                return self.handle_manifest_upload(stream, content_length).await;
+            }
+            Some("payload") => {
+                return self.handle_payload_upload(stream, content_length).await;
+            }
+            _ => {
+                // No active flash session — legacy integrated envelope path
+            }
+        }
+
+        // --- Legacy path: integrated SUIT envelope (HSM keys, etc.) ---
+
         let min_security_ver = {
             let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
             let rb = *self.running_bank.lock().unwrap();
@@ -741,22 +967,20 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         tracing::info!(
             bank_set = ?self.bank_set,
             content_length = ?content_length,
-            "streaming package upload started"
+            "streaming package upload (legacy envelope)"
         );
 
-        // Create a transfer entry so the viewer can see the upload in progress
         let transfer_id = self.next_id();
         {
             let mut ft = self.flash_transfer.lock().unwrap();
             *ft = Some(FlashTransferState {
                 transfer_id: transfer_id.clone(),
-                package_id: String::new(), // not yet known
+                package_id: String::new(),
                 state: FlashState::Transferring,
                 image_size: content_length.unwrap_or(0),
             });
         }
 
-        // Signal upload in progress so activation state shows Transferring
         *self.upload_phase.lock().unwrap() = Some(FlashState::Transferring);
 
         let validated = match crate::streaming::process_envelope_stream(
@@ -778,7 +1002,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             }
         };
 
-        // Upload complete — clear upload phase, update transfer to Preparing
         *self.upload_phase.lock().unwrap() = None;
         {
             let mut ft = self.flash_transfer.lock().unwrap();
@@ -862,13 +1085,34 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     async fn start_flash(&self) -> BackendResult<String> {
         self.require_flash_access()?;
 
-        // Find the most recent verified package
+        // Initialize flash session — next upload will be treated as manifest
+        {
+            let mut session = self.flash_session.lock().unwrap();
+            *session = Some(FlashSessionState::AwaitingManifest);
+        }
+
+        let transfer_id = self.next_id();
+        tracing::info!(transfer_id = %transfer_id, "flash session started — awaiting manifest upload");
+
+        // Check if we already have a verified package (legacy integrated envelope path)
         let package_id = {
             let packages = self.packages.lock().unwrap();
             packages.iter()
                 .find(|(_, p)| p.status == PackageStatus::Verified)
                 .map(|(id, _)| id.clone())
-                .ok_or_else(|| BackendError::InvalidRequest("no verified package".into()))?
+        };
+
+        // If no verified package yet, return the transfer_id.
+        // Payloads will be processed as they arrive via receive_package_stream.
+        let Some(package_id) = package_id else {
+            let mut ft = self.flash_transfer.lock().unwrap();
+            *ft = Some(FlashTransferState {
+                transfer_id: transfer_id.clone(),
+                package_id: String::new(),
+                state: FlashState::Transferring,
+                image_size: 0,
+            });
+            return Ok(transfer_id);
         };
         let (meta, image_data, image_size, pre_sha256, pre_size, manifest_type, raw_envelope) = {
             let packages = self.packages.lock().unwrap();
