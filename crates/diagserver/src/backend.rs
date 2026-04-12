@@ -859,24 +859,21 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
     // --- Flash ---
 
-    async fn start_flash(
-        &self,
-        manifest_id: &str,
-        payload_ids: &std::collections::HashMap<String, String>,
-    ) -> BackendResult<String> {
+    async fn start_flash(&self) -> BackendResult<String> {
         self.require_flash_access()?;
 
-        // New multi-file path: process raw payloads using manifest
-        if !payload_ids.is_empty() {
-            return self.start_flash_multi(manifest_id, payload_ids);
-        }
-
-        // Legacy path: single integrated envelope (HSM keys, etc.)
-        let package_id = manifest_id;
+        // Find the most recent verified package
+        let package_id = {
+            let packages = self.packages.lock().unwrap();
+            packages.iter()
+                .find(|(_, p)| p.status == PackageStatus::Verified)
+                .map(|(id, _)| id.clone())
+                .ok_or_else(|| BackendError::InvalidRequest("no verified package".into()))?
+        };
         let (meta, image_data, image_size, pre_sha256, pre_size, manifest_type, raw_envelope) = {
             let packages = self.packages.lock().unwrap();
             let p = packages
-                .get(package_id)
+                .get(&package_id)
                 .ok_or_else(|| BackendError::EntityNotFound(package_id.to_string()))?;
             let size = if let Some(s) = p.validated.image_size {
                 s
