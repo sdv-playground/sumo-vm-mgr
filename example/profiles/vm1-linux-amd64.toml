@@ -1,14 +1,14 @@
-# OS1 Linux amd64 profile — real Linux kernel + rootfs on x86_64 QEMU
+# VM1 Linux amd64 profile — real Linux kernel + rootfs on x86_64 QEMU
 #
 # Use with campaign-linux. The images_dir should contain:
 #   bzImage     — Linux kernel
-#   os1-a.img   — rootfs (symlink to rootfs.img)
-#   os1-b.img   — rootfs for bank B (symlink or second copy)
+#   vm1-a.img   — rootfs (symlink to rootfs.img)
+#   vm1-b.img   — rootfs for bank B (symlink or second copy)
 #   data.img    — persistent data partition (/data)
 #   swap.img    — swap partition
 
 [vm]
-bank_set = "os1"
+bank_set = "vm1"
 arch = "x86_64"
 ram_mb = 2048
 cpus = 4

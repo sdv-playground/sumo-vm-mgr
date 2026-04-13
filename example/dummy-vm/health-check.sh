@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./example/linux-vm/health-check.sh                  # default: linux1
-#   ./example/linux-vm/health-check.sh os1               # specific VM name
+#   ./example/linux-vm/health-check.sh vm1               # specific VM name
 #   ./example/linux-vm/health-check.sh linux1 2          # poll every 2 seconds
 #
 # Requires run-vm.sh to be running in another terminal.

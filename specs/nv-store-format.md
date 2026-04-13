@@ -16,22 +16,28 @@ Offset      Size        Sectors   Content
 0x004000    8 KB        2         App (shared application data)
 0x006000    40 KB       --        (reserved)
 
-0x010000    16 KB       4         Hyp FW Meta A
-0x014000    16 KB       4         Hyp FW Meta B
-0x018000    32 KB       8         Hyp Runtime A
-0x020000    32 KB       8         Hyp Runtime B
+0x010000    16 KB       4         Hypervisor FW Meta A
+0x014000    16 KB       4         Hypervisor FW Meta B
+0x018000    32 KB       8         Hypervisor Runtime A
+0x020000    32 KB       8         Hypervisor Runtime B
 
-0x028000    16 KB       4         OS1 FW Meta A
-0x02C000    16 KB       4         OS1 FW Meta B
-0x030000    32 KB       8         OS1 Runtime A
-0x038000    32 KB       8         OS1 Runtime B
+0x028000    16 KB       4         VM1 FW Meta A
+0x02C000    16 KB       4         VM1 FW Meta B
+0x030000    32 KB       8         VM1 Runtime A
+0x038000    32 KB       8         VM1 Runtime B
 
-0x040000    16 KB       4         OS2 FW Meta A
-0x044000    16 KB       4         OS2 FW Meta B
-0x048000    32 KB       8         OS2 Runtime A
-0x050000    32 KB       8         OS2 Runtime B
+0x040000    16 KB       4         VM2 FW Meta A
+0x044000    16 KB       4         VM2 FW Meta B
+0x048000    32 KB       8         VM2 Runtime A
+0x050000    32 KB       8         VM2 Runtime B
 
-0x058000    remainder   --        (reserved for future use)
+0x058000    16 KB       4         HSM FW Meta (single bank)
+0x05C000    32 KB       8         HSM Runtime (single bank)
+
+0x064000    16 KB       4         Qtd FW Meta (reserved, wire compat)
+0x068000    32 KB       8         Qtd Runtime (reserved, wire compat)
+
+0x070000    remainder   --        (reserved for future use)
 ```
 
 Sector size: 4 KB (matches typical eMMC erase block).
@@ -73,20 +79,30 @@ Tracks the active bank, committed status, and boot count for each bank set.
 Offset  Size  Field
 0x00    4     magic (NVB1)
 0x04    4     write_seq
-0x08    1     hyp.active_bank    (0=A, 1=B)
-0x09    1     hyp.committed      (0=trial, 1=committed)
-0x0A    1     hyp.boot_count     (incremented each boot in trial mode)
-0x0B    1     os1.active_bank
-0x0C    1     os1.committed
-0x0D    1     os1.boot_count
-0x0E    1     os2.active_bank
-0x0F    1     os2.committed
-0x10    1     os2.boot_count
-0x11    3     (padding)
-0x14    4     crc32
+0x08    1     hypervisor.active_bank  (0=A, 1=B)
+0x09    1     hypervisor.committed    (0=trial, 1=committed)
+0x0A    1     hypervisor.boot_count   (incremented each boot in trial mode)
+0x0B    1     vm1.active_bank
+0x0C    1     vm1.committed
+0x0D    1     vm1.boot_count
+0x0E    1     vm2.active_bank
+0x0F    1     vm2.committed
+0x10    1     vm2.boot_count
+0x11    1     hsm.active_bank         (always 0, single-bank)
+0x12    1     hsm.committed           (always 1)
+0x13    1     hsm.boot_count          (always 0)
+0x14    1     qtd.active_bank         (reserved, wire compat)
+0x15    1     qtd.committed           (reserved)
+0x16    1     qtd.boot_count          (reserved)
+0x17    1     (padding)
+0x18    4     crc32
 ```
 
-Total: 24 bytes per sector (rest of 4 KB sector is unused/zero-padded).
+Total: 28 bytes per sector (rest of 4 KB sector is unused/zero-padded).
+
+Note: The wire format includes 5 bank sets (Hypervisor, VM1, VM2, HSM, Qtd)
+for compatibility. HSM is single-bank (always bank A, always committed).
+Qtd is reserved and unused.
 
 ## Factory Data
 

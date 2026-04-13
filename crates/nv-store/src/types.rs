@@ -1,11 +1,11 @@
 /// Core types for the NV store bank management system.
 ///
-/// Five independent A/B bank sets:
-///   - Hypervisor (QNX)
-///   - OS1 (Linux or QNX VM)
-///   - OS2 (Linux or QNX VM)
+/// Five independent A/B bank sets (NUM_BANK_SETS=5 for wire compat):
+///   - Hypervisor (host platform)
+///   - VM1 (Linux or QNX VM)
+///   - VM2 (Linux or QNX VM)
 ///   - HSM (Hardware Security Module — single-banked, non-rollbackable)
-///   - QTD (QNX Target Partition)
+///   - Qtd (deprecated — kept for NV layout compatibility, not exposed)
 
 /// Identifies which bank is active within a bank set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,22 +37,23 @@ impl Bank {
 #[repr(u8)]
 pub enum BankSet {
     Hypervisor = 0,
-    Os1 = 1,
-    Os2 = 2,
+    Vm1 = 1,
+    Vm2 = 2,
     Hsm = 3,
+    /// Deprecated: kept for NV layout compatibility (index 4). Not exposed as a component.
     Qtd = 4,
 }
 
 impl BankSet {
     pub fn all() -> [BankSet; NUM_BANK_SETS] {
-        [BankSet::Hypervisor, BankSet::Os1, BankSet::Os2, BankSet::Hsm, BankSet::Qtd]
+        [BankSet::Hypervisor, BankSet::Vm1, BankSet::Vm2, BankSet::Hsm, BankSet::Qtd]
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "hyp" | "hypervisor" => Some(BankSet::Hypervisor),
-            "os1" => Some(BankSet::Os1),
-            "os2" => Some(BankSet::Os2),
+            "os1" | "vm1" => Some(BankSet::Vm1),
+            "os2" | "vm2" => Some(BankSet::Vm2),
             "hsm" => Some(BankSet::Hsm),
             "qtd" => Some(BankSet::Qtd),
             _ => None,
@@ -149,21 +150,21 @@ impl Default for BankBootState {
 /// ```text
 /// [0..4]   magic (NVB1)
 /// [4..8]   write_seq
-/// [8]      hyp.active_bank
-/// [9]      hyp.committed
-/// [10]     hyp.boot_count
-/// [11]     os1.active_bank
-/// [12]     os1.committed
-/// [13]     os1.boot_count
-/// [14]     os2.active_bank
-/// [15]     os2.committed
-/// [16]     os2.boot_count
+/// [8]      hypervisor.active_bank
+/// [9]      hypervisor.committed
+/// [10]     hypervisor.boot_count
+/// [11]     vm1.active_bank
+/// [12]     vm1.committed
+/// [13]     vm1.boot_count
+/// [14]     vm2.active_bank
+/// [15]     vm2.committed
+/// [16]     vm2.boot_count
 /// [17]     hsm.active_bank
 /// [18]     hsm.committed
 /// [19]     hsm.boot_count
-/// [20]     qtd.active_bank
-/// [21]     qtd.committed
-/// [22]     qtd.boot_count
+/// [20]     qtd.active_bank (deprecated)
+/// [21]     qtd.committed (deprecated)
+/// [22]     qtd.boot_count (deprecated)
 /// [23..28] padding
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]

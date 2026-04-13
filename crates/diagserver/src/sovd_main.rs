@@ -166,18 +166,17 @@ async fn main() {
 
     // Create one backend per bank set
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
-        ("hyp", BankSet::Hypervisor, ComponentConfig {
+        ("hypervisor", BankSet::Hypervisor, ComponentConfig {
             entity_type: "hpc".into(), ..ComponentConfig::default()
         }),
-        ("os1", BankSet::Os1, ComponentConfig::default()),
-        ("os2", BankSet::Os2, ComponentConfig::default()),
+        ("vm1", BankSet::Vm1, ComponentConfig::default()),
+        ("vm2", BankSet::Vm2, ComponentConfig::default()),
         ("hsm", BankSet::Hsm, ComponentConfig {
             supports_rollback: false,
             single_bank: true,
             entity_type: "hsm".into(),
             ..ComponentConfig::default()
         }),
-        ("qtd", BankSet::Qtd, ComponentConfig::default()),
     ];
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
@@ -191,6 +190,18 @@ async fn main() {
             vm_service_socket.clone(),
             images_dir.clone(),
         );
+        // Read display_name from per-bank vm-config.yaml if available
+        if let Some(ref dir) = images_dir {
+            let config_path = dir.join(id).join("current").join("vm-config.yaml");
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                // Lightweight parse — just extract display_name
+                if let Ok(map) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                    if let Some(name) = map.get("display_name").and_then(|v| v.as_str()) {
+                        backend = backend.with_display_name(name.to_string());
+                    }
+                }
+            }
+        }
         // Wire HSM provider into the HSM backend
         if set == BankSet::Hsm {
             if let Some(ref provider) = hsm_provider {
@@ -276,7 +287,7 @@ async fn main() {
         tracing::info!("  vm-service socket: {}", sock.display());
     }
     tracing::info!("  HSM keystore: {}", hsm_keystore_path.display());
-    tracing::info!("  components: hyp, os1, os2, hsm, qtd");
+    tracing::info!("  components: hypervisor, vm1, vm2, hsm");
     tracing::info!("  try: curl http://{bind_addr}/vehicle/v1/components");
 
     axum::serve(listener, router).await.unwrap();

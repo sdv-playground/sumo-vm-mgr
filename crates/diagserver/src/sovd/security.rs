@@ -46,28 +46,28 @@ mod tests {
     #[test]
     fn test_provider_roundtrip() {
         let provider = TestSecurityProvider;
-        let seed = provider.generate_seed(BankSet::Os1, 1);
+        let seed = provider.generate_seed(BankSet::Vm1, 1);
         assert_eq!(seed.len(), 4);
 
         let key: Vec<u8> = seed.iter().map(|b| b ^ 0xFF).collect();
-        assert!(provider.validate_key(BankSet::Os1, 1, &seed, &key));
+        assert!(provider.validate_key(BankSet::Vm1, 1, &seed, &key));
     }
 
     #[test]
     fn test_provider_rejects_wrong_key() {
         let provider = TestSecurityProvider;
-        let seed = provider.generate_seed(BankSet::Os1, 1);
+        let seed = provider.generate_seed(BankSet::Vm1, 1);
         let bad_key = vec![0x00; 4];
         // Only passes if seed happens to be all 0xFF, astronomically unlikely
         if seed != vec![0xFF; 4] {
-            assert!(!provider.validate_key(BankSet::Os1, 1, &seed, &bad_key));
+            assert!(!provider.validate_key(BankSet::Vm1, 1, &seed, &bad_key));
         }
     }
 
     #[test]
     fn test_provider_rejects_wrong_length() {
         let provider = TestSecurityProvider;
-        let seed = provider.generate_seed(BankSet::Os1, 1);
-        assert!(!provider.validate_key(BankSet::Os1, 1, &seed, &[0x00; 2]));
+        let seed = provider.generate_seed(BankSet::Vm1, 1);
+        assert!(!provider.validate_key(BankSet::Vm1, 1, &seed, &[0x00; 2]));
     }
 }

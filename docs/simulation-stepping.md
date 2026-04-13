@@ -30,7 +30,7 @@ use vm_devices::qmp::QmpClient;
 let clock = Arc::new(SimulationClock::new(1_000_000_000, wall_offset));
 
 // Connect to QEMU's QMP socket
-let qmp = QmpClient::connect("/tmp/vm-svc-os1-qmp.sock")?;
+let qmp = QmpClient::connect("/tmp/vm-svc-vm1-qmp.sock")?;
 
 // Create controller: 100ms steps, with QMP for vCPU control
 let ctrl = SimController::with_qmp(clock.clone(), 100_000_000, qmp);
@@ -176,7 +176,7 @@ The socket is created automatically. Connect after QEMU starts.
 To control a VM from an external simulation tool:
 
 1. **Start the vehicle stack** with `start-ecus.sh`
-2. **Connect QMP**: `QmpClient::connect("/tmp/vm-svc-os1-qmp.sock")`
+2. **Connect QMP**: `QmpClient::connect("/tmp/vm-svc-vm1-qmp.sock")`
 3. **Create SimController** with the desired step size
 4. **Replace device clocks**: pass `controller.clock()` to TimeSim, HealthSim, CanBridge
 5. **Drive the loop**: call `step()` at the simulation tick rate

@@ -1,6 +1,6 @@
 /// VmBackend — DiagnosticBackend implementation for vm-mgr bank sets.
 ///
-/// Each instance manages one bank set (hyp, os1, os2) and provides:
+/// Each instance manages one bank set (hypervisor, vm1, vm2, hsm) and provides:
 /// - Parameter read/write via NV DIDs
 /// - Fault (DTC) management
 /// - SUIT-based firmware flash with A/B banking
@@ -213,11 +213,11 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         images_dir: Option<PathBuf>,
     ) -> Self {
         let (id, name, desc) = match bank_set {
-            BankSet::Hypervisor => ("hyp", "Hypervisor", "Hypervisor A/B bank set"),
-            BankSet::Os1 => ("os1", "OS1", "Primary OS VM A/B bank set"),
-            BankSet::Os2 => ("os2", "OS2", "Secondary OS VM A/B bank set"),
-            BankSet::Hsm => ("hsm", "HSM", "Hardware Security Module"),
-            BankSet::Qtd => ("qtd", "QTD", "QNX Target Partition A/B bank set"),
+            BankSet::Hypervisor => ("hypervisor", "Hypervisor", "Hypervisor A/B bank set"),
+            BankSet::Vm1 => ("vm1", "VM1", "Virtual machine slot 1"),
+            BankSet::Vm2 => ("vm2", "VM2", "Virtual machine slot 2"),
+            BankSet::Hsm => ("hsm", "HSM Key Store", "Hardware Security Module"),
+            BankSet::Qtd => ("qtd", "Reserved", "Deprecated — not exposed"),
         };
 
         // Read the current active bank at startup — this is what we're running on.
@@ -272,6 +272,12 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             upload_phase: Mutex::new(None),
             hsm_provider: None,
         }
+    }
+
+    /// Override the component display name (shown in SOVD component listing).
+    pub fn with_display_name(mut self, name: String) -> Self {
+        self.entity_info.name = name;
+        self
     }
 
     /// Set an HSM provider for routing key material manifests.
@@ -366,9 +372,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let device_key = self.manifest_provider.device_decryption_key();
 
         let set_name = match self.bank_set {
-            BankSet::Hypervisor => "hyp",
-            BankSet::Os1 => "os1",
-            BankSet::Os2 => "os2",
+            BankSet::Hypervisor => "hypervisor",
+            BankSet::Vm1 => "vm1",
+            BankSet::Vm2 => "vm2",
             BankSet::Hsm => "hsm",
             BankSet::Qtd => "qtd",
         };
@@ -398,6 +404,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             let output_suffix = match uri.as_str() {
                 "#kernel" => format!("{set_name}-kernel-staged.img"),
                 "#firmware" => format!("{set_name}-staged.img"),
+                "#config" => format!("{set_name}-config-staged.yaml"),
                 other => format!("{set_name}-{}-staged.img", other.trim_start_matches('#')),
             };
             let output_path = images_dir.join(&output_suffix);
@@ -581,9 +588,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
         let uri = manifest.uri(comp_idx).unwrap_or("#firmware");
         let set_name = match self.bank_set {
-            BankSet::Hypervisor => "hyp",
-            BankSet::Os1 => "os1",
-            BankSet::Os2 => "os2",
+            BankSet::Hypervisor => "hypervisor",
+            BankSet::Vm1 => "vm1",
+            BankSet::Vm2 => "vm2",
             BankSet::Hsm => "hsm",
             BankSet::Qtd => "qtd",
         };
@@ -1138,6 +1145,13 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             *session = Some(FlashSessionState::AwaitingManifest);
         }
 
+        // Clear stale packages from previous flash cycles so we don't
+        // accidentally pick up an old verified package.
+        {
+            let mut packages = self.packages.lock().unwrap();
+            packages.clear();
+        }
+
         let transfer_id = self.next_id();
         tracing::info!(transfer_id = %transfer_id, "flash session started — awaiting manifest upload");
 
@@ -1259,9 +1273,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             // Rename staged file to target bank image
             if let Some(ref images_dir) = self.images_dir {
                 let set_name = match self.bank_set {
-                    BankSet::Hypervisor => "hyp",
-                    BankSet::Os1 => "os1",
-                    BankSet::Os2 => "os2",
+                    BankSet::Hypervisor => "hypervisor",
+                    BankSet::Vm1 => "vm1",
+                    BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
                     BankSet::Qtd => "qtd",
                 };
@@ -1299,9 +1313,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             // Write firmware payload to bank image file (real rootfs OTA)
             if let Some(ref images_dir) = self.images_dir {
                 let set_name = match self.bank_set {
-                    BankSet::Hypervisor => "hyp",
-                    BankSet::Os1 => "os1",
-                    BankSet::Os2 => "os2",
+                    BankSet::Hypervisor => "hypervisor",
+                    BankSet::Vm1 => "vm1",
+                    BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
                     BankSet::Qtd => "qtd",
                 };
@@ -1439,9 +1453,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                         // Rename staged files to target bank
                         if let Some(ref images_dir) = self.images_dir {
                             let set_name = match self.bank_set {
-                                BankSet::Hypervisor => "hyp",
-                                BankSet::Os1 => "os1",
-                                BankSet::Os2 => "os2",
+                                BankSet::Hypervisor => "hypervisor",
+                                BankSet::Vm1 => "vm1",
+                                BankSet::Vm2 => "vm2",
                                 BankSet::Hsm => "hsm",
                                 BankSet::Qtd => "qtd",
                             };
@@ -1458,6 +1472,20 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                                     } else {
                                         tracing::info!("renamed {} → {}", staged.display(), target.display());
                                     }
+                                }
+                            }
+
+                            // Per-bank VM config → target bank directory
+                            let config_staged = images_dir.join(format!("{set_name}-config-staged.yaml"));
+                            if config_staged.exists() {
+                                let bank_dir = images_dir.join(set_name).join(format!("bank_{target_bank}"));
+                                let config_target = bank_dir.join("vm-config.yaml");
+                                if let Err(e) = std::fs::rename(&config_staged, &config_target) {
+                                    tracing::warn!("rename config {} → {}: {e}",
+                                        config_staged.display(), config_target.display());
+                                } else {
+                                    tracing::info!("installed vm-config.yaml → {}",
+                                        config_target.display());
                                 }
                             }
                         }
@@ -1511,9 +1539,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // Flip the `current` symlink so vm-service boots the right bank
         if let (Some(ref images_dir), Some(ref socket_path)) = (&self.images_dir, &self.vm_service_socket) {
             let set_name = match self.bank_set {
-                BankSet::Hypervisor => "hyp",
-                BankSet::Os1 => "os1",
-                BankSet::Os2 => "os2",
+                BankSet::Hypervisor => "hypervisor",
+                BankSet::Vm1 => "vm1",
+                BankSet::Vm2 => "vm2",
                 BankSet::Hsm => "hsm",
                 BankSet::Qtd => "qtd",
             };

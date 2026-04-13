@@ -1,15 +1,15 @@
-component_id: ["os2"]
+component_id: ["vm2"]
 vendor_id: "fa6b4a53-d5ad-5fdf-be9d-e4e97d85cd2b"
 class_id: "7a3e1b92-c8f4-5d1a-a629-3f8c42e1d7b0"
 
 sequence_number: 1
 version: "1.0.0"
 
-spare_part_number: "OS2-SPARE-001"
-ecu_sw_number: "OS2-SW-001"
-supplier_sw_number: "SUP-SW-OS2-001"
+spare_part_number: "VM2-SPARE-001"
+ecu_sw_number: "VM2-SW-001"
+supplier_sw_number: "SUP-SW-VM2-001"
 supplier_sw_version: "1.0.0"
-system_name: "OS2-Linux"
-odx_file_id: "ODX-OS2-V1"
+system_name: "VM2-Linux"
+odx_file_id: "ODX-VM2-V1"
 tester_serial: "FACTORY"
 programming_date: "20260323"

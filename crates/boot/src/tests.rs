@@ -65,7 +65,7 @@ fn trial_boot_increments_count() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap(); // init
 
-    // Put OS1 into trial mode on Bank B
+    // Put VM1 into trial mode on Bank B
     let mut state = mgr.nv().read_boot_state().unwrap();
     state.banks[1].active_bank = Bank::B;
     state.banks[1].committed = false;
@@ -78,7 +78,7 @@ fn trial_boot_increments_count() {
     let actions = mgr.process_boot().unwrap();
     assert_eq!(actions[1], BootAction::TrialBoot { bank: Bank::B, boot_count: 2 });
 
-    // Hyp and OS2 should still be committed
+    // Hyp and VM2 should still be committed
     assert_eq!(actions[0], BootAction::Boot { bank: Bank::A });
     assert_eq!(actions[2], BootAction::Boot { bank: Bank::A });
 }
@@ -108,7 +108,7 @@ fn auto_rollback_after_max_trial_boots() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    // Set OS1 to trial with count at MAX (next boot triggers rollback)
+    // Set VM1 to trial with count at MAX (next boot triggers rollback)
     let mut state = mgr.nv().read_boot_state().unwrap();
     state.banks[1].active_bank = Bank::B;
     state.banks[1].committed = false;
@@ -186,7 +186,7 @@ fn bank_sets_independent_trial() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    // OS1 in trial, Hyp and OS2 committed
+    // VM1 in trial, Hyp and VM2 committed
     let mut state = mgr.nv().read_boot_state().unwrap();
     state.banks[1].active_bank = Bank::B;
     state.banks[1].committed = false;
@@ -195,8 +195,8 @@ fn bank_sets_independent_trial() {
 
     let actions = mgr.process_boot().unwrap();
     assert_eq!(actions[0], BootAction::Boot { bank: Bank::A }); // hyp committed
-    assert_eq!(actions[1], BootAction::TrialBoot { bank: Bank::B, boot_count: 1 }); // os1 trial
-    assert_eq!(actions[2], BootAction::Boot { bank: Bank::A }); // os2 committed
+    assert_eq!(actions[1], BootAction::TrialBoot { bank: Bank::B, boot_count: 1 }); // vm1 trial
+    assert_eq!(actions[2], BootAction::Boot { bank: Bank::A }); // vm2 committed
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn multiple_bank_sets_in_trial() {
     mgr.process_boot().unwrap();
 
     let mut state = mgr.nv().read_boot_state().unwrap();
-    // Hyp on trial (bank B), OS2 on trial (bank B)
+    // Hyp on trial (bank B), VM2 on trial (bank B)
     state.banks[0].active_bank = Bank::B;
     state.banks[0].committed = false;
     state.banks[0].boot_count = 0;
@@ -216,7 +216,7 @@ fn multiple_bank_sets_in_trial() {
 
     let actions = mgr.process_boot().unwrap();
     assert_eq!(actions[0], BootAction::TrialBoot { bank: Bank::B, boot_count: 1 });
-    assert_eq!(actions[1], BootAction::Boot { bank: Bank::A }); // OS1 committed
+    assert_eq!(actions[1], BootAction::Boot { bank: Bank::A }); // VM1 committed
     assert_eq!(actions[2], BootAction::TrialBoot { bank: Bank::B, boot_count: 6 });
 }
 
@@ -232,9 +232,9 @@ fn verify_image_correct_hash() {
 
     let mut meta = NvFwMeta::default();
     meta.image_sha256 = expected_hash;
-    mgr.nv_mut().write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    mgr.nv_mut().write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
-    let result = mgr.verify_image(BankSet::Os1, Bank::A, image_data);
+    let result = mgr.verify_image(BankSet::Vm1, Bank::A, image_data);
     assert_eq!(result, HashCheck::Ok);
 }
 
@@ -248,9 +248,9 @@ fn verify_image_wrong_hash() {
 
     let mut meta = NvFwMeta::default();
     meta.image_sha256 = Sha256::digest(wrong_data).into();
-    mgr.nv_mut().write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    mgr.nv_mut().write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
-    let result = mgr.verify_image(BankSet::Os1, Bank::A, image_data);
+    let result = mgr.verify_image(BankSet::Vm1, Bank::A, image_data);
     match result {
         HashCheck::Mismatch { expected, actual } => {
             assert_eq!(expected, Sha256::digest(wrong_data).as_slice());
@@ -265,7 +265,7 @@ fn verify_image_no_meta() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    let result = mgr.verify_image(BankSet::Os1, Bank::A, b"anything");
+    let result = mgr.verify_image(BankSet::Vm1, Bank::A, b"anything");
     assert_eq!(result, HashCheck::NoMeta);
 }
 
@@ -275,9 +275,9 @@ fn verify_image_zero_hash_is_no_meta() {
     mgr.process_boot().unwrap();
 
     let mut meta = NvFwMeta::default(); // all zeros including hash
-    mgr.nv_mut().write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    mgr.nv_mut().write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
-    let result = mgr.verify_image(BankSet::Os1, Bank::A, b"anything");
+    let result = mgr.verify_image(BankSet::Vm1, Bank::A, b"anything");
     assert_eq!(result, HashCheck::NoMeta);
 }
 
@@ -288,14 +288,14 @@ fn hash_failure_in_trial_triggers_rollback() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    // Put OS1 in trial on Bank B
+    // Put VM1 in trial on Bank B
     let mut state = mgr.nv().read_boot_state().unwrap();
     state.banks[1].active_bank = Bank::B;
     state.banks[1].committed = false;
     state.banks[1].boot_count = 3;
     mgr.nv_mut().write_boot_state(&mut state).unwrap();
 
-    let action = mgr.handle_hash_failure(BankSet::Os1).unwrap();
+    let action = mgr.handle_hash_failure(BankSet::Vm1).unwrap();
     assert_eq!(action, BootAction::HashRollback { from: Bank::B, to: Bank::A });
 
     // Verify NV state
@@ -310,7 +310,7 @@ fn hash_failure_in_committed_is_fatal() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    let action = mgr.handle_hash_failure(BankSet::Os1).unwrap();
+    let action = mgr.handle_hash_failure(BankSet::Vm1).unwrap();
     assert_eq!(action, BootAction::HashFatal { bank: Bank::A });
 
     // NV state unchanged — committed image is corrupt, nothing to do
@@ -326,8 +326,8 @@ fn active_bank_query() {
     mgr.process_boot().unwrap();
 
     assert_eq!(mgr.active_bank(BankSet::Hypervisor), Some(Bank::A));
-    assert_eq!(mgr.active_bank(BankSet::Os1), Some(Bank::A));
-    assert_eq!(mgr.active_bank(BankSet::Os2), Some(Bank::A));
+    assert_eq!(mgr.active_bank(BankSet::Vm1), Some(Bank::A));
+    assert_eq!(mgr.active_bank(BankSet::Vm2), Some(Bank::A));
 }
 
 #[test]
@@ -335,14 +335,14 @@ fn is_trial_query() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    assert_eq!(mgr.is_trial(BankSet::Os1), Some(false));
+    assert_eq!(mgr.is_trial(BankSet::Vm1), Some(false));
 
     // Put into trial
     let mut state = mgr.nv().read_boot_state().unwrap();
     state.banks[1].committed = false;
     mgr.nv_mut().write_boot_state(&mut state).unwrap();
 
-    assert_eq!(mgr.is_trial(BankSet::Os1), Some(true));
+    assert_eq!(mgr.is_trial(BankSet::Vm1), Some(true));
 }
 
 // --- Simulated OTA + boot cycle ---
@@ -362,7 +362,7 @@ fn ota_trial_commit_cycle() {
     meta.fw_secver = 2;
     meta.min_security_ver = 1;
     meta.image_sha256 = hash;
-    mgr.nv_mut().write_fw_meta(BankSet::Os1, Bank::B, &mut meta).unwrap();
+    mgr.nv_mut().write_fw_meta(BankSet::Vm1, Bank::B, &mut meta).unwrap();
 
     // Switch to trial
     let mut state = mgr.nv().read_boot_state().unwrap();
@@ -376,7 +376,7 @@ fn ota_trial_commit_cycle() {
     assert_eq!(actions[1], BootAction::TrialBoot { bank: Bank::B, boot_count: 1 });
 
     // Verify image
-    assert_eq!(mgr.verify_image(BankSet::Os1, Bank::B, image), HashCheck::Ok);
+    assert_eq!(mgr.verify_image(BankSet::Vm1, Bank::B, image), HashCheck::Ok);
 
     // Commit (simulating diagserver command)
     let mut state = mgr.nv().read_boot_state().unwrap();
@@ -385,18 +385,18 @@ fn ota_trial_commit_cycle() {
     mgr.nv_mut().write_boot_state(&mut state).unwrap();
 
     // Raise anti-rollback floor
-    let mut meta = mgr.nv().read_fw_meta(BankSet::Os1, Bank::B).unwrap();
+    let mut meta = mgr.nv().read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
     if meta.fw_secver > meta.min_security_ver {
         meta.min_security_ver = meta.fw_secver;
     }
-    mgr.nv_mut().write_fw_meta(BankSet::Os1, Bank::B, &mut meta).unwrap();
+    mgr.nv_mut().write_fw_meta(BankSet::Vm1, Bank::B, &mut meta).unwrap();
 
     // Next boot: committed on B
     let actions = mgr.process_boot().unwrap();
     assert_eq!(actions[1], BootAction::Boot { bank: Bank::B });
 
     // Verify anti-rollback floor was raised
-    let meta = mgr.nv().read_fw_meta(BankSet::Os1, Bank::B).unwrap();
+    let meta = mgr.nv().read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
     assert_eq!(meta.min_security_ver, 2);
 }
 
@@ -405,7 +405,7 @@ fn ota_trial_auto_rollback_cycle() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    // OTA: switch OS1 to Bank B, trial mode
+    // OTA: switch VM1 to Bank B, trial mode
     let mut state = mgr.nv().read_boot_state().unwrap();
     state.banks[1].active_bank = Bank::B;
     state.banks[1].committed = false;
@@ -438,7 +438,7 @@ fn ota_trial_auto_rollback_cycle() {
 fn parse_dev_profile() {
     let toml = r#"
 [vm]
-bank_set = "os1"
+bank_set = "vm1"
 ram_mb = 2048
 cpus = 4
 kernel = "Image"
@@ -476,7 +476,7 @@ path = "data.img"
 "#;
 
     let profile = VmProfile::from_toml(toml).unwrap();
-    assert_eq!(profile.vm.bank_set, "os1");
+    assert_eq!(profile.vm.bank_set, "vm1");
     assert_eq!(profile.vm.ram_mb, 2048);
     assert_eq!(profile.vm.cpus, 4);
     assert_eq!(profile.can_count(), 1);
@@ -488,7 +488,7 @@ path = "data.img"
 fn parse_minimal_profile() {
     let toml = r#"
 [vm]
-bank_set = "os1"
+bank_set = "vm1"
 kernel = "Image"
 
 [[devices]]
@@ -507,7 +507,7 @@ ssh_port = 2222
 fn parse_host_passthrough_can() {
     let toml = r#"
 [vm]
-bank_set = "os1"
+bank_set = "vm1"
 
 [[devices]]
 type = "can"
@@ -531,7 +531,7 @@ interface = "vcan0"
 fn parse_multiple_can() {
     let toml = r#"
 [vm]
-bank_set = "os1"
+bank_set = "vm1"
 
 [[devices]]
 type = "can"
@@ -567,18 +567,18 @@ nv_store: /tmp/test-nv.bin
 images_dir: /opt/images
 
 components:
-  os1:
-    bank_set: os1
+  vm1:
+    bank_set: vm1
     backend: qemu
-    profile: profiles/os1.toml
+    profile: profiles/vm1.toml
     shutdown:
       timeout_secs: 15
       method: health
     readiness:
       method: health
       timeout_secs: 30
-  os2:
-    bank_set: os2
+  vm2:
+    bank_set: vm2
     backend: dummy
   hsm:
     bank_set: hsm
@@ -591,17 +591,17 @@ components:
     assert_eq!(config.images_dir.to_str().unwrap(), "/opt/images");
     assert_eq!(config.components.len(), 3);
 
-    let os1 = &config.components["os1"];
-    assert_eq!(os1.bank_set, "os1");
-    assert_eq!(os1.backend, "qemu");
-    assert_eq!(os1.profile.as_ref().unwrap().to_str().unwrap(), "profiles/os1.toml");
-    assert!(!os1.single_bank);
-    assert_eq!(os1.shutdown.as_ref().unwrap().timeout_secs, 15);
-    assert_eq!(os1.readiness.as_ref().unwrap().timeout_secs, 30);
+    let vm1 = &config.components["vm1"];
+    assert_eq!(vm1.bank_set, "vm1");
+    assert_eq!(vm1.backend, "qemu");
+    assert_eq!(vm1.profile.as_ref().unwrap().to_str().unwrap(), "profiles/vm1.toml");
+    assert!(!vm1.single_bank);
+    assert_eq!(vm1.shutdown.as_ref().unwrap().timeout_secs, 15);
+    assert_eq!(vm1.readiness.as_ref().unwrap().timeout_secs, 30);
 
-    let os2 = &config.components["os2"];
-    assert_eq!(os2.backend, "dummy");
-    assert!(os2.profile.is_none());
+    let vm2 = &config.components["vm2"];
+    assert_eq!(vm2.backend, "dummy");
+    assert!(vm2.profile.is_none());
 
     let hsm = &config.components["hsm"];
     assert!(hsm.single_bank);
@@ -614,16 +614,16 @@ nv_store: /tmp/nv.bin
 images_dir: /images
 
 components:
-  os1:
-    bank_set: os1
+  vm1:
+    bank_set: vm1
 "#;
 
     let config = VmMgrConfig::from_yaml(yaml).unwrap();
-    let os1 = &config.components["os1"];
-    assert_eq!(os1.backend, "dummy"); // default backend
-    assert!(!os1.single_bank);
-    assert!(os1.shutdown.is_none());
-    assert!(os1.readiness.is_none());
+    let vm1 = &config.components["vm1"];
+    assert_eq!(vm1.backend, "dummy"); // default backend
+    assert!(!vm1.single_bank);
+    assert!(vm1.shutdown.is_none());
+    assert!(vm1.readiness.is_none());
 }
 
 #[test]

@@ -58,7 +58,7 @@ impl FirmwareManifest {
     }
 
     /// Resolve the BankSet from component_id.
-    /// Accepts ["os1"], ["hyp"], or ["vendor", "os1"], etc.
+    /// Accepts ["vm1"], ["hypervisor"], or ["vendor", "vm1"], etc.
     pub fn resolve_bank_set(&self) -> Option<BankSet> {
         let tag = self.component_id.last()?;
         BankSet::from_str(tag)
@@ -186,7 +186,7 @@ system_name: "OS1-Linux"
         assert_eq!(m.component_id, vec!["os1"]);
         assert_eq!(m.sequence_number, 3);
         assert_eq!(m.version, "1.2.0");
-        assert_eq!(m.resolve_bank_set(), Some(BankSet::Os1));
+        assert_eq!(m.resolve_bank_set(), Some(BankSet::Vm1));
     }
 
     #[test]

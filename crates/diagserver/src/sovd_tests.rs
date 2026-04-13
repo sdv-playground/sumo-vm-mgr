@@ -70,11 +70,10 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
-        ("hyp", BankSet::Hypervisor, ComponentConfig { entity_type: "hpc".into(), ..ComponentConfig::default() }),
-        ("os1", BankSet::Os1, ComponentConfig::default()),
-        ("os2", BankSet::Os2, ComponentConfig::default()),
+        ("hypervisor", BankSet::Hypervisor, ComponentConfig { entity_type: "hpc".into(), ..ComponentConfig::default() }),
+        ("vm1", BankSet::Vm1, ComponentConfig::default()),
+        ("vm2", BankSet::Vm2, ComponentConfig::default()),
         ("hsm", BankSet::Hsm, ComponentConfig { supports_rollback: false, single_bank: true, entity_type: "hsm".into(), ..ComponentConfig::default() }),
-        ("qtd", BankSet::Qtd, ComponentConfig::default()),
     ];
     for (id, set, config) in components {
         backends.insert(
@@ -217,15 +216,15 @@ async fn list_components() {
     let (status, json) = get(&router, "/vehicle/v1/components").await;
     assert_eq!(status, StatusCode::OK);
     let items = json["items"].as_array().unwrap();
-    assert_eq!(items.len(), 5);
+    assert_eq!(items.len(), 4);
 }
 
 #[tokio::test]
-async fn get_component_os1() {
+async fn get_component_vm1() {
     let (router, _, _) = make_router();
-    let (status, json) = get(&router, "/vehicle/v1/components/os1").await;
+    let (status, json) = get(&router, "/vehicle/v1/components/vm1").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["id"], "os1");
+    assert_eq!(json["id"], "vm1");
     assert!(json["capabilities"]["sessions"].as_bool().unwrap());
     assert!(json["capabilities"]["security"].as_bool().unwrap());
     assert!(json["capabilities"]["software_update"].as_bool().unwrap());
@@ -238,7 +237,7 @@ async fn get_component_os1() {
 #[tokio::test]
 async fn list_parameters() {
     let (router, _, _) = make_router();
-    let (status, json) = get(&router, "/vehicle/v1/components/os1/data").await;
+    let (status, json) = get(&router, "/vehicle/v1/components/vm1/data").await;
     assert_eq!(status, StatusCode::OK);
     let items = json["items"].as_array().unwrap();
     assert!(items.len() >= 21);
@@ -247,7 +246,7 @@ async fn list_parameters() {
 #[tokio::test]
 async fn read_active_bank() {
     let (router, _, _) = make_router();
-    let (status, json) = get(&router, "/vehicle/v1/components/os1/data/active_bank").await;
+    let (status, json) = get(&router, "/vehicle/v1/components/vm1/data/active_bank").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["value"], "A");
 }
@@ -255,7 +254,7 @@ async fn read_active_bank() {
 #[tokio::test]
 async fn read_committed() {
     let (router, _, _) = make_router();
-    let (status, json) = get(&router, "/vehicle/v1/components/os1/data/committed").await;
+    let (status, json) = get(&router, "/vehicle/v1/components/vm1/data/committed").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["value"], true);
 }
@@ -267,7 +266,7 @@ async fn read_committed() {
 #[tokio::test]
 async fn session_default_initially() {
     let (router, _, _) = make_router();
-    let (status, json) = get(&router, "/vehicle/v1/components/os1/modes/session").await;
+    let (status, json) = get(&router, "/vehicle/v1/components/vm1/modes/session").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["value"], "default");
 }
@@ -275,7 +274,7 @@ async fn session_default_initially() {
 #[tokio::test]
 async fn session_switch_to_programming() {
     let (router, _, _) = make_router();
-    let (status, json) = put_json(&router, "/vehicle/v1/components/os1/modes/session",
+    let (status, json) = put_json(&router, "/vehicle/v1/components/vm1/modes/session",
         serde_json::json!({"value": "programming"})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["value"], "programming");
@@ -284,7 +283,7 @@ async fn session_switch_to_programming() {
 #[tokio::test]
 async fn security_locked_initially() {
     let (router, _, _) = make_router();
-    let (status, json) = get(&router, "/vehicle/v1/components/os1/modes/security").await;
+    let (status, json) = get(&router, "/vehicle/v1/components/vm1/modes/security").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["value"], "locked");
 }
@@ -293,11 +292,11 @@ async fn security_locked_initially() {
 async fn security_seed_key_unlock() {
     let (router, _, _) = make_router();
     // Programming session first
-    put_json(&router, "/vehicle/v1/components/os1/modes/session",
+    put_json(&router, "/vehicle/v1/components/vm1/modes/session",
         serde_json::json!({"value": "programming"})).await;
 
     // Request seed
-    let (status, json) = put_json(&router, "/vehicle/v1/components/os1/modes/security",
+    let (status, json) = put_json(&router, "/vehicle/v1/components/vm1/modes/security",
         serde_json::json!({"value": "level1_requestseed"})).await;
     assert_eq!(status, StatusCode::OK);
     assert!(json["seed"].is_object());
@@ -311,7 +310,7 @@ async fn security_seed_key_unlock() {
     let key_hex: String = seed_bytes.iter().map(|b| format!("{:02x}", b ^ 0xFF)).collect();
 
     // Send key
-    let (status, json) = put_json(&router, "/vehicle/v1/components/os1/modes/security",
+    let (status, json) = put_json(&router, "/vehicle/v1/components/vm1/modes/security",
         serde_json::json!({"value": "level1", "key": key_hex})).await;
     assert_eq!(status, StatusCode::OK);
     // Unlocked — value should be "level1"
@@ -321,14 +320,14 @@ async fn security_seed_key_unlock() {
 #[tokio::test]
 async fn session_change_resets_security() {
     let (router, _, _) = make_router();
-    unlock_for_flash(&router, "os1").await;
+    unlock_for_flash(&router, "vm1").await;
 
     // Switch back to default
-    put_json(&router, "/vehicle/v1/components/os1/modes/session",
+    put_json(&router, "/vehicle/v1/components/vm1/modes/session",
         serde_json::json!({"value": "default"})).await;
 
     // Security should be locked
-    let (_, json) = get(&router, "/vehicle/v1/components/os1/modes/security").await;
+    let (_, json) = get(&router, "/vehicle/v1/components/vm1/modes/security").await;
     assert_eq!(json["value"], "locked");
 }
 
@@ -339,8 +338,8 @@ async fn session_change_resets_security() {
 #[tokio::test]
 async fn flash_rejected_in_default_session() {
     let (router, _, keys) = make_router();
-    let envelope = make_test_suit_envelope(&keys, "os1", 1, &[0xAA; 256]);
-    let (status, _) = post_bytes(&router, "/vehicle/v1/components/os1/files", envelope).await;
+    let envelope = make_test_suit_envelope(&keys, "vm1", 1, &[0xAA; 256]);
+    let (status, _) = post_bytes(&router, "/vehicle/v1/components/vm1/files", envelope).await;
     // Should be rejected — not in programming session
     assert_ne!(status, StatusCode::CREATED);
 }
@@ -349,11 +348,11 @@ async fn flash_rejected_in_default_session() {
 async fn flash_rejected_when_locked() {
     let (router, _, keys) = make_router();
     // Programming but no security unlock
-    put_json(&router, "/vehicle/v1/components/os1/modes/session",
+    put_json(&router, "/vehicle/v1/components/vm1/modes/session",
         serde_json::json!({"value": "programming"})).await;
 
-    let envelope = make_test_suit_envelope(&keys, "os1", 1, &[0xAA; 256]);
-    let (status, _) = post_bytes(&router, "/vehicle/v1/components/os1/files", envelope).await;
+    let envelope = make_test_suit_envelope(&keys, "vm1", 1, &[0xAA; 256]);
+    let (status, _) = post_bytes(&router, "/vehicle/v1/components/vm1/files", envelope).await;
     assert_ne!(status, StatusCode::CREATED);
 }
 
@@ -364,39 +363,39 @@ async fn flash_rejected_when_locked() {
 #[tokio::test]
 async fn flash_full_suit_flow() {
     let (router, _, keys) = make_router();
-    unlock_for_flash(&router, "os1").await;
+    unlock_for_flash(&router, "vm1").await;
 
     let image = vec![0xBB; 2048];
-    let envelope = make_test_suit_envelope(&keys, "os1", 2, &image);
+    let envelope = make_test_suit_envelope(&keys, "vm1", 2, &image);
 
     // 1. Upload
-    let (status, json) = post_bytes(&router, "/vehicle/v1/components/os1/files", envelope).await;
+    let (status, json) = post_bytes(&router, "/vehicle/v1/components/vm1/files", envelope).await;
     assert_eq!(status, StatusCode::CREATED);
     let file_id = json["file_id"].as_str().unwrap().to_string();
 
     // 2. Verify
     let (status, json) = post_empty(&router,
-        &format!("/vehicle/v1/components/os1/files/{file_id}/verify")).await;
+        &format!("/vehicle/v1/components/vm1/files/{file_id}/verify")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(json["valid"].as_bool().unwrap());
 
     // 3. Start transfer
-    let (status, _json) = post_json(&router, "/vehicle/v1/components/os1/flash/transfer",
+    let (status, _json) = post_json(&router, "/vehicle/v1/components/vm1/flash/transfer",
         serde_json::json!({"file_id": file_id})).await;
     assert!(status == StatusCode::OK || status == StatusCode::ACCEPTED);
 
     // 4. Check activation — should be trial (activated)
-    let (status, json) = get(&router, "/vehicle/v1/components/os1/flash/activation").await;
+    let (status, json) = get(&router, "/vehicle/v1/components/vm1/flash/activation").await;
     assert_eq!(status, StatusCode::OK);
     // Trial state — sovd-api serializes FlashState::Activated
     assert!(json["state"].as_str().unwrap() != "committed");
 
     // 5. Commit
-    let (status, _) = post_empty(&router, "/vehicle/v1/components/os1/flash/commit").await;
+    let (status, _) = post_empty(&router, "/vehicle/v1/components/vm1/flash/commit").await;
     assert_eq!(status, StatusCode::OK);
 
     // 6. Verify idle after commit (flash_transfer cleared → Complete)
-    let (status, json) = get(&router, "/vehicle/v1/components/os1/flash/activation").await;
+    let (status, json) = get(&router, "/vehicle/v1/components/vm1/flash/activation").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["state"], "complete");
 }
@@ -408,7 +407,7 @@ async fn flash_full_suit_flow() {
 #[tokio::test]
 async fn faults_empty_initially() {
     let (router, _, _) = make_router();
-    let (status, json) = get(&router, "/vehicle/v1/components/os1/faults").await;
+    let (status, json) = get(&router, "/vehicle/v1/components/vm1/faults").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["total_count"], 0);
 }
@@ -420,20 +419,20 @@ async fn faults_and_clear() {
     {
         let mut nv = nv.lock().unwrap();
         let bs = nv.read_boot_state().unwrap();
-        let active = bs.banks[BankSet::Os1 as usize].active_bank;
-        let mut runtime = nv.read_runtime(BankSet::Os1, active).unwrap_or_default();
+        let active = bs.banks[BankSet::Vm1 as usize].active_bank;
+        let mut runtime = nv.read_runtime(BankSet::Vm1, active).unwrap_or_default();
         runtime.dtc_count = 1;
         runtime.dtcs[0] = DtcEntry { dtc_number: 0x00A301, status: 0x01 };
-        nv.write_runtime(BankSet::Os1, active, &mut runtime).unwrap();
+        nv.write_runtime(BankSet::Vm1, active, &mut runtime).unwrap();
     }
 
-    let (status, json) = get(&router, "/vehicle/v1/components/os1/faults").await;
+    let (status, json) = get(&router, "/vehicle/v1/components/vm1/faults").await;
     assert_eq!(status, StatusCode::OK);
     let items = json["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
 
     // Clear
-    let (status, json) = delete(&router, "/vehicle/v1/components/os1/faults").await;
+    let (status, json) = delete(&router, "/vehicle/v1/components/vm1/faults").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["cleared_count"], 1);
 }
@@ -453,17 +452,17 @@ async fn ota_commit_via_sovd() {
         meta.fw_version[..5].copy_from_slice(b"2.0.0");
         meta.fw_secver = 1;
         meta.fw_seq = 1;
-        ota::install(&mut *nv, BankSet::Os1, b"test", &meta, false).unwrap();
+        ota::install(&mut *nv, BankSet::Vm1, b"test", &meta, false).unwrap();
     }
 
-    let (_, json) = get(&router, "/vehicle/v1/components/os1/flash/activation").await;
+    let (_, json) = get(&router, "/vehicle/v1/components/vm1/flash/activation").await;
     // Trial state — sovd-api serializes FlashState::Activated
     assert!(json["state"].as_str().unwrap() != "committed");
 
-    let (status, _) = post_empty(&router, "/vehicle/v1/components/os1/flash/commit").await;
+    let (status, _) = post_empty(&router, "/vehicle/v1/components/vm1/flash/commit").await;
     assert_eq!(status, StatusCode::OK);
 
-    let (_, json) = get(&router, "/vehicle/v1/components/os1/flash/activation").await;
+    let (_, json) = get(&router, "/vehicle/v1/components/vm1/flash/activation").await;
     assert_eq!(json["state"], "complete"); // idle after commit
 }
 
@@ -477,13 +476,13 @@ async fn ota_rollback_via_sovd() {
         meta.fw_version[..5].copy_from_slice(b"2.0.0");
         meta.fw_secver = 1;
         meta.fw_seq = 1;
-        ota::install(&mut *nv, BankSet::Os1, b"test", &meta, false).unwrap();
+        ota::install(&mut *nv, BankSet::Vm1, b"test", &meta, false).unwrap();
     }
 
-    let (status, _) = post_empty(&router, "/vehicle/v1/components/os1/flash/rollback").await;
+    let (status, _) = post_empty(&router, "/vehicle/v1/components/vm1/flash/rollback").await;
     assert_eq!(status, StatusCode::OK);
 
-    let (_, json) = get(&router, "/vehicle/v1/components/os1/data/active_bank").await;
+    let (_, json) = get(&router, "/vehicle/v1/components/vm1/data/active_bank").await;
     assert_eq!(json["value"], "A");
 }
 
@@ -498,10 +497,10 @@ fn suit_provider_validates_good_envelope() {
     // Software authority = same key as signing key (trust anchor) for tests
     provider.update_keys(keys.trust_anchor.clone(), None);
     let image = vec![0xDD; 4096];
-    let envelope = make_test_suit_envelope(&keys, "os1", 5, &image);
+    let envelope = make_test_suit_envelope(&keys, "vm1", 5, &image);
 
     let result = provider.validate(&envelope, 0).unwrap();
-    assert_eq!(result.bank_set, BankSet::Os1);
+    assert_eq!(result.bank_set, BankSet::Vm1);
     assert_eq!(result.image_meta.fw_seq, 5);
     assert_eq!(result.image_data, image);
 }
@@ -514,7 +513,7 @@ fn suit_provider_rejects_wrong_key() {
     // Set wrong software authority — should reject firmware
     provider.update_keys(other_keys.trust_anchor.clone(), None);
     let image = vec![0xEE; 256];
-    let envelope = make_test_suit_envelope(&keys, "os1", 1, &image);
+    let envelope = make_test_suit_envelope(&keys, "vm1", 1, &image);
     assert!(provider.validate(&envelope, 0).is_err());
 }
 
@@ -524,6 +523,6 @@ fn suit_provider_rejects_rollback() {
     let provider = SuitProvider::new(keys.trust_anchor.clone());
     provider.update_keys(keys.trust_anchor.clone(), None);
     let image = vec![0xFF; 256];
-    let envelope = make_test_suit_envelope(&keys, "os1", 3, &image);
+    let envelope = make_test_suit_envelope(&keys, "vm1", 3, &image);
     assert!(provider.validate(&envelope, 5).is_err());
 }

@@ -45,11 +45,11 @@ fn main() {
         }
     };
 
-    let set_names = ["hyp", "os1", "os2"];
+    let set_names = ["hypervisor", "vm1", "vm2"];
 
     for (i, action) in actions.iter().enumerate() {
         let name = set_names[i];
-        let set = [BankSet::Hypervisor, BankSet::Os1, BankSet::Os2][i];
+        let set = [BankSet::Hypervisor, BankSet::Vm1, BankSet::Vm2][i];
         match action {
             BootAction::FirstBoot => {
                 println!("[bootmgr] {name}: first boot, initialized to bank A");
@@ -106,7 +106,7 @@ fn main() {
 
     // Output active banks as machine-readable line for scripts
     println!();
-    for (i, set) in [BankSet::Hypervisor, BankSet::Os1, BankSet::Os2].iter().enumerate() {
+    for (i, set) in [BankSet::Hypervisor, BankSet::Vm1, BankSet::Vm2].iter().enumerate() {
         if let Some(bank) = mgr.active_bank(*set) {
             let letter = match bank {
                 nv_store::types::Bank::A => "A",

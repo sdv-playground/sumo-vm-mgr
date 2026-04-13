@@ -98,9 +98,9 @@ pub async fn process_envelope_stream(
     let suit_device_key = manifest_provider.device_decryption_key();
 
     let set_name = match bank_set {
-        BankSet::Hypervisor => "hyp",
-        BankSet::Os1 => "os1",
-        BankSet::Os2 => "os2",
+        BankSet::Hypervisor => "hypervisor",
+        BankSet::Vm1 => "vm1",
+        BankSet::Vm2 => "vm2",
         BankSet::Hsm => "hsm",
         BankSet::Qtd => "qtd",
     };
@@ -132,6 +132,7 @@ pub async fn process_envelope_stream(
             let suffix = match pp.key.as_str() {
                 "#kernel" => format!("{set_name}-kernel-staged.img"),
                 "#firmware" => format!("{set_name}-staged.img"),
+                "#config" => format!("{set_name}-config-staged.yaml"),
                 other => format!("{set_name}-{}-staged.img",
                     other.trim_start_matches('#')),
             };

@@ -32,7 +32,10 @@ Three Rust crates in a workspace:
 
 ### Key Concepts
 
-- Three A/B bank sets: hypervisor, OS1, OS2 (independent state machines)
+- Four components: hypervisor, vm1, vm2 (A/B banked), hsm (single-bank, no rollback)
+- Two-process architecture: vm-service (QEMU lifecycle) + vm-sovd (diagnostics/OTA)
+- Per-bank VM config: vm-config.yaml in bank directories, delivered alongside
+  firmware via OTA, auto-rollback with firmware
 - NV store: raw partition, sector rotation, CRC-32, monotonic write_seq
 - Trial boot: up to 10 reboots before auto-rollback
 - Copy-on-update: clone Runtime DIDs to target bank before OTA write
@@ -40,6 +43,8 @@ Three Rust crates in a workspace:
   enables A/B fleet testing. Floor raised only on commit.
 - CRL manifests: policy-only, no firmware, raises anti-rollback floor
 - Encrypted firmware: AES-128-GCM + ECDH-ES+A128KW per-device
+- Multi-component SUIT: kernel + rootfs + vm-config as separate payloads (#kernel, #firmware, #config)
+  all compressed and encrypted per-ECU
 - Session/security: programming session + seed/key unlock before flash
 - SecurityProvider trait: pluggable key validation (TestSecurityProvider for dev)
 - ManifestProvider trait: pluggable manifest validation (SuitProvider default)

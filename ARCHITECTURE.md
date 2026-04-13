@@ -2,7 +2,7 @@
 
 ## Overview
 
-Platform-agnostic VM lifecycle manager for automotive ECUs. Handles A/B bank switching, boot decisions with trial boot and auto-rollback, OTA updates with anti-rollback security, and automotive diagnostics (UDS DIDs, DTCs) via both CLI and SOVD REST API. Supports SUIT-inspired firmware bundles (VMFB format) for packaged updates. Developed and tested on Linux (file-backed storage + QEMU), deployable on any hypervisor (QNX qvm, Xen) via the backend trait.
+Platform-agnostic VM lifecycle manager for automotive ECUs. Handles A/B bank switching, boot decisions with trial boot and auto-rollback, OTA updates with SUIT manifest validation and encrypted firmware, and automotive diagnostics (UDS DIDs, DTCs) via SOVD REST API. Two-process architecture: vm-service (QEMU lifecycle) + vm-sovd (diagnostics/OTA). Developed and tested on Linux (file-backed storage + QEMU), deployable on any hypervisor (QNX qvm, Xen) via the backend trait.
 
 **Stack:** Rust 2021 edition, Axum 0.8 (HTTP), Tokio (async runtime), SHA-256 (image verification), CRC-32 (sector integrity), serde_yaml (manifests)
 
@@ -25,16 +25,13 @@ vm-mgr/
 +-- scripts/
 |   +-- run.sh                  # Boot loop launcher (builds, factory-init, starts SOVD + vm-runner)
 |   +-- mkbundle.sh             # Creates VMFB firmware bundle from manifest + image
-+-- example/profiles/
-|   +-- os1-dev.toml            # QEMU profile: full device stack (CAN, HSM, health, time)
-|   +-- os1-minimal.toml        # QEMU profile: network only, quick boot testing
 +-- example/
 |   +-- factory/                # Example factory provisioning manifests
 |   |   +-- factory.yaml        # Serial, VIN, HW IDs
-|   |   +-- hyp.yaml            # Hypervisor firmware manifest (version, DIDs)
-|   |   +-- os1.yaml            # OS1 firmware manifest (version, DIDs)
+|   |   +-- hypervisor.yaml     # Hypervisor firmware manifest (version, DIDs)
+|   |   +-- vm1.yaml            # VM1 firmware manifest (version, DIDs)
 |   +-- keys/                   # Generated SUIT signing keys
-|   +-- output/                 # Generated SUIT envelopes (os1-v1, os1-v2, os2-v1, os2-v2)
+|   +-- output/                 # Generated SUIT envelopes (vm1-v1, vm1-v2, etc.)
 +-- specs/
 |   +-- disk-layout.md          # GPT partition table specification
 |   +-- nv-store-format.md      # NV partition internal layout & wire formats
@@ -57,23 +54,26 @@ vm-mgr/
     |       +-- qnx.rs           # QnxBackend (stub for production)
     |       +-- config.rs        # VmProfile, VmConfig, DeviceConfig (TOML, serde)
     |       +-- tests.rs         # 30+ tests (boot cycle, hash verification, config parsing, QEMU args)
-    +-- diagserver/             # Diagnostic server: CLI + SOVD REST API + manifest/bundle
+    +-- vm-service/             # VM lifecycle manager (QEMU process management)
+    |   +-- src/
+    |       +-- config.rs        # VmServiceConfig, VmDefinition, VmBankConfig (per-bank overrides)
+    |       +-- manager.rs       # VmManager: start/stop/restart VMs, IPC listener
+    |       +-- qemu.rs          # QemuRunner: QEMU process launch + arg builder
+    |       +-- main.rs          # vm-service binary
+    +-- diagserver/             # Diagnostic server: SOVD REST API + SUIT OTA engine
         +-- src/
             +-- lib.rs           # Module exports
-            +-- main.rs          # vm-diagserver CLI binary (10 commands)
+            +-- backend.rs       # VmBackend: DiagnosticBackend implementation
+            +-- suit_provider.rs # SUIT envelope validation + orchestrator integration
+            +-- manifest_provider.rs # ManifestProvider trait
+            +-- streaming.rs     # Streaming payload pipeline (decrypt + decompress)
             +-- did.rs           # DID resolution (Runtime > FwMeta > Factory > Dynamic)
             +-- ota.rs           # OTA install/commit/rollback engine
-            +-- manifest.rs      # FirmwareManifest, FactoryManifest, FirmwareBundle (VMFB)
-            +-- tests.rs         # 50+ unit tests (DID, OTA, manifest, bundle)
+            +-- tests.rs         # Unit tests (DID, OTA, backend)
             +-- sovd_main.rs     # vm-sovd HTTP server binary (Axum + Tokio)
-            +-- sovd_tests.rs    # 30+ HTTP integration tests
             +-- sovd/
                 +-- mod.rs       # SOVD module exports
-                +-- models.rs    # JSON types + DID parameter registry (21 standard DIDs)
-                +-- handlers.rs  # 16 async Axum handler functions
-                +-- router.rs    # Route definitions + CORS + 256MB body limit
-                +-- state.rs     # AppState<D>, UploadStore, UploadEntry, TransferState
-                +-- error.rs     # ApiError -> HTTP status + JSON body (OtaError mapping)
+                +-- security.rs  # SecurityProvider trait + TestSecurityProvider
 ```
 
 ## System Architecture
@@ -174,22 +174,31 @@ graph TB
 
 **Dependencies:** `nv-store`, `sha2`, `serde`, `toml`, `libc`, `ctrlc`
 
+### vm-service
+
+| Module | Purpose | Key Exports |
+|--------|---------|-------------|
+| `config` | VM definition + per-bank overrides | `VmServiceConfig`, `VmDefinition`, `VmBankConfig`, `ImagePaths`, `with_bank_overrides()` |
+| `manager` | VM lifecycle management | `VmManager` (start/stop/restart VMs, IPC socket listener) |
+| `qemu` | QEMU process launch | `QemuRunner` (arg builder, process management, KVM detection) |
+| `main` | Service binary | `vm-service --config <yaml> [--images-dir <dir>] [--socket <path>]` |
+
+**Dependencies:** `nv-store`, `serde`, `serde_yaml`, `tokio`, `tracing`
+
 ### vm-diagserver
 
 | Module | Purpose | Key Exports |
 |--------|---------|-------------|
+| `backend` | SOVD backend implementation | `VmBackend` (implements `DiagnosticBackend`), `ComponentConfig` |
+| `suit_provider` | SUIT envelope validation | `SuitProvider` (signature, digest, security version checks) |
+| `manifest_provider` | Provider trait | `ManifestProvider` trait (pluggable validation) |
+| `streaming` | Payload pipeline | Streaming decrypt (AES-128-GCM) + decompress (zstd) for multi-component uploads |
 | `did` | DID resolution (4-layer priority) | `read_did`, `write_did`, `DidValue`, 21 DID constants (F187-F19E, FD00-FD04) |
-| `ota` | OTA lifecycle engine | `install`, `commit`, `rollback`, `status`, `OtaError` (6 variants), `ImageMeta`, `InstallResult`, `BankStatus` |
-| `manifest` | SUIT-inspired manifests & bundles | `FirmwareManifest`, `FactoryManifest`, `FirmwareBundle` (VMFB pack/unpack), `BundleError` |
-| `main` | CLI entry point (10 commands) | `vm-diagserver <nv-path> <command> [args]` |
-| `sovd/handlers` | Axum HTTP handlers | 16 async functions (health, components, parameters, faults, flash upload/verify/transfer/commit/rollback) |
-| `sovd/router` | Route + middleware setup | `create_router<D>()` (17 routes, CORS, 256MB body limit) |
-| `sovd/models` | JSON request/response types | `ComponentInfo`, `ParameterList`, `DataValue`, `FaultList`, `ActivationState`, `TransferProgress`, etc. + `PARAM_REGISTRY` (21 DIDs), `resolve_param()` |
-| `sovd/state` | Shared state | `AppState<D>` (`Arc<Mutex<NvStore<D>>>` + `Arc<Mutex<UploadStore>>`), `UploadEntry`, `TransferState`, `UploadPhase`, `TransferPhase` |
-| `sovd/error` | Error-to-HTTP mapping | `ApiError` (5 variants) -> HTTP status + JSON, `From<OtaError>` |
-| `sovd_main` | HTTP server entry point | `vm-sovd <nv-path> [addr]` (default 0.0.0.0:8080) |
+| `ota` | OTA lifecycle engine | `install`, `commit`, `rollback`, `status`, `OtaError`, `BankStatus` |
+| `sovd/security` | Security provider | `SecurityProvider` trait, `TestSecurityProvider` (XOR 0xFF for dev) |
+| `sovd_main` | HTTP server entry point | `vm-sovd <nv-path> <provisioning-authority> [options] [bind-addr]` |
 
-**Dependencies:** `nv-store`, `sha2`, `crc32fast`, `serde`, `serde_json`, `serde_yaml`, `axum`, `tokio`, `tower-http`, `tracing`, `tracing-subscriber`
+**Dependencies:** `nv-store`, `sovd-core`, `sovd-api`, `sumo-onboard`, `sumo-processor`, `sumo-crypto`, `hsm`, `axum`, `tokio`, `tracing`
 
 ```mermaid
 graph LR
@@ -248,9 +257,11 @@ classDiagram
     class BankSet {
         <<enum>>
         Hypervisor = 0
-        Os1 = 1
-        Os2 = 2
-        +all() [BankSet; 3]
+        Vm1 = 1
+        Vm2 = 2
+        Hsm = 3
+        Qtd = 4 (reserved)
+        +all() [BankSet; 4]
         +from_str(s) Option~BankSet~
     }
 
@@ -280,7 +291,7 @@ classDiagram
 
     class NvBootState {
         write_seq: u32
-        banks: [BankBootState; 3]
+        banks: [BankBootState; 5]
     }
 
     class NvFactory {
@@ -390,7 +401,7 @@ classDiagram
     NvFwMeta ..|> NvRecord
     NvRuntime ..|> NvRecord
     NvApp ..|> NvRecord
-    NvBootState "1" *-- "3" BankBootState
+    NvBootState "1" *-- "5" BankBootState
     BankBootState --> Bank
     NvRuntime "1" *-- "20" DidEntry
     NvRuntime "1" *-- "16" DtcEntry
@@ -453,44 +464,39 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant C as HTTP Client
-    participant H as SOVD Handlers
-    participant U as UploadStore
-    participant OTA as OTA Engine
+    participant H as VmBackend
+    participant S as SuitProvider
     participant NV as NvStore
+    participant FS as Bank Directory
 
-    C->>H: GET /components/os1/flash/activation
-    H->>NV: read_boot_state()
-    H-->>C: { state: "committed", active_version: "1.0" }
+    C->>H: PUT /components/vm1/modes/session { "programming" }
+    C->>H: PUT /components/vm1/modes/security { seed/key }
 
-    C->>H: POST /components/os1/files (VMFB bundle body)
-    H->>H: FirmwareBundle::unpack(body)
-    H->>U: Store upload (id, component, bundle)
+    C->>H: POST /components/vm1/files (SUIT envelope)
+    H->>S: validate(envelope) — signature + security version
     H-->>C: { upload_id: "1", state: "uploaded" }
 
-    C->>H: POST /components/os1/files/1/verify
-    H->>U: Get upload entry
-    H->>H: SHA-256 of image, check against manifest
-    H->>U: state = Verified
-    H-->>C: { state: "verified", image_sha256, image_size }
+    C->>H: POST /components/vm1/files/1/verify
+    H->>S: verify digests against manifest
+    H-->>C: { state: "verified" }
 
-    C->>H: POST /components/os1/flash/transfer { file_id: "1" }
-    H->>U: Extract manifest + image
-    H->>OTA: install(nv, Os1, image, meta)
-    OTA->>NV: read_boot_state() [verify committed]
-    OTA->>NV: read_fw_meta(Os1, active) [check anti-rollback]
-    OTA->>NV: copy_runtime(Os1, A -> B)
-    OTA->>OTA: SHA-256 + CRC-32 of image
-    OTA->>NV: write_fw_meta(Os1, B, new_meta)
-    OTA->>NV: write_boot_state(active=B, committed=false)
-    H->>U: Create TransferState (completed)
-    H-->>C: { transfer_id: "2", state: "completed" }
+    C->>H: POST /components/vm1/flash/transfer { file_id: "1" }
+    Note over H: Streaming multi-payload flash
+    C->>H: PUT payloads: #kernel, #firmware, #config
+    H->>H: decrypt (AES-128-GCM) + decompress (zstd) each payload
+    H->>FS: write kernel + rootfs to staged files
+    H->>FS: write vm-config.yaml to staged file
+    H->>NV: copy_runtime(Vm1, A -> B)
+    H->>FS: rename staged files → target bank directory
+    H->>FS: flip current symlink → target bank
+    H->>NV: write_fw_meta(Vm1, B, new_meta)
+    H->>NV: write_boot_state(active=B, committed=false)
+    H-->>C: { transfer_id, state: "completed" }
 
-    Note over C: VM reboots into trial mode...
+    Note over C: POST /restart → vm-service restarts VM with new bank config
 
-    C->>H: POST /components/os1/flash/commit
-    H->>OTA: commit(nv, Os1)
-    OTA->>NV: read_fw_meta [raise min_security_ver]
-    OTA->>NV: write_boot_state(committed=true)
+    C->>H: POST /components/vm1/flash/commit
+    H->>NV: raise min_security_ver, write committed=true
     H-->>C: { success: true }
 ```
 
@@ -503,19 +509,19 @@ sequenceDiagram
     participant D as did::read_did
     participant NV as NvStore
 
-    C->>H: GET /components/os1/data/fw_version
+    C->>H: GET /components/vm1/data/fw_version
     H->>H: resolve_param("fw_version") -> (0xF189, registry entry)
-    H->>D: read_did(nv, Os1, 0xF189)
+    H->>D: read_did(nv, Vm1, 0xF189)
 
     D->>NV: read_boot_state() [get active bank]
 
-    D->>NV: read_runtime(Os1, active_bank)
+    D->>NV: read_runtime(Vm1, active_bank)
     Note over D: 1. Check runtime DIDs (writable, per-bank)
 
     alt Found in Runtime
         D-->>H: Bytes(data)
     else Not in Runtime
-        D->>NV: read_fw_meta(Os1, active_bank)
+        D->>NV: read_fw_meta(Vm1, active_bank)
         Note over D: 2. Check FW Meta DIDs (F187-F19E)
         alt Found in FW Meta
             D-->>H: Bytes(data)
@@ -556,7 +562,7 @@ sequenceDiagram
     D->>D: Parse example/factory/factory.yaml
     D->>NV: write_factory(serial, VIN, HW IDs)
 
-    loop For each {hyp, os1, os2}.yaml
+    loop For each {hypervisor, vm1, vm2}.yaml
         D->>D: Parse manifest YAML
         D->>D: Hash corresponding image (if exists)
         D->>NV: write_fw_meta(set, Bank::A, meta)
@@ -570,7 +576,7 @@ sequenceDiagram
 
 | State | Type | Location | Reads | Writes |
 |-------|------|----------|-------|--------|
-| Boot State | `NvBootState` (3x `BankBootState`) | NV offset 0x0, 2 sectors | `process_boot`, `status`, `read_did` (dynamic DIDs), `install`, `commit`, `rollback` | `process_boot`, `install`, `commit`, `rollback` |
+| Boot State | `NvBootState` (5x `BankBootState`) | NV offset 0x0, 2 sectors | `process_boot`, `status`, `read_did` (dynamic DIDs), `install`, `commit`, `rollback` | `process_boot`, `install`, `commit`, `rollback` |
 | Factory Data | `NvFactory` | NV offset 0x2000, 2 sectors | `read_did` (F18A-F193) | `provision`, `factory-init` (write-once) |
 | FW Metadata | `NvFwMeta` (per set, per bank) | NV offset 0x10000+, 4 sectors each | `read_did` (F187-F19E), `verify_image`, `status`, `install` (anti-rollback check) | `install`, `commit` (raise floor), `factory-init` |
 | Runtime DIDs/DTCs | `NvRuntime` (per set, per bank) | NV offset varies, 8 sectors each | `read_did`, `list_faults` | `write_did`, `install` (copy-on-update), `clear_faults` |
@@ -593,7 +599,7 @@ sequenceDiagram
 
 | Command | Description |
 |---------|-------------|
-| `vm-boot <nv-path>` | Process boot decisions, print actions for all 3 bank sets, output ACTIVE_HYP/OS1/OS2 |
+| `vm-boot <nv-path>` | Process boot decisions, print actions for all bank sets |
 | `vm-boot <nv-path> --init` | Create NV file if missing, then process boot |
 
 ### CLI: vm-runner
@@ -621,8 +627,8 @@ sequenceDiagram
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check (`{ status: "ok", components: 3 }`) |
-| GET | `/vehicle/v1/components` | List components (hyp, os1, os2) with capabilities |
+| GET | `/health` | Health check (`{ status: "ok", components: 4 }`) |
+| GET | `/vehicle/v1/components` | List components (hypervisor, vm1, vm2, hsm) with capabilities |
 | GET | `/vehicle/v1/components/{id}` | Get single component info |
 | GET | `/vehicle/v1/components/{id}/data` | List all DIDs (21 standard + runtime DIDs) |
 | GET | `/vehicle/v1/components/{id}/data/{param}` | Read DID by name (`fw_version`) or hex (`F189`, `0xF189`) |
@@ -706,10 +712,10 @@ Before OTA writes to the inactive bank, runtime DIDs and DTCs are cloned from th
 Each bank tracks `min_security_ver`. The floor is only raised on explicit commit (not on install), allowing rollback during trial. Once raised, images with lower security versions are permanently rejected. The floor is preserved from active bank to target bank during install.
 
 ### Independent Bank Sets
-Hypervisor, OS1, and OS2 have completely independent state machines with separate NV regions. This enables staged rollouts: update OS1, verify, commit, then update OS2. Different bank sets can be in different states simultaneously.
+Hypervisor, VM1, and VM2 have completely independent A/B state machines with separate NV regions. This enables staged rollouts: update vm1, verify, commit, then update vm2. Different bank sets can be in different states simultaneously. The HSM component uses a single bank (no A/B, no rollback).
 
-### VMFB Firmware Bundle Format
-SUIT-inspired binary format: 4-byte magic "VMFB", 4-byte version, 4-byte manifest length, YAML manifest, raw image bytes. Enables single-file OTA uploads containing both metadata and payload.
+### Multi-Component SUIT Envelopes
+Firmware updates use SUIT envelopes with multiple components: kernel (#kernel), rootfs (#firmware), and VM config (#config). All payloads are compressed (zstd) and encrypted (AES-128-GCM + ECDH-ES+A128KW) per-device. The VM config (vm-config.yaml) is delivered alongside firmware so it rolls back automatically with the firmware bank.
 
 ### Arc<Mutex<NvStore>> for SOVD Concurrency
 The HTTP server wraps `NvStore` in `Arc<Mutex<>>` so multiple Axum handlers can safely share mutable access. Lock scope is kept minimal (per-handler). Upload state is separately mutex'd to avoid contention.
@@ -734,7 +740,7 @@ mkdir -p specs profiles firmware scripts
 
 ### 2. Core Types to Define First (nv-store)
 
-1. `Bank` enum (A/B) with `other()` and `from_u8()`, and `BankSet` enum (Hypervisor/Os1/Os2) with `from_str()` and `all()`
+1. `Bank` enum (A/B) with `other()` and `from_u8()`, and `BankSet` enum (Hypervisor/Vm1/Vm2/Hsm/Qtd) with `from_str()` and `all()`
 2. `BlockDevice` trait with `read`, `write`, `sync`, `size`
 3. `MemBlockDevice` (for tests) and `FileBlockDevice` (open + create)
 4. `NvRecord` trait with `MAGIC`, `serialize`, `deserialize`, `size`, `write_seq`, `set_write_seq`
@@ -766,7 +772,7 @@ mkdir -p specs profiles firmware scripts
 - **NV partition layout offsets** are hardcoded constants in `store.rs:layout`. Each bank set's base is at `0x010000 + set_index * 0x018000`. FW Meta A/B and Runtime A/B are at fixed relative offsets within each bank set.
 - **Sector rotation**: always scan all sectors to find max `write_seq`. Never assume write order. An empty sector (wrong magic) is preferred over overwriting the oldest valid one. The sequence number wraps with `wrapping_add(1)`.
 - **QEMU backend**: ivshmem-server sockets at `/tmp/bali-ivshmem-*.sock`, shared memory at `/dev/shm/ivshmem-*`. Stale sockets/shm are cleaned before launch. Wait up to 5s (50 * 100ms) for socket creation. 500ms delay after simulator start before QEMU launch.
-- **Image naming convention**: `{set}-{bank}.img` (e.g., `os1-a.img`, `hyp-b.img`).
+- **Image naming convention**: `{set}-{bank}.img` (e.g., `vm1-a.img`, `hypervisor-b.img`).
 - **DID hex parsing**: Both SOVD handlers and CLI accept `"F189"`, `"0xF189"`, and `"0xf189"` formats.
 - **Factory provision is write-once**: no update path. The `factory-init` command skips if data exists.
 - **SOVD handler locking**: acquire mutex, do NV operations, drop lock before returning. Upload store has separate mutex to avoid contention with NV.

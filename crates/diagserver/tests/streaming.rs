@@ -89,7 +89,7 @@ async fn single_component_unencrypted() {
     let digest = crypto.sha256(&payload);
 
     let envelope = ImageManifestBuilder::new()
-        .component_id(vec!["os1".to_string()])
+        .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, payload.len() as u64)
@@ -105,7 +105,7 @@ async fn single_component_unencrypted() {
         &provider,
         0,
         Some(tmp.path()),
-        BankSet::Os1,
+        BankSet::Vm1,
     )
     .await;
 
@@ -114,7 +114,7 @@ async fn single_component_unencrypted() {
     assert_eq!(v.image_sha256, Some(digest));
 
     // Verify file on disk
-    let written = std::fs::read(tmp.path().join("os1-staged.img")).unwrap();
+    let written = std::fs::read(tmp.path().join("vm1-staged.img")).unwrap();
     assert_eq!(written, payload);
 }
 
@@ -129,7 +129,7 @@ async fn single_component_encrypted() {
     let encrypted = encrypt_payload(&plaintext, &device_key);
 
     let envelope = ImageManifestBuilder::new()
-        .component_id(vec!["os1".to_string()])
+        .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, plaintext.len() as u64)
@@ -146,7 +146,7 @@ async fn single_component_encrypted() {
         &provider,
         0,
         Some(tmp.path()),
-        BankSet::Os1,
+        BankSet::Vm1,
     )
     .await;
 
@@ -154,7 +154,7 @@ async fn single_component_encrypted() {
     assert_eq!(v.image_size, Some(8192));
 
     // Decrypted file should match original plaintext
-    let written = std::fs::read(tmp.path().join("os1-staged.img")).unwrap();
+    let written = std::fs::read(tmp.path().join("vm1-staged.img")).unwrap();
     assert_eq!(written, plaintext);
 }
 
@@ -181,14 +181,14 @@ fn multi_component_separate_uploads() {
         .security_version(1)
         .text_version("1.0.0")
         .add_component(ComponentSpec {
-            id: vec!["os1".into(), "kernel".into()],
+            id: vec!["vm1".into(), "kernel".into()],
             digest: kernel_digest.to_vec(),
             size: kernel.len() as u64,
             uri: "#kernel".into(),
             encryption_info: None,
         })
         .add_component(ComponentSpec {
-            id: vec!["os1".into(), "rootfs".into()],
+            id: vec!["vm1".into(), "rootfs".into()],
             digest: rootfs_digest.to_vec(),
             size: rootfs.len() as u64,
             uri: "#firmware".into(),
@@ -201,7 +201,7 @@ fn multi_component_separate_uploads() {
 
     // Step 1: Validate manifest (tiny, ~1KB)
     let validated = validate_manifest(&manifest, &provider, 0).unwrap();
-    assert_eq!(validated.bank_set, BankSet::Os1);
+    assert_eq!(validated.bank_set, BankSet::Vm1);
 
     // Step 2: Save payloads as raw files (simulating separate uploads)
     let kernel_path = tmp.path().join("upload-kernel.bin");
@@ -210,14 +210,14 @@ fn multi_component_separate_uploads() {
     std::fs::write(&rootfs_path, &rootfs).unwrap();
 
     // Step 3: Process each payload using manifest encryption info
-    let kernel_out = tmp.path().join("os1-kernel-staged.img");
+    let kernel_out = tmp.path().join("vm1-kernel-staged.img");
     let (ksize, khash) = process_raw_payload(
         &kernel_path, &manifest, 0, None, &kernel_digest, &kernel_out,
     ).unwrap();
     assert_eq!(ksize, 2048);
     assert_eq!(khash, kernel_digest);
 
-    let rootfs_out = tmp.path().join("os1-staged.img");
+    let rootfs_out = tmp.path().join("vm1-staged.img");
     let (rsize, rhash) = process_raw_payload(
         &rootfs_path, &manifest, 1, None, &rootfs_digest, &rootfs_out,
     ).unwrap();
@@ -249,14 +249,14 @@ fn multi_component_encrypted_separate() {
         .sequence_number(1)
         .security_version(1)
         .add_component(ComponentSpec {
-            id: vec!["os1".into(), "kernel".into()],
+            id: vec!["vm1".into(), "kernel".into()],
             digest: kernel_digest.to_vec(),
             size: kernel.len() as u64,
             uri: "#kernel".into(),
             encryption_info: Some(kernel_enc.encryption_info.clone()),
         })
         .add_component(ComponentSpec {
-            id: vec!["os1".into(), "rootfs".into()],
+            id: vec!["vm1".into(), "rootfs".into()],
             digest: rootfs_digest.to_vec(),
             size: rootfs.len() as u64,
             uri: "#firmware".into(),
@@ -275,14 +275,14 @@ fn multi_component_encrypted_separate() {
     std::fs::write(&rootfs_path, &rootfs_enc.ciphertext).unwrap();
 
     // Process each — decrypt + verify
-    let kernel_out = tmp.path().join("os1-kernel-staged.img");
+    let kernel_out = tmp.path().join("vm1-kernel-staged.img");
     let (ksize, _) = process_raw_payload(
         &kernel_path, &manifest, 0, Some(&dk_bytes), &kernel_digest, &kernel_out,
     ).unwrap();
     assert_eq!(ksize, 2048);
     assert_eq!(std::fs::read(&kernel_out).unwrap(), kernel);
 
-    let rootfs_out = tmp.path().join("os1-staged.img");
+    let rootfs_out = tmp.path().join("vm1-staged.img");
     let (rsize, _) = process_raw_payload(
         &rootfs_path, &manifest, 1, Some(&dk_bytes), &rootfs_digest, &rootfs_out,
     ).unwrap();
@@ -302,7 +302,7 @@ fn raw_payload_corrupt_fails() {
     let digest = crypto.sha256(&payload);
 
     let manifest = ImageManifestBuilder::new()
-        .component_id(vec!["os1".into()])
+        .component_id(vec!["vm1".into()])
         .sequence_number(1)
         .payload_digest(&digest, payload.len() as u64)
         .payload_uri("#firmware".into())
@@ -332,7 +332,7 @@ async fn chunked_delivery() {
     let digest = crypto.sha256(&payload);
 
     let envelope = ImageManifestBuilder::new()
-        .component_id(vec!["os1".to_string()])
+        .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, payload.len() as u64)
@@ -348,14 +348,14 @@ async fn chunked_delivery() {
         &provider,
         0,
         Some(tmp.path()),
-        BankSet::Os1,
+        BankSet::Vm1,
     )
     .await;
 
     let v = result.unwrap();
     assert_eq!(v.image_size, Some(32768));
 
-    let written = std::fs::read(tmp.path().join("os1-staged.img")).unwrap();
+    let written = std::fs::read(tmp.path().join("vm1-staged.img")).unwrap();
     assert_eq!(written, payload);
 }
 
@@ -377,7 +377,7 @@ async fn corrupted_payload_digest_mismatch() {
     corrupted[100] ^= 0xFF;
 
     let envelope = ImageManifestBuilder::new()
-        .component_id(vec!["os1".to_string()])
+        .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, payload.len() as u64) // digest of ORIGINAL
@@ -392,7 +392,7 @@ async fn corrupted_payload_digest_mismatch() {
         &provider,
         0,
         Some(tmp.path()),
-        BankSet::Os1,
+        BankSet::Vm1,
     )
     .await;
 
@@ -414,7 +414,7 @@ async fn truncated_transfer() {
     let digest = crypto.sha256(&payload);
 
     let envelope = ImageManifestBuilder::new()
-        .component_id(vec!["os1".to_string()])
+        .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, payload.len() as u64)
@@ -432,7 +432,7 @@ async fn truncated_transfer() {
         &provider,
         0,
         Some(tmp.path()),
-        BankSet::Os1,
+        BankSet::Vm1,
     )
     .await;
 
@@ -449,7 +449,7 @@ async fn wrong_device_key() {
     let encrypted = encrypt_payload(&plaintext, &device_key);
 
     let envelope = ImageManifestBuilder::new()
-        .component_id(vec!["os1".to_string()])
+        .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, plaintext.len() as u64)
@@ -469,7 +469,7 @@ async fn wrong_device_key() {
         &provider,
         0,
         Some(tmp.path()),
-        BankSet::Os1,
+        BankSet::Vm1,
     )
     .await;
 
@@ -491,7 +491,7 @@ async fn anti_rollback_rejects_old_security_version() {
     let digest = crypto.sha256(&payload);
 
     let envelope = ImageManifestBuilder::new()
-        .component_id(vec!["os1".to_string()])
+        .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1) // manifest says secver=1
         .payload_digest(&digest, payload.len() as u64)
@@ -506,7 +506,7 @@ async fn anti_rollback_rejects_old_security_version() {
         &provider,
         5, // min_security_ver = 5 — higher than manifest's 1
         Some(tmp.path()),
-        BankSet::Os1,
+        BankSet::Vm1,
     )
     .await;
 
@@ -528,7 +528,7 @@ async fn stream_error_mid_transfer() {
     let digest = crypto.sha256(&payload);
 
     let envelope = ImageManifestBuilder::new()
-        .component_id(vec!["os1".to_string()])
+        .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, payload.len() as u64)
@@ -554,7 +554,7 @@ async fn stream_error_mid_transfer() {
         &provider,
         0,
         Some(tmp.path()),
-        BankSet::Os1,
+        BankSet::Vm1,
     )
     .await;
 

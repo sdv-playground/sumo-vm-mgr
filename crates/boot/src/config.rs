@@ -104,7 +104,7 @@ pub struct VmProfile {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VmConfig {
-    pub bank_set: String, // "hyp", "os1", "os2", "hsm", "qtd"
+    pub bank_set: String, // "hypervisor", "vm1", "vm2", "hsm"
     /// Target architecture: "aarch64" (default) or "x86_64"
     #[serde(default)]
     pub arch: Option<String>,
@@ -269,14 +269,14 @@ pub struct VmMgrConfig {
     pub nv_store: PathBuf,
     /// Directory containing bank images ({set}-{bank}.img).
     pub images_dir: PathBuf,
-    /// Per-component configuration, keyed by component ID (e.g., "os1", "hsm").
+    /// Per-component configuration, keyed by component ID (e.g., "vm1", "hsm").
     pub components: HashMap<String, ComponentEntry>,
 }
 
 /// Configuration for a single managed component.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ComponentEntry {
-    /// Bank set name: "hyp", "os1", "os2", "hsm", "qtd".
+    /// Bank set name: "hypervisor", "vm1", "vm2", "hsm".
     pub bank_set: String,
     /// Backend type: "qemu", "dummy", "qnx".
     #[serde(default = "default_component_backend")]

@@ -32,7 +32,7 @@ fn did_factory_serial_number() {
     factory.serial_number = str_arr("ECU-001");
     nv.write_factory(&mut factory).unwrap();
 
-    let val = read_did(&nv, BankSet::Os1, DID_SERIAL_NUMBER, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_SERIAL_NUMBER, None);
     assert_eq!(val.as_str(), Some("ECU-001"));
 }
 
@@ -43,7 +43,7 @@ fn did_factory_vin() {
     factory.vin = str_arr("WDB1234567890ABCD");
     nv.write_factory(&mut factory).unwrap();
 
-    let val = read_did(&nv, BankSet::Os1, DID_VIN, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_VIN, None);
     assert_eq!(val.as_str(), Some("WDB1234567890ABCD"));
 }
 
@@ -52,9 +52,9 @@ fn did_fw_meta_version() {
     let mut nv = make_nv();
     let mut meta = NvFwMeta::default();
     meta.fw_version = str_arr("2.1.0");
-    nv.write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
-    let val = read_did(&nv, BankSet::Os1, DID_FW_VERSION, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_FW_VERSION, None);
     assert_eq!(val.as_str(), Some("2.1.0"));
 }
 
@@ -65,15 +65,15 @@ fn did_fw_meta_reads_active_bank() {
     // Bank A has version 1.0
     let mut meta_a = NvFwMeta::default();
     meta_a.fw_version = str_arr("1.0");
-    nv.write_fw_meta(BankSet::Os1, Bank::A, &mut meta_a).unwrap();
+    nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta_a).unwrap();
 
     // Bank B has version 2.0
     let mut meta_b = NvFwMeta::default();
     meta_b.fw_version = str_arr("2.0");
-    nv.write_fw_meta(BankSet::Os1, Bank::B, &mut meta_b).unwrap();
+    nv.write_fw_meta(BankSet::Vm1, Bank::B, &mut meta_b).unwrap();
 
     // Active bank is A — should read 1.0
-    let val = read_did(&nv, BankSet::Os1, DID_FW_VERSION, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_FW_VERSION, None);
     assert_eq!(val.as_str(), Some("1.0"));
 
     // Switch to B
@@ -81,7 +81,7 @@ fn did_fw_meta_reads_active_bank() {
     state.banks[1].active_bank = Bank::B;
     nv.write_boot_state(&mut state).unwrap();
 
-    let val = read_did(&nv, BankSet::Os1, DID_FW_VERSION, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_FW_VERSION, None);
     assert_eq!(val.as_str(), Some("2.0"));
 }
 
@@ -92,12 +92,12 @@ fn did_runtime_overrides_fw_meta() {
     // FW Meta has tester_serial "TOOL-A"
     let mut meta = NvFwMeta::default();
     meta.tester_serial = str_arr("TOOL-A");
-    nv.write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
     // Runtime DID with same number overrides it
-    write_did(&mut nv, BankSet::Os1, DID_TESTER_SERIAL, b"TOOL-B").unwrap();
+    write_did(&mut nv, BankSet::Vm1, DID_TESTER_SERIAL, b"TOOL-B").unwrap();
 
-    let val = read_did(&nv, BankSet::Os1, DID_TESTER_SERIAL, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_TESTER_SERIAL, None);
     assert_eq!(val.as_str(), Some("TOOL-B"));
 }
 
@@ -105,10 +105,10 @@ fn did_runtime_overrides_fw_meta() {
 fn did_runtime_write_and_read() {
     let mut nv = make_nv();
 
-    let ok = write_did(&mut nv, BankSet::Os1, 0xFD10, b"hello").unwrap();
+    let ok = write_did(&mut nv, BankSet::Vm1, 0xFD10, b"hello").unwrap();
     assert!(ok);
 
-    let val = read_did(&nv, BankSet::Os1, 0xFD10, None);
+    let val = read_did(&nv, BankSet::Vm1, 0xFD10, None);
     assert_eq!(val, DidValue::Bytes(b"hello".to_vec()));
 }
 
@@ -116,10 +116,10 @@ fn did_runtime_write_and_read() {
 fn did_runtime_update_existing() {
     let mut nv = make_nv();
 
-    write_did(&mut nv, BankSet::Os1, 0xFD10, b"v1").unwrap();
-    write_did(&mut nv, BankSet::Os1, 0xFD10, b"v2").unwrap();
+    write_did(&mut nv, BankSet::Vm1, 0xFD10, b"v1").unwrap();
+    write_did(&mut nv, BankSet::Vm1, 0xFD10, b"v2").unwrap();
 
-    let val = read_did(&nv, BankSet::Os1, 0xFD10, None);
+    let val = read_did(&nv, BankSet::Vm1, 0xFD10, None);
     assert_eq!(val, DidValue::Bytes(b"v2".to_vec()));
 }
 
@@ -129,12 +129,12 @@ fn did_runtime_full() {
 
     // Fill all 20 slots
     for i in 0..MAX_DIDS as u16 {
-        let ok = write_did(&mut nv, BankSet::Os1, 0xFD10 + i, &[i as u8]).unwrap();
+        let ok = write_did(&mut nv, BankSet::Vm1, 0xFD10 + i, &[i as u8]).unwrap();
         assert!(ok);
     }
 
     // 21st should fail
-    let ok = write_did(&mut nv, BankSet::Os1, 0xFDFF, b"overflow").unwrap();
+    let ok = write_did(&mut nv, BankSet::Vm1, 0xFDFF, b"overflow").unwrap();
     assert!(!ok);
 }
 
@@ -142,14 +142,14 @@ fn did_runtime_full() {
 fn did_dynamic_active_bank() {
     let mut nv = make_nv();
 
-    let val = read_did(&nv, BankSet::Os1, DID_ACTIVE_BANK, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_ACTIVE_BANK, None);
     assert_eq!(val, DidValue::Bytes(vec![b'A']));
 
     let mut state = nv.read_boot_state().unwrap();
     state.banks[1].active_bank = Bank::B;
     nv.write_boot_state(&mut state).unwrap();
 
-    let val = read_did(&nv, BankSet::Os1, DID_ACTIVE_BANK, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_ACTIVE_BANK, None);
     assert_eq!(val, DidValue::Bytes(vec![b'B']));
 }
 
@@ -157,14 +157,14 @@ fn did_dynamic_active_bank() {
 fn did_dynamic_committed() {
     let mut nv = make_nv();
 
-    let val = read_did(&nv, BankSet::Os1, DID_COMMITTED, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_COMMITTED, None);
     assert_eq!(val, DidValue::Bytes(vec![1])); // true
 
     let mut state = nv.read_boot_state().unwrap();
     state.banks[1].committed = false;
     nv.write_boot_state(&mut state).unwrap();
 
-    let val = read_did(&nv, BankSet::Os1, DID_COMMITTED, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_COMMITTED, None);
     assert_eq!(val, DidValue::Bytes(vec![0])); // false
 }
 
@@ -175,19 +175,19 @@ fn did_dynamic_security_versions() {
     let mut meta = NvFwMeta::default();
     meta.fw_secver = 5;
     meta.min_security_ver = 3;
-    nv.write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
-    let val = read_did(&nv, BankSet::Os1, DID_CURRENT_SECURITY_VER, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_CURRENT_SECURITY_VER, None);
     assert_eq!(val, DidValue::Bytes(5u32.to_le_bytes().to_vec()));
 
-    let val = read_did(&nv, BankSet::Os1, DID_MIN_SECURITY_VER, None);
+    let val = read_did(&nv, BankSet::Vm1, DID_MIN_SECURITY_VER, None);
     assert_eq!(val, DidValue::Bytes(3u32.to_le_bytes().to_vec()));
 }
 
 #[test]
 fn did_not_found() {
     let nv = make_nv();
-    let val = read_did(&nv, BankSet::Os1, 0x1234, None);
+    let val = read_did(&nv, BankSet::Vm1, 0x1234, None);
     assert_eq!(val, DidValue::NotFound);
 }
 
@@ -195,13 +195,13 @@ fn did_not_found() {
 fn did_bank_set_isolation() {
     let mut nv = make_nv();
 
-    write_did(&mut nv, BankSet::Os1, 0xFD10, b"os1-data").unwrap();
-    write_did(&mut nv, BankSet::Os2, 0xFD10, b"os2-data").unwrap();
+    write_did(&mut nv, BankSet::Vm1, 0xFD10, b"vm1-data").unwrap();
+    write_did(&mut nv, BankSet::Vm2, 0xFD10, b"vm2-data").unwrap();
 
-    let val1 = read_did(&nv, BankSet::Os1, 0xFD10, None);
-    let val2 = read_did(&nv, BankSet::Os2, 0xFD10, None);
-    assert_eq!(val1, DidValue::Bytes(b"os1-data".to_vec()));
-    assert_eq!(val2, DidValue::Bytes(b"os2-data".to_vec()));
+    let val1 = read_did(&nv, BankSet::Vm1, 0xFD10, None);
+    let val2 = read_did(&nv, BankSet::Vm2, 0xFD10, None);
+    assert_eq!(val1, DidValue::Bytes(b"vm1-data".to_vec()));
+    assert_eq!(val2, DidValue::Bytes(b"vm2-data".to_vec()));
 }
 
 // ============================================================
@@ -222,7 +222,7 @@ fn ota_install_basic() {
     let image = b"firmware-v2-image-data";
     let meta = make_image_meta("2.0", 2);
 
-    let result = install(&mut nv, BankSet::Os1, image, &meta, false).unwrap();
+    let result = install(&mut nv, BankSet::Vm1, image, &meta, false).unwrap();
     assert_eq!(result.target_bank, Bank::B); // was on A, target is B
 
     // Boot state: trial on B
@@ -232,7 +232,7 @@ fn ota_install_basic() {
     assert_eq!(state.banks[1].boot_count, 0);
 
     // FW Meta written for B
-    let fw = nv.read_fw_meta(BankSet::Os1, Bank::B).unwrap();
+    let fw = nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
     assert_eq!(&fw.fw_version[..3], b"2.0");
     assert_eq!(fw.fw_secver, 2);
     assert_eq!(fw.image_sha256, result.image_sha256);
@@ -242,12 +242,12 @@ fn ota_install_basic() {
 fn ota_install_rejects_if_trial() {
     let mut nv = make_nv();
 
-    // Put OS1 in trial
+    // Put VM1 in trial
     let mut state = nv.read_boot_state().unwrap();
     state.banks[1].committed = false;
     nv.write_boot_state(&mut state).unwrap();
 
-    let result = install(&mut nv, BankSet::Os1, b"img", &ImageMeta::default(), false);
+    let result = install(&mut nv, BankSet::Vm1, b"img", &ImageMeta::default(), false);
     assert_eq!(result.unwrap_err(), OtaError::InTrial);
 }
 
@@ -258,11 +258,11 @@ fn ota_install_rejects_low_security_version() {
     // Set min_security_ver = 5 on current bank
     let mut meta = NvFwMeta::default();
     meta.min_security_ver = 5;
-    nv.write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
     // Try to install secver=3 — should be rejected
     let img_meta = make_image_meta("old", 3);
-    let result = install(&mut nv, BankSet::Os1, b"img", &img_meta, false);
+    let result = install(&mut nv, BankSet::Vm1, b"img", &img_meta, false);
     assert_eq!(
         result.unwrap_err(),
         OtaError::SecurityVersionTooLow { image: 3, floor: 5 }
@@ -276,14 +276,14 @@ fn ota_install_preserves_min_security_ver() {
     // Active bank A has floor=3
     let mut meta = NvFwMeta::default();
     meta.min_security_ver = 3;
-    nv.write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
     // Install secver=5 to B
     let img_meta = make_image_meta("2.0", 5);
-    install(&mut nv, BankSet::Os1, b"img", &img_meta, false).unwrap();
+    install(&mut nv, BankSet::Vm1, b"img", &img_meta, false).unwrap();
 
     // Target bank B should preserve floor=3 (not raised until commit)
-    let fw_b = nv.read_fw_meta(BankSet::Os1, Bank::B).unwrap();
+    let fw_b = nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
     assert_eq!(fw_b.min_security_ver, 3);
     assert_eq!(fw_b.fw_secver, 5);
 }
@@ -293,13 +293,13 @@ fn ota_install_copies_runtime() {
     let mut nv = make_nv();
 
     // Write runtime DID on active bank A
-    write_did(&mut nv, BankSet::Os1, 0xFD10, b"preserved").unwrap();
+    write_did(&mut nv, BankSet::Vm1, 0xFD10, b"preserved").unwrap();
 
     // Install to B
-    install(&mut nv, BankSet::Os1, b"img", &make_image_meta("2.0", 1), false).unwrap();
+    install(&mut nv, BankSet::Vm1, b"img", &make_image_meta("2.0", 1), false).unwrap();
 
     // Runtime should have been copied to B
-    let runtime_b = nv.read_runtime(BankSet::Os1, Bank::B).unwrap();
+    let runtime_b = nv.read_runtime(BankSet::Vm1, Bank::B).unwrap();
     assert_eq!(runtime_b.did_count, 1);
     assert_eq!(runtime_b.dids[0].did, 0xFD10);
     assert_eq!(&runtime_b.dids[0].data[..9], b"preserved");
@@ -314,8 +314,8 @@ fn commit_basic() {
     let mut nv = make_nv();
 
     // Install then commit
-    install(&mut nv, BankSet::Os1, b"img", &make_image_meta("2.0", 3), false).unwrap();
-    commit(&mut nv, BankSet::Os1).unwrap();
+    install(&mut nv, BankSet::Vm1, b"img", &make_image_meta("2.0", 3), false).unwrap();
+    commit(&mut nv, BankSet::Vm1).unwrap();
 
     let state = nv.read_boot_state().unwrap();
     assert!(state.banks[1].committed);
@@ -330,25 +330,25 @@ fn commit_raises_anti_rollback_floor() {
     // Current floor = 1
     let mut meta = NvFwMeta::default();
     meta.min_security_ver = 1;
-    nv.write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
     // Install secver=5
-    install(&mut nv, BankSet::Os1, b"img", &make_image_meta("2.0", 5), false).unwrap();
+    install(&mut nv, BankSet::Vm1, b"img", &make_image_meta("2.0", 5), false).unwrap();
 
     // Before commit: floor still 1
-    let fw = nv.read_fw_meta(BankSet::Os1, Bank::B).unwrap();
+    let fw = nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
     assert_eq!(fw.min_security_ver, 1);
 
     // Commit: floor raised to 5
-    commit(&mut nv, BankSet::Os1).unwrap();
-    let fw = nv.read_fw_meta(BankSet::Os1, Bank::B).unwrap();
+    commit(&mut nv, BankSet::Vm1).unwrap();
+    let fw = nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
     assert_eq!(fw.min_security_ver, 5);
 }
 
 #[test]
 fn commit_rejects_if_committed() {
     let mut nv = make_nv();
-    let result = commit(&mut nv, BankSet::Os1);
+    let result = commit(&mut nv, BankSet::Vm1);
     assert_eq!(result.unwrap_err(), OtaError::AlreadyCommitted);
 }
 
@@ -360,9 +360,9 @@ fn commit_rejects_if_committed() {
 fn rollback_basic() {
     let mut nv = make_nv();
 
-    install(&mut nv, BankSet::Os1, b"img", &make_image_meta("2.0", 1), false).unwrap();
+    install(&mut nv, BankSet::Vm1, b"img", &make_image_meta("2.0", 1), false).unwrap();
 
-    let previous = rollback(&mut nv, BankSet::Os1).unwrap();
+    let previous = rollback(&mut nv, BankSet::Vm1).unwrap();
     assert_eq!(previous, Bank::A); // rolled back to A
 
     let state = nv.read_boot_state().unwrap();
@@ -373,7 +373,7 @@ fn rollback_basic() {
 #[test]
 fn rollback_rejects_if_committed() {
     let mut nv = make_nv();
-    let result = rollback(&mut nv, BankSet::Os1);
+    let result = rollback(&mut nv, BankSet::Vm1);
     assert_eq!(result.unwrap_err(), OtaError::NotInTrial);
 }
 
@@ -388,9 +388,9 @@ fn status_committed() {
     meta.fw_version = str_arr("1.0");
     meta.fw_secver = 1;
     meta.min_security_ver = 1;
-    nv.write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
-    let s = status(&nv, BankSet::Os1).unwrap();
+    let s = status(&nv, BankSet::Vm1).unwrap();
     assert_eq!(s.active_bank, Bank::A);
     assert!(s.committed);
     assert_eq!(s.boot_count, 0);
@@ -401,9 +401,9 @@ fn status_committed() {
 #[test]
 fn status_trial() {
     let mut nv = make_nv();
-    install(&mut nv, BankSet::Os1, b"img", &make_image_meta("2.0", 3), false).unwrap();
+    install(&mut nv, BankSet::Vm1, b"img", &make_image_meta("2.0", 3), false).unwrap();
 
-    let s = status(&nv, BankSet::Os1).unwrap();
+    let s = status(&nv, BankSet::Vm1).unwrap();
     assert_eq!(s.active_bank, Bank::B);
     assert!(!s.committed);
     assert_eq!(s.fw_secver, Some(3));
@@ -422,26 +422,26 @@ fn full_ota_install_commit_then_new_update() {
     meta_a.fw_version = str_arr("1.0");
     meta_a.fw_secver = 1;
     meta_a.min_security_ver = 0;
-    nv.write_fw_meta(BankSet::Os1, Bank::A, &mut meta_a).unwrap();
+    nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta_a).unwrap();
 
     // Install v2 → bank B
-    install(&mut nv, BankSet::Os1, b"v2-image", &make_image_meta("2.0", 2), false).unwrap();
-    commit(&mut nv, BankSet::Os1).unwrap();
+    install(&mut nv, BankSet::Vm1, b"v2-image", &make_image_meta("2.0", 2), false).unwrap();
+    commit(&mut nv, BankSet::Vm1).unwrap();
 
     // Now on bank B, committed
-    let s = status(&nv, BankSet::Os1).unwrap();
+    let s = status(&nv, BankSet::Vm1).unwrap();
     assert_eq!(s.active_bank, Bank::B);
     assert!(s.committed);
 
     // Install v3 → bank A (cycles back)
-    install(&mut nv, BankSet::Os1, b"v3-image", &make_image_meta("3.0", 3), false).unwrap();
+    install(&mut nv, BankSet::Vm1, b"v3-image", &make_image_meta("3.0", 3), false).unwrap();
 
-    let s = status(&nv, BankSet::Os1).unwrap();
+    let s = status(&nv, BankSet::Vm1).unwrap();
     assert_eq!(s.active_bank, Bank::A);
     assert!(!s.committed);
 
-    commit(&mut nv, BankSet::Os1).unwrap();
-    let fw = nv.read_fw_meta(BankSet::Os1, Bank::A).unwrap();
+    commit(&mut nv, BankSet::Vm1).unwrap();
+    let fw = nv.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
     assert_eq!(&fw.fw_version[..3], b"3.0");
     assert_eq!(fw.min_security_ver, 3); // floor raised
 }
@@ -451,18 +451,18 @@ fn full_ota_install_rollback_retry() {
     let mut nv = make_nv();
 
     // Install v2 → B, then rollback to A
-    install(&mut nv, BankSet::Os1, b"bad-img", &make_image_meta("2.0", 1), false).unwrap();
-    rollback(&mut nv, BankSet::Os1).unwrap();
+    install(&mut nv, BankSet::Vm1, b"bad-img", &make_image_meta("2.0", 1), false).unwrap();
+    rollback(&mut nv, BankSet::Vm1).unwrap();
 
-    let s = status(&nv, BankSet::Os1).unwrap();
+    let s = status(&nv, BankSet::Vm1).unwrap();
     assert_eq!(s.active_bank, Bank::A);
     assert!(s.committed);
 
     // Can install again (back to B)
-    install(&mut nv, BankSet::Os1, b"good-img", &make_image_meta("2.1", 2), false).unwrap();
-    commit(&mut nv, BankSet::Os1).unwrap();
+    install(&mut nv, BankSet::Vm1, b"good-img", &make_image_meta("2.1", 2), false).unwrap();
+    commit(&mut nv, BankSet::Vm1).unwrap();
 
-    let s = status(&nv, BankSet::Os1).unwrap();
+    let s = status(&nv, BankSet::Vm1).unwrap();
     assert_eq!(s.active_bank, Bank::B);
     assert!(s.committed);
 }
@@ -471,17 +471,17 @@ fn full_ota_install_rollback_retry() {
 fn full_ota_multiple_bank_sets() {
     let mut nv = make_nv();
 
-    // Update OS1
-    install(&mut nv, BankSet::Os1, b"os1-v2", &make_image_meta("os1-2.0", 1), false).unwrap();
-    commit(&mut nv, BankSet::Os1).unwrap();
+    // Update VM1
+    install(&mut nv, BankSet::Vm1, b"vm1-v2", &make_image_meta("vm1-2.0", 1), false).unwrap();
+    commit(&mut nv, BankSet::Vm1).unwrap();
 
-    // Update OS2
-    install(&mut nv, BankSet::Os2, b"os2-v2", &make_image_meta("os2-2.0", 1), false).unwrap();
-    commit(&mut nv, BankSet::Os2).unwrap();
+    // Update VM2
+    install(&mut nv, BankSet::Vm2, b"vm2-v2", &make_image_meta("vm2-2.0", 1), false).unwrap();
+    commit(&mut nv, BankSet::Vm2).unwrap();
 
     // Both on B, independent
-    assert_eq!(status(&nv, BankSet::Os1).unwrap().active_bank, Bank::B);
-    assert_eq!(status(&nv, BankSet::Os2).unwrap().active_bank, Bank::B);
+    assert_eq!(status(&nv, BankSet::Vm1).unwrap().active_bank, Bank::B);
+    assert_eq!(status(&nv, BankSet::Vm2).unwrap().active_bank, Bank::B);
     assert_eq!(status(&nv, BankSet::Hypervisor).unwrap().active_bank, Bank::A); // untouched
 }
 
@@ -490,18 +490,18 @@ fn anti_rollback_blocks_downgrade_after_commit() {
     let mut nv = make_nv();
 
     // Install v2 secver=5, commit (floor raised to 5)
-    install(&mut nv, BankSet::Os1, b"v2", &make_image_meta("2.0", 5), false).unwrap();
-    commit(&mut nv, BankSet::Os1).unwrap();
+    install(&mut nv, BankSet::Vm1, b"v2", &make_image_meta("2.0", 5), false).unwrap();
+    commit(&mut nv, BankSet::Vm1).unwrap();
 
     // Try install v3 with secver=3 — blocked
-    let result = install(&mut nv, BankSet::Os1, b"v3-old", &make_image_meta("3.0", 3), false);
+    let result = install(&mut nv, BankSet::Vm1, b"v3-old", &make_image_meta("3.0", 3), false);
     assert_eq!(
         result.unwrap_err(),
         OtaError::SecurityVersionTooLow { image: 3, floor: 5 }
     );
 
     // secver=5 is allowed (equal to floor)
-    let result = install(&mut nv, BankSet::Os1, b"v3-ok", &make_image_meta("3.0", 5), false);
+    let result = install(&mut nv, BankSet::Vm1, b"v3-ok", &make_image_meta("3.0", 5), false);
     assert!(result.is_ok());
 }
 
@@ -570,7 +570,7 @@ fn hsm_commit_is_noop() {
 }
 
 // ============================================================
-// QTD (rollbackable, A/B banked — same as os1/os2)
+// QTD (deprecated bank set — kept for NV layout compat, A/B banked)
 // ============================================================
 
 #[test]

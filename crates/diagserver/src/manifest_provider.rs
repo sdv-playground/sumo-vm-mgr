@@ -9,7 +9,7 @@ use crate::ota::ImageMeta;
 /// Manifest sub-type — determines how the payload is handled after validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestType {
-    /// Normal firmware image — write to bank (os1, os2, hyp, hsm firmware, qtd).
+    /// Normal firmware image — write to bank (vm1, vm2, hypervisor, hsm).
     Firmware,
     /// HSM key material — route to HsmProvider::provision() with raw envelope.
     HsmKeys,

@@ -2,9 +2,10 @@
 
 ## Overview
 
-Each A/B bank set (hypervisor, OS1, OS2) has an independent state machine
-managing its update lifecycle. The state machine ensures atomic updates with
-automatic rollback on failure.
+Each A/B bank set (hypervisor, vm1, vm2) has an independent state machine
+managing its update lifecycle. The HSM component uses a single bank (no A/B,
+no rollback). The state machine ensures atomic updates with automatic rollback
+on failure.
 
 ## States
 
@@ -49,7 +50,7 @@ On every boot, the boot manager executes:
 
 ```
 1. Read NV Boot State
-2. For each bank set (hyp, os1, os2):
+2. For each A/B bank set (hypervisor, vm1, vm2):
    a. If committed == true:
       - Boot from active_bank (normal path)
    b. If committed == false (trial mode):
@@ -65,20 +66,20 @@ On every boot, the boot manager executes:
 4. If hash verification fails:
    - If trial: immediate rollback (don't count, just swap)
    - If committed: FATAL — both banks may be corrupted
-5. Start hypervisor from hyp active bank
-6. Start VMs from os1/os2 active banks
+5. Start hypervisor from hypervisor active bank
+6. Start VMs from vm1/vm2 active banks
 ```
 
 ## OTA Update Flow (vm-diagserver)
 
 ```
-1. Receive OTA image for a bank set (e.g., OS1)
+1. Receive OTA image for a bank set (e.g., vm1)
 2. Preconditions:
    - Current bank set must be COMMITTED (reject if trial)
    - Image security_version >= min_security_ver (anti-rollback)
 3. Determine target: inactive bank (active_bank.other())
 4. Copy-on-update: clone active Runtime DIDs/DTCs → target Runtime
-5. Write image to target partition (os1-a or os1-b)
+5. Write image to target partition (vm1-a or vm1-b)
 6. Verify written image (read-back SHA-256)
 7. Write NV FW Meta for target bank:
    - SW DIDs from image header
@@ -140,13 +141,16 @@ fundamentally broken updates.
 
 ## Independence
 
-Each bank set has its own state machine. Updating OS1 does not affect OS2 or
-the hypervisor. They can be:
+Each A/B bank set has its own state machine. Updating vm1 does not affect vm2
+or the hypervisor. They can be:
 - Updated independently
 - At different states (one committed, another in trial)
 - Committed/rolled back independently
 
-This allows staged rollouts: update OS1, verify, commit, then update OS2.
+This allows staged rollouts: update vm1, verify, commit, then update vm2.
+
+The HSM component uses a single bank and does not participate in A/B switching
+or trial boot. HSM updates are applied directly without rollback support.
 
 ## DID Resolution (read path)
 

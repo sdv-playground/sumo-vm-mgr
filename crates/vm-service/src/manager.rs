@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::config::{BackendType, VmDefinition, VmServiceConfig};
+use crate::config::{BackendType, VmBankConfig, VmDefinition, VmServiceConfig};
 use crate::health::{HealthDetail, HealthMonitor, HealthStatus};
 use crate::runner::dummy::DummyRunner;
 use crate::runner::qemu::QemuRunner;
@@ -131,7 +131,17 @@ impl VmManager {
             vm.handle = None;
         }
 
-        let handle = vm.runner.start(name, &vm.def)?;
+        // Read per-bank config if available (image_dir resolves through current symlink)
+        let effective_def = match VmBankConfig::from_dir(&vm.def.image_dir) {
+            Some(bank_config) => {
+                tracing::info!("loaded per-bank config for {name} from {}/vm-config.yaml",
+                    vm.def.image_dir.display());
+                vm.def.with_bank_overrides(&bank_config)
+            }
+            None => vm.def.clone(),
+        };
+
+        let handle = vm.runner.start(name, &effective_def)?;
         tracing::info!("started VM {name} (pid: {:?})", handle.pid);
         vm.handle = Some(handle);
         Ok(())

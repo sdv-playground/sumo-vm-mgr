@@ -11,14 +11,14 @@ nv_store: /tmp/sumo-sovd-sim-nv.bin
 images_dir: /opt/vm-mgr/images
 
 components:
-  hyp:
-    bank_set: hyp
+  hypervisor:
+    bank_set: hypervisor
     backend: dummy
 
-  os1:
-    bank_set: os1
+  vm1:
+    bank_set: vm1
     backend: qemu
-    profile: example/profiles/os1-dev.toml
+    profile: example/profiles/vm1-dev.toml
     shutdown:
       timeout_secs: 10
       method: health
@@ -26,15 +26,11 @@ components:
       method: health
       timeout_secs: 30
 
-  os2:
-    bank_set: os2
+  vm2:
+    bank_set: vm2
     backend: dummy
 
   hsm:
     bank_set: hsm
     backend: dummy
     single_bank: true
-
-  qtd:
-    bank_set: qtd
-    backend: dummy

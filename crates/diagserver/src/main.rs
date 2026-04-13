@@ -12,7 +12,7 @@ fn usage() -> ! {
     eprintln!("Usage: vm-diagserver <nv-store-path> <command> [args...]");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  status <set>                     Show bank status (hyp|os1|os2|hsm|qtd)");
+    eprintln!("  status <set>                     Show bank status (hypervisor|vm1|vm2|hsm)");
     eprintln!("  install <set> <image-path> <ver> <secver>  Install OTA image");
     eprintln!("  commit <set>                     Commit trial bank");
     eprintln!("  rollback <set>                   Rollback to previous bank");
@@ -24,17 +24,10 @@ fn usage() -> ! {
 }
 
 fn parse_set(s: &str) -> BankSet {
-    match s {
-        "hyp" => BankSet::Hypervisor,
-        "os1" => BankSet::Os1,
-        "os2" => BankSet::Os2,
-        "hsm" => BankSet::Hsm,
-        "qtd" => BankSet::Qtd,
-        _ => {
-            eprintln!("Invalid bank set '{s}'. Use: hyp, os1, os2, hsm, qtd");
-            std::process::exit(1);
-        }
-    }
+    BankSet::from_str(s).unwrap_or_else(|| {
+        eprintln!("Invalid bank set '{s}'. Use: hypervisor, vm1, vm2, hsm");
+        std::process::exit(1);
+    })
 }
 
 fn parse_did(s: &str) -> u16 {
@@ -273,7 +266,7 @@ fn main() {
             }
 
             // Write FW meta for each bank set with a manifest
-            for name in ["hyp", "os1", "os2", "hsm", "qtd"] {
+            for name in ["hypervisor", "vm1", "vm2", "hsm"] {
                 let manifest_file = dir.join(format!("{name}.yaml"));
                 if !manifest_file.exists() {
                     continue;
@@ -291,7 +284,7 @@ fn main() {
                 let image_sha256: [u8; 32];
                 let fw_crc: u32;
 
-                if name == "hyp" {
+                if name == "hypervisor" {
                     if let Some(ref rp) = runner_path {
                         let data = std::fs::read(rp).unwrap_or_else(|e| {
                             eprintln!("[factory] failed to read runner binary: {e}");

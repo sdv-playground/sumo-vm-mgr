@@ -32,7 +32,10 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  (lib)           factory, runtime DIDs, DTCs   │
 │                                               │
 │  vm-boot         Boot decisions, trial count,  │
-│  (lib+bin)       hash verify, QEMU/QNX backend │
+│  (lib)           hash verify, auto-rollback    │
+│                                               │
+│  vm-service      QEMU lifecycle, per-bank     │
+│  (lib+bin)       VM config, restart via IPC    │
 │                                               │
 │  vm-diagserver   SUIT validation, OTA engine,  │
 │  (lib+bins)      DID resolution, VmBackend     │
@@ -49,8 +52,9 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | Crate | Binaries | Purpose |
 |-------|----------|---------|
 | `nv-store` | — | Sector-rotated NV storage with CRC-32 integrity |
-| `vm-boot` | `vm-boot`, `vm-runner` | Boot decisions, trial counting, auto-rollback, backend trait |
-| `vm-diagserver` | `vm-diagserver`, `vm-sovd` | SUIT+SOVD: manifest validation, OTA engine, DID resolution, REST server |
+| `vm-boot` | `vm-boot` | Boot decisions, trial counting, auto-rollback |
+| `vm-service` | `vm-service` | QEMU lifecycle management, per-bank VM config, restart via IPC |
+| `vm-diagserver` | `vm-sovd` | SUIT+SOVD: manifest validation, OTA engine, DID resolution, REST server |
 
 ## SUIT Manifest Integration
 
@@ -84,12 +88,12 @@ Generates in `example/output/`:
 
 | File | Description |
 |------|-------------|
-| `os1-v1.0.0.suit` | Encrypted firmware (secver=1) |
-| `os1-v1.1.0.suit` | Encrypted firmware (secver=1) |
-| `os1-v1.2.0.suit` | Encrypted firmware (secver=1) |
-| `os1-v1.3.0.suit` | Encrypted firmware (secver=1) |
-| `os1-v1.2.0-secver2-full.suit` | Re-signed with secver=2 |
-| `os1-crl-secver2.suit` | CRL: blocks secver < 2 (228 bytes) |
+| `vm1-v1.0.0.suit` | Encrypted firmware (secver=1) |
+| `vm1-v1.1.0.suit` | Encrypted firmware (secver=1) |
+| `vm1-v1.2.0.suit` | Encrypted firmware (secver=1) |
+| `vm1-v1.3.0.suit` | Encrypted firmware (secver=1) |
+| `vm1-v1.2.0-secver2-full.suit` | Re-signed with secver=2 |
+| `vm1-crl-secver2.suit` | CRL: blocks secver < 2 (228 bytes) |
 | `firmware/*.bin` | Content-addressable binaries (by SHA-256) |
 
 ## SOVD Server
@@ -100,9 +104,10 @@ Uses [sovd-core](https://github.com/sdv-playground/SOVDd) `DiagnosticBackend` tr
 
 | Component | Bank Set | Description |
 |-----------|----------|-------------|
-| `hyp` | Hypervisor | Hypervisor A/B bank set |
-| `os1` | OS1 | Primary OS VM |
-| `os2` | OS2 | Secondary OS VM |
+| `hypervisor` | Hypervisor | Hypervisor A/B bank set |
+| `vm1` | Vm1 | Primary OS VM (Linux) |
+| `vm2` | Vm2 | Secondary OS VM (QNX) |
+| `hsm` | Hsm | HSM firmware (single-bank, no rollback) |
 
 ### Endpoints
 
@@ -135,11 +140,13 @@ Flash operations require programming session + security unlock:
 
 ## Key Concepts
 
-- **Three A/B bank sets**: Hypervisor, OS1, OS2 — independent state machines
+- **Four components**: hypervisor, vm1, vm2 (A/B banked), hsm (single-bank, no rollback)
+- **Two-process architecture**: vm-service (QEMU lifecycle) + vm-sovd (diagnostics/OTA via SOVD)
+- **Per-bank VM config**: vm-config.yaml in bank directories, delivered alongside firmware via OTA
+- **Multi-component SUIT**: kernel + rootfs + vm-config as separate payloads (#kernel, #firmware, #config)
 - **Trial boot**: Up to 10 reboots before auto-rollback to previous bank
 - **Copy-on-update**: Runtime DIDs/DTCs cloned to target bank before OTA write
 - **NV persistence**: Boot state, security floor survive power cycles (sector-rotated, CRC-protected)
-- **Backend trait**: `QemuBackend` for dev/test, `QnxBackend` stub for production
 
 ## NV Store Layout
 

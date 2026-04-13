@@ -14,13 +14,17 @@ use serde::Deserialize;
 pub struct VmServiceConfig {
     /// Unix socket path for the control API.
     pub socket: PathBuf,
-    /// VM definitions, keyed by name (e.g., "os1", "os2").
+    /// VM definitions, keyed by name (e.g., "vm1", "vm2").
     pub vms: HashMap<String, VmDefinition>,
 }
 
 /// Everything needed to run a single VM.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VmDefinition {
+    /// Human-readable display name (e.g., "VM1 — Debian Linux").
+    /// Used in SOVD component listing if available.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// Backend type: qemu, qnx, or dummy.
     pub backend: BackendType,
     /// Guest operating system type. Affects boot method, disk layout, device setup.
@@ -39,7 +43,7 @@ pub struct VmDefinition {
     #[serde(default)]
     pub cpu_model: Option<String>,
     /// Directory containing kernel + rootfs. Typically a symlink
-    /// (e.g., /var/lib/vms/os1/current → bank_a/).
+    /// (e.g., /var/lib/vms/vm1/current → bank_a/).
     pub image_dir: PathBuf,
     /// Image filenames relative to image_dir.
     #[serde(default)]
@@ -190,6 +194,35 @@ impl VmDefinition {
     pub fn shutdown_timeout_secs(&self) -> u64 {
         self.shutdown.as_ref().map(|s| s.timeout_secs).unwrap_or(10)
     }
+
+    /// Merge per-bank overrides into this definition. Only present fields are overridden.
+    pub fn with_bank_overrides(&self, overrides: &VmBankConfig) -> Self {
+        let mut merged = self.clone();
+        if let Some(ref name) = overrides.display_name {
+            merged.display_name = Some(name.clone());
+        }
+        if let Some(cpus) = overrides.cpus {
+            merged.cpus = cpus;
+        }
+        if let Some(ram) = overrides.ram_mb {
+            merged.ram_mb = ram;
+        }
+        if let Some(ref model) = overrides.cpu_model {
+            merged.cpu_model = Some(model.clone());
+        }
+        if let Some(ref cmd) = overrides.extra_cmdline {
+            merged.extra_cmdline = Some(cmd.clone());
+        }
+        if let Some(ref imgs) = overrides.images {
+            if imgs.kernel.is_some() {
+                merged.images.kernel = imgs.kernel.clone();
+            }
+            if imgs.rootfs.is_some() {
+                merged.images.rootfs = imgs.rootfs.clone();
+            }
+        }
+        merged
+    }
 }
 
 // =============================================================================
@@ -329,5 +362,180 @@ impl DeviceConfig {
             _ => false,
         }
     }
+}
 
+// =============================================================================
+// Per-bank VM config (delivered alongside firmware during OTA)
+// =============================================================================
+
+/// Per-bank VM config — lives in bank directories, overrides base VmDefinition fields.
+/// Delivered alongside firmware during OTA updates. All fields Optional — only present
+/// fields override the base VmDefinition.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct VmBankConfig {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub cpus: Option<u32>,
+    #[serde(default)]
+    pub ram_mb: Option<u32>,
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    #[serde(default)]
+    pub extra_cmdline: Option<String>,
+    #[serde(default)]
+    pub images: Option<ImagePaths>,
+}
+
+impl VmBankConfig {
+    /// Load per-bank config from image directory. Returns None if the file
+    /// doesn't exist or can't be parsed (backward-compatible default).
+    pub fn from_dir(image_dir: &Path) -> Option<Self> {
+        let path = image_dir.join("vm-config.yaml");
+        let content = std::fs::read_to_string(&path).ok()?;
+        match serde_yaml::from_str(&content) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                tracing::warn!("failed to parse {}: {e}", path.display());
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn base_def() -> VmDefinition {
+        VmDefinition {
+            display_name: Some("Base VM".into()),
+            backend: BackendType::Dummy,
+            os_type: OsType::Linux,
+            arch: None,
+            cpus: 4,
+            ram_mb: 2048,
+            cpu_model: None,
+            image_dir: PathBuf::from("/tmp/test"),
+            images: ImagePaths { kernel: Some("bzImage".into()), rootfs: Some("rootfs.img".into()) },
+            devices: vec![],
+            disks: vec![],
+            health: None,
+            shutdown: None,
+            extra_cmdline: Some("console=ttyS0".into()),
+            sim_dir: None,
+        }
+    }
+
+    #[test]
+    fn bank_config_partial_override() {
+        let base = base_def();
+        let overrides = VmBankConfig {
+            cpus: Some(2),
+            ram_mb: Some(4096),
+            ..Default::default()
+        };
+
+        let merged = base.with_bank_overrides(&overrides);
+        assert_eq!(merged.cpus, 2);
+        assert_eq!(merged.ram_mb, 4096);
+        // Unchanged fields
+        assert_eq!(merged.display_name.as_deref(), Some("Base VM"));
+        assert_eq!(merged.extra_cmdline.as_deref(), Some("console=ttyS0"));
+        assert_eq!(merged.images.kernel.as_deref(), Some("bzImage"));
+    }
+
+    #[test]
+    fn bank_config_full_override() {
+        let base = base_def();
+        let overrides = VmBankConfig {
+            display_name: Some("VM1 — Debian v2.0".into()),
+            cpus: Some(8),
+            ram_mb: Some(8192),
+            cpu_model: Some("max".into()),
+            extra_cmdline: Some("console=ttyS0 debug".into()),
+            images: Some(ImagePaths {
+                kernel: Some("vmlinuz".into()),
+                rootfs: Some("root.ext4".into()),
+            }),
+        };
+
+        let merged = base.with_bank_overrides(&overrides);
+        assert_eq!(merged.display_name.as_deref(), Some("VM1 — Debian v2.0"));
+        assert_eq!(merged.cpus, 8);
+        assert_eq!(merged.ram_mb, 8192);
+        assert_eq!(merged.cpu_model.as_deref(), Some("max"));
+        assert_eq!(merged.extra_cmdline.as_deref(), Some("console=ttyS0 debug"));
+        assert_eq!(merged.images.kernel.as_deref(), Some("vmlinuz"));
+        assert_eq!(merged.images.rootfs.as_deref(), Some("root.ext4"));
+    }
+
+    #[test]
+    fn bank_config_empty_override_is_noop() {
+        let base = base_def();
+        let overrides = VmBankConfig::default();
+
+        let merged = base.with_bank_overrides(&overrides);
+        assert_eq!(merged.cpus, 4);
+        assert_eq!(merged.ram_mb, 2048);
+        assert_eq!(merged.display_name.as_deref(), Some("Base VM"));
+    }
+
+    #[test]
+    fn bank_config_deserialize_yaml() {
+        let yaml = r#"
+cpus: 2
+ram_mb: 1024
+display_name: "Test VM v1.0"
+extra_cmdline: "debug"
+"#;
+        let config: VmBankConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.cpus, Some(2));
+        assert_eq!(config.ram_mb, Some(1024));
+        assert_eq!(config.display_name.as_deref(), Some("Test VM v1.0"));
+        assert_eq!(config.extra_cmdline.as_deref(), Some("debug"));
+        assert!(config.cpu_model.is_none());
+        assert!(config.images.is_none());
+    }
+
+    #[test]
+    fn bank_config_from_dir_missing_file() {
+        let dir = std::env::temp_dir().join("vm-bank-config-test-missing");
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(VmBankConfig::from_dir(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bank_config_from_dir_valid_file() {
+        let dir = std::env::temp_dir().join("vm-bank-config-test-valid");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mut f = std::fs::File::create(dir.join("vm-config.yaml")).unwrap();
+        writeln!(f, "cpus: 6\nram_mb: 3072").unwrap();
+
+        let config = VmBankConfig::from_dir(&dir).unwrap();
+        assert_eq!(config.cpus, Some(6));
+        assert_eq!(config.ram_mb, Some(3072));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bank_config_images_partial_override() {
+        let base = base_def();
+        // Override only kernel, keep rootfs from base
+        let overrides = VmBankConfig {
+            images: Some(ImagePaths {
+                kernel: Some("vmlinuz-new".into()),
+                rootfs: None,
+            }),
+            ..Default::default()
+        };
+
+        let merged = base.with_bank_overrides(&overrides);
+        assert_eq!(merged.images.kernel.as_deref(), Some("vmlinuz-new"));
+        assert_eq!(merged.images.rootfs.as_deref(), Some("rootfs.img")); // unchanged
+    }
 }

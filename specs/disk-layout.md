@@ -14,10 +14,10 @@ presented read-only to VMs.
 | 1  | `boot`         | 64 MB   | raw     | QNX IPL + first-stage loader (not banked)|
 | 2  | `hyp-a`        | 512 MB  | raw     | QNX hypervisor image, bank A             |
 | 3  | `hyp-b`        | 512 MB  | raw     | QNX hypervisor image, bank B             |
-| 4  | `os1-a`        | 2 GB    | ext4    | OS1 image (kernel + rootfs), bank A      |
-| 5  | `os1-b`        | 2 GB    | ext4    | OS1 image (kernel + rootfs), bank B      |
-| 6  | `os2-a`        | 2 GB    | ext4    | OS2 image (kernel + rootfs), bank A      |
-| 7  | `os2-b`        | 2 GB    | ext4    | OS2 image (kernel + rootfs), bank B      |
+| 4  | `vm1-a`        | 2 GB    | ext4    | VM1 image (kernel + rootfs), bank A      |
+| 5  | `vm1-b`        | 2 GB    | ext4    | VM1 image (kernel + rootfs), bank B      |
+| 6  | `vm2-a`        | 2 GB    | ext4    | VM2 image (kernel + rootfs), bank A      |
+| 7  | `vm2-b`        | 2 GB    | ext4    | VM2 image (kernel + rootfs), bank B      |
 | 8  | `nv`           | 32 MB   | raw     | NV data store (bank manager managed)     |
 | 9  | `data`         | 2 GB    | ext4    | Persistent data (keys, config, app state)|
 | 10 | `containers`   | varies  | ext4    | Container image store (Podman/Docker)    |
@@ -32,7 +32,7 @@ presented read-only to VMs.
 - **hyp-a/b**: Full QNX hypervisor image. The bootloader verifies the SHA-256 hash
   (from NV FW Meta) before executing. Read-only at runtime.
 
-- **os1-a/b, os2-a/b**: Complete guest OS stacks (kernel + rootfs + modules).
+- **vm1-a/b, vm2-a/b**: Complete guest OS stacks (kernel + rootfs + modules).
   Presented to VMs as read-only block devices. The hypervisor verifies SHA-256
   before mapping to the VM.
 
@@ -59,7 +59,7 @@ labels to find the NV partition and image partitions.
 ## Sizing
 
 The sizes above assume a 16 GB device. For larger devices, expand `containers`
-and `data`. For constrained devices (8 GB), reduce OS image sizes or drop OS2.
+and `data`. For constrained devices (8 GB), reduce VM image sizes or drop vm2.
 
-The three A/B bank sets (hyp + os1 + os2) consume ~9 GB. NV + data + containers
+The three A/B bank sets (hyp + vm1 + vm2) consume ~9 GB. NV + data + containers
 + swap consume the remainder.

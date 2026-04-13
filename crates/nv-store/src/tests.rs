@@ -65,8 +65,8 @@ fn fw_meta_roundtrip() {
     meta.spare_part_number[..4].copy_from_slice(b"SP01");
     meta.min_security_ver = 2;
 
-    store.write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
-    let read = store.read_fw_meta(BankSet::Os1, Bank::A).unwrap();
+    store.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+    let read = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
 
     assert_eq!(&read.fw_version[..5], b"1.2.3");
     assert_eq!(read.fw_seq, 10);
@@ -77,7 +77,7 @@ fn fw_meta_roundtrip() {
     assert_eq!(read.min_security_ver, 2);
 
     // Bank B should be empty
-    assert!(store.read_fw_meta(BankSet::Os1, Bank::B).is_none());
+    assert!(store.read_fw_meta(BankSet::Vm1, Bank::B).is_none());
 }
 
 #[test]
@@ -94,8 +94,8 @@ fn runtime_roundtrip() {
     runtime.dtc_count = 1;
     runtime.dtcs[0] = DtcEntry { dtc_number: 0x00112233, status: 0x09 };
 
-    store.write_runtime(BankSet::Os2, Bank::B, &mut runtime).unwrap();
-    let read = store.read_runtime(BankSet::Os2, Bank::B).unwrap();
+    store.write_runtime(BankSet::Vm2, Bank::B, &mut runtime).unwrap();
+    let read = store.read_runtime(BankSet::Vm2, Bank::B).unwrap();
 
     assert_eq!(read.did_count, 2);
     assert_eq!(read.dids[0].did, 0xFD10);
@@ -237,8 +237,8 @@ fn empty_device_returns_none() {
     assert!(store.read_boot_state().is_none());
     assert!(store.read_factory().is_none());
     assert!(store.read_app().is_none());
-    assert!(store.read_fw_meta(BankSet::Os1, Bank::A).is_none());
-    assert!(store.read_runtime(BankSet::Os1, Bank::A).is_none());
+    assert!(store.read_fw_meta(BankSet::Vm1, Bank::A).is_none());
+    assert!(store.read_runtime(BankSet::Vm1, Bank::A).is_none());
 }
 
 // --- Bank isolation ---
@@ -250,22 +250,22 @@ fn bank_sets_are_isolated() {
     // Write to OS1 Bank A
     let mut meta1 = NvFwMeta::default();
     meta1.fw_version[..3].copy_from_slice(b"1.0");
-    store.write_fw_meta(BankSet::Os1, Bank::A, &mut meta1).unwrap();
+    store.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta1).unwrap();
 
     // Write to OS2 Bank A
     let mut meta2 = NvFwMeta::default();
     meta2.fw_version[..3].copy_from_slice(b"2.0");
-    store.write_fw_meta(BankSet::Os2, Bank::A, &mut meta2).unwrap();
+    store.write_fw_meta(BankSet::Vm2, Bank::A, &mut meta2).unwrap();
 
     // Write to OS1 Bank B
     let mut meta3 = NvFwMeta::default();
     meta3.fw_version[..3].copy_from_slice(b"1.1");
-    store.write_fw_meta(BankSet::Os1, Bank::B, &mut meta3).unwrap();
+    store.write_fw_meta(BankSet::Vm1, Bank::B, &mut meta3).unwrap();
 
     // Verify isolation
-    let r1a = store.read_fw_meta(BankSet::Os1, Bank::A).unwrap();
-    let r2a = store.read_fw_meta(BankSet::Os2, Bank::A).unwrap();
-    let r1b = store.read_fw_meta(BankSet::Os1, Bank::B).unwrap();
+    let r1a = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
+    let r2a = store.read_fw_meta(BankSet::Vm2, Bank::A).unwrap();
+    let r1b = store.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
 
     assert_eq!(&r1a.fw_version[..3], b"1.0");
     assert_eq!(&r2a.fw_version[..3], b"2.0");
@@ -296,13 +296,13 @@ fn copy_runtime_clones_dids() {
     };
     runtime.dtc_count = 1;
     runtime.dtcs[0] = DtcEntry { dtc_number: 0x001122, status: 0x01 };
-    store.write_runtime(BankSet::Os1, Bank::A, &mut runtime).unwrap();
+    store.write_runtime(BankSet::Vm1, Bank::A, &mut runtime).unwrap();
 
     // Copy A → B
-    store.copy_runtime(BankSet::Os1, Bank::A, Bank::B).unwrap();
+    store.copy_runtime(BankSet::Vm1, Bank::A, Bank::B).unwrap();
 
     // Verify B has the same data
-    let copied = store.read_runtime(BankSet::Os1, Bank::B).unwrap();
+    let copied = store.read_runtime(BankSet::Vm1, Bank::B).unwrap();
     assert_eq!(copied.did_count, 1);
     assert_eq!(copied.dids[0].did, 0xFD10);
     assert_eq!(&copied.dids[0].data[..3], b"abc");
@@ -311,9 +311,9 @@ fn copy_runtime_clones_dids() {
 
     // Modify A — B should be unaffected
     runtime.dids[0].data[0] = b'X';
-    store.write_runtime(BankSet::Os1, Bank::A, &mut runtime).unwrap();
+    store.write_runtime(BankSet::Vm1, Bank::A, &mut runtime).unwrap();
 
-    let b_again = store.read_runtime(BankSet::Os1, Bank::B).unwrap();
+    let b_again = store.read_runtime(BankSet::Vm1, Bank::B).unwrap();
     assert_eq!(b_again.dids[0].data[0], b'a'); // still 'a', not 'X'
 }
 
@@ -322,9 +322,9 @@ fn copy_runtime_from_empty_writes_default() {
     let mut store = make_store();
 
     // Bank A has no runtime — copy should write empty default to Bank B
-    store.copy_runtime(BankSet::Os1, Bank::A, Bank::B).unwrap();
+    store.copy_runtime(BankSet::Vm1, Bank::A, Bank::B).unwrap();
 
-    let copied = store.read_runtime(BankSet::Os1, Bank::B).unwrap();
+    let copied = store.read_runtime(BankSet::Vm1, Bank::B).unwrap();
     assert_eq!(copied.did_count, 0);
     assert_eq!(copied.dtc_count, 0);
 }
@@ -412,16 +412,16 @@ fn anti_rollback_floor_raised_on_commit() {
     let mut meta = NvFwMeta::default();
     meta.fw_secver = 5;
     meta.min_security_ver = 2;
-    store.write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    store.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
     // On commit: raise floor if secver > min
-    let mut read = store.read_fw_meta(BankSet::Os1, Bank::A).unwrap();
+    let mut read = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
     if read.fw_secver > read.min_security_ver {
         read.min_security_ver = read.fw_secver;
     }
-    store.write_fw_meta(BankSet::Os1, Bank::A, &mut read).unwrap();
+    store.write_fw_meta(BankSet::Vm1, Bank::A, &mut read).unwrap();
 
-    let final_read = store.read_fw_meta(BankSet::Os1, Bank::A).unwrap();
+    let final_read = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
     assert_eq!(final_read.min_security_ver, 5);
 }
 
@@ -431,9 +431,9 @@ fn anti_rollback_rejects_old_version() {
 
     let mut meta = NvFwMeta::default();
     meta.min_security_ver = 5;
-    store.write_fw_meta(BankSet::Os1, Bank::A, &mut meta).unwrap();
+    store.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
-    let current = store.read_fw_meta(BankSet::Os1, Bank::A).unwrap();
+    let current = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
 
     // Simulate OTA with secver=3 — should be rejected
     let incoming_secver: u32 = 3;
