@@ -45,11 +45,15 @@ fn main() {
         }
     };
 
-    let set_names = ["hypervisor", "vm1", "vm2"];
+    let output_sets: &[(&str, usize, BankSet)] = &[
+        ("hypervisor", 0, BankSet::Hypervisor),
+        ("vm1", 1, BankSet::Vm1),
+        ("vm2", 2, BankSet::Vm2),
+        ("boot", 4, BankSet::Boot),
+    ];
 
-    for (i, action) in actions.iter().enumerate() {
-        let name = set_names[i];
-        let set = [BankSet::Hypervisor, BankSet::Vm1, BankSet::Vm2][i];
+    for &(name, idx, set) in output_sets {
+        let action = &actions[idx];
         match action {
             BootAction::FirstBoot => {
                 println!("[bootmgr] {name}: first boot, initialized to bank A");
@@ -106,13 +110,13 @@ fn main() {
 
     // Output active banks as machine-readable line for scripts
     println!();
-    for (i, set) in [BankSet::Hypervisor, BankSet::Vm1, BankSet::Vm2].iter().enumerate() {
-        if let Some(bank) = mgr.active_bank(*set) {
+    for &(name, _, set) in output_sets {
+        if let Some(bank) = mgr.active_bank(set) {
             let letter = match bank {
                 nv_store::types::Bank::A => "A",
                 nv_store::types::Bank::B => "B",
             };
-            println!("ACTIVE_{}={}", set_names[i].to_uppercase(), letter);
+            println!("ACTIVE_{}={}", name.to_uppercase(), letter);
         }
     }
 }

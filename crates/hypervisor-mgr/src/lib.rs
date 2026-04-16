@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod did;
+pub mod ifs;
 pub mod manifest;
 pub mod manifest_provider;
 pub mod ota;

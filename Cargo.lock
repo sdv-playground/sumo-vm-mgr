@@ -971,6 +971,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "hypervisor-mgr"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "ciborium",
+ "coset",
+ "crc32fast",
+ "futures",
+ "getrandom 0.2.17",
+ "hsm",
+ "http-body-util",
+ "hyper",
+ "nv-store",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sovd-api",
+ "sovd-core",
+ "sumo-codec",
+ "sumo-crypto",
+ "sumo-offboard",
+ "sumo-onboard",
+ "sumo-processor",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2358,43 +2395,6 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "tracing",
-]
-
-[[package]]
-name = "vm-diagserver"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "ciborium",
- "coset",
- "crc32fast",
- "futures",
- "getrandom 0.2.17",
- "hsm",
- "http-body-util",
- "hyper",
- "nv-store",
- "ruzstd",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "sovd-api",
- "sovd-core",
- "sumo-codec",
- "sumo-crypto",
- "sumo-offboard",
- "sumo-onboard",
- "sumo-processor",
- "tempfile",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

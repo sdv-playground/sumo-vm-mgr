@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/nv-store",
     "crates/boot",
-    "crates/diagserver",
+    "crates/hypervisor-mgr",
     "crates/vm-service",
     "crates/hsm",
     "crates/vhsm-ssd",

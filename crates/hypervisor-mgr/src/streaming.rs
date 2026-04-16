@@ -102,7 +102,7 @@ pub async fn process_envelope_stream(
         BankSet::Vm1 => "vm1",
         BankSet::Vm2 => "vm2",
         BankSet::Hsm => "hsm",
-        BankSet::Qtd => "qtd",
+        BankSet::Boot => "boot",
     };
 
     // Map payload keys to component indices by matching URIs in the manifest

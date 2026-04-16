@@ -179,6 +179,9 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// (component_id `["hsm", "keys"]`) are routed to this provider
     /// instead of being written as a disk image.
     hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
+    /// Optional IFS activator — when set (for BankSet::Boot), ecu_reset()
+    /// copies the IFS to the boot partition instead of symlink switching.
+    ifs_activator: Option<Arc<dyn crate::ifs::IfsActivator>>,
 }
 
 impl<D: BlockDevice + Send + 'static> VmBackend<D> {
@@ -217,7 +220,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             BankSet::Vm1 => ("vm1", "VM1", "Virtual machine slot 1"),
             BankSet::Vm2 => ("vm2", "VM2", "Virtual machine slot 2"),
             BankSet::Hsm => ("hsm", "HSM Key Store", "Hardware Security Module"),
-            BankSet::Qtd => ("qtd", "Reserved", "Deprecated — not exposed"),
+            BankSet::Boot => ("boot", "Boot Image (IFS)", "IFS boot image A/B bank set"),
         };
 
         // Read the current active bank at startup — this is what we're running on.
@@ -271,6 +274,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             images_dir,
             upload_phase: Mutex::new(None),
             hsm_provider: None,
+            ifs_activator: None,
         }
     }
 
@@ -283,6 +287,12 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// Set an HSM provider for routing key material manifests.
     pub fn with_hsm_provider(mut self, provider: Arc<Mutex<dyn hsm::HsmProvider>>) -> Self {
         self.hsm_provider = Some(provider);
+        self
+    }
+
+    /// Set an IFS activator for boot image activation (BankSet::Boot only).
+    pub fn with_ifs_activator(mut self, activator: Arc<dyn crate::ifs::IfsActivator>) -> Self {
+        self.ifs_activator = Some(activator);
         self
     }
 
@@ -376,7 +386,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             BankSet::Vm1 => "vm1",
             BankSet::Vm2 => "vm2",
             BankSet::Hsm => "hsm",
-            BankSet::Qtd => "qtd",
+            BankSet::Boot => "boot",
         };
 
         let images_dir = self.images_dir.as_ref()
@@ -592,7 +602,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             BankSet::Vm1 => "vm1",
             BankSet::Vm2 => "vm2",
             BankSet::Hsm => "hsm",
-            BankSet::Qtd => "qtd",
+            BankSet::Boot => "boot",
         };
 
         let output_suffix = match uri {
@@ -1277,7 +1287,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     BankSet::Vm1 => "vm1",
                     BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
-                    BankSet::Qtd => "qtd",
+                    BankSet::Boot => "boot",
                 };
                 let bank_name = match result.target_bank {
                     Bank::A => "a",
@@ -1317,7 +1327,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     BankSet::Vm1 => "vm1",
                     BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
-                    BankSet::Qtd => "qtd",
+                    BankSet::Boot => "boot",
                 };
                 let bank_name = match result.target_bank {
                     Bank::A => "a",
@@ -1457,7 +1467,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                                 BankSet::Vm1 => "vm1",
                                 BankSet::Vm2 => "vm2",
                                 BankSet::Hsm => "hsm",
-                                BankSet::Qtd => "qtd",
+                                BankSet::Boot => "boot",
                             };
                             let rb = *self.running_bank.lock().unwrap();
                             let target_bank = if rb == nv_store::types::Bank::A { "b" } else { "a" };
@@ -1536,6 +1546,25 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         *self.session.lock().unwrap() = SessionState::Default;
         *self.security.lock().unwrap() = SecurityAccessState::default();
 
+        // IFS boot image: copy to boot partition via IfsActivator (no symlink, no vm-service)
+        if self.bank_set == BankSet::Boot {
+            if let (Some(ref activator), Some(ref images_dir)) = (&self.ifs_activator, &self.images_dir) {
+                let target_bank = *self.running_bank.lock().unwrap();
+                let bank_dir_name = match target_bank {
+                    Bank::A => "bank_a",
+                    Bank::B => "bank_b",
+                };
+                let ifs_source = images_dir.join("boot").join(bank_dir_name).join("primary_boot_image.bin");
+                match activator.activate(&ifs_source) {
+                    Ok(()) => tracing::info!("IFS activated from {}", ifs_source.display()),
+                    Err(e) => tracing::warn!("IFS activation failed: {e}"),
+                }
+            } else {
+                tracing::info!("boot component: no IFS activator configured — reboot manually");
+            }
+            return Ok(None);
+        }
+
         // Flip the `current` symlink so vm-service boots the right bank
         if let (Some(ref images_dir), Some(ref socket_path)) = (&self.images_dir, &self.vm_service_socket) {
             let set_name = match self.bank_set {
@@ -1543,7 +1572,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 BankSet::Vm1 => "vm1",
                 BankSet::Vm2 => "vm2",
                 BankSet::Hsm => "hsm",
-                BankSet::Qtd => "qtd",
+                BankSet::Boot => "boot",
             };
             let target_bank = *self.running_bank.lock().unwrap();
             let bank_dir_name = match target_bank {

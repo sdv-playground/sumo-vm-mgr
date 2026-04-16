@@ -5,7 +5,7 @@
 ///   - VM1 (Linux or QNX VM)
 ///   - VM2 (Linux or QNX VM)
 ///   - HSM (Hardware Security Module — single-banked, non-rollbackable)
-///   - Qtd (deprecated — kept for NV layout compatibility, not exposed)
+///   - Boot (IFS boot image — A/B banked, reuses NV slot 4)
 
 /// Identifies which bank is active within a bank set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,13 +40,13 @@ pub enum BankSet {
     Vm1 = 1,
     Vm2 = 2,
     Hsm = 3,
-    /// Deprecated: kept for NV layout compatibility (index 4). Not exposed as a component.
-    Qtd = 4,
+    /// IFS boot image (A/B banked). Reuses NV slot 4.
+    Boot = 4,
 }
 
 impl BankSet {
     pub fn all() -> [BankSet; NUM_BANK_SETS] {
-        [BankSet::Hypervisor, BankSet::Vm1, BankSet::Vm2, BankSet::Hsm, BankSet::Qtd]
+        [BankSet::Hypervisor, BankSet::Vm1, BankSet::Vm2, BankSet::Hsm, BankSet::Boot]
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
@@ -55,7 +55,7 @@ impl BankSet {
             "os1" | "vm1" => Some(BankSet::Vm1),
             "os2" | "vm2" => Some(BankSet::Vm2),
             "hsm" => Some(BankSet::Hsm),
-            "qtd" => Some(BankSet::Qtd),
+            "boot" | "qtd" => Some(BankSet::Boot),
             _ => None,
         }
     }
@@ -162,9 +162,9 @@ impl Default for BankBootState {
 /// [17]     hsm.active_bank
 /// [18]     hsm.committed
 /// [19]     hsm.boot_count
-/// [20]     qtd.active_bank (deprecated)
-/// [21]     qtd.committed (deprecated)
-/// [22]     qtd.boot_count (deprecated)
+/// [20]     boot.active_bank
+/// [21]     boot.committed
+/// [22]     boot.boot_count
 /// [23..28] padding
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]

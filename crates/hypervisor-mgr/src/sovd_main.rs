@@ -8,13 +8,13 @@ use nv_store::types::{BankSet, NvBootState};
 
 use sovd_core::DiagnosticBackend;
 
-use vm_diagserver::backend::{VmBackend, ComponentConfig};
-use vm_diagserver::sovd::security::TestSecurityProvider;
-use vm_diagserver::suit_provider::SuitProvider;
+use hypervisor_mgr::backend::{VmBackend, ComponentConfig};
+use hypervisor_mgr::sovd::security::TestSecurityProvider;
+use hypervisor_mgr::suit_provider::SuitProvider;
 
 use axum::response::IntoResponse;
 use hsm::{HsmProvider, KeyRole};
-use hsm::linux::LinuxSimHsm;
+use hsm::sim::SimHsm;
 
 #[tokio::main]
 async fn main() {
@@ -29,19 +29,26 @@ async fn main() {
     if args.len() < 3 {
         eprintln!("Usage: vm-sovd <nv-store-path> <provisioning-authority-path> [options] [bind-addr]");
         eprintln!();
-        eprintln!("  provisioning-authority-path: COSE_Key public key for HSM key envelope validation");
-        eprintln!("  --images-dir:      directory for bank image files (enables real image OTA)");
-        eprintln!("  --vm-service-socket: Unix socket for vm-service lifecycle control");
-        eprintln!("  --hsm-daemon:      path to vhsm-test-ssd binary");
-        eprintln!("  --hsm-keystore:    HSM keystore directory (default: /tmp/vhsm-keys)");
-        eprintln!("  --hsm-port:        HSM vsock port (default: 5100)");
-        eprintln!("  bind-addr defaults to 0.0.0.0:8080");
+        eprintln!("Positional:");
+        eprintln!("  nv-store-path              NV store file (created if missing)");
+        eprintln!("  provisioning-authority-path COSE_Key public key for HSM key envelope validation");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  --images-dir <path>        Directory for A/B bank image files (enables real image OTA)");
+        eprintln!("  --vm-service-socket <path> Unix socket / TCP address for vm-service lifecycle control");
+        eprintln!("  --hsm-daemon <path>        Path to vhsm-test-ssd binary");
+        eprintln!("  --hsm-keystore <path>      HSM keystore directory (default: /tmp/vhsm-keys)");
+        eprintln!("  --hsm-port <port>          HSM vsock port (default: 5100)");
+        eprintln!("  --boot-device <path>       Boot partition block device for IFS activation (e.g. /dev/hd0t177)");
+        eprintln!("  --boot-mount <path>        Boot partition mount point (default: /mnt/boot)");
+        eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
         eprintln!();
         eprintln!("Software authority and device decryption keys are loaded from HSM after provisioning.");
         eprintln!("Firmware flash is rejected until HSM is provisioned.");
         eprintln!();
-        eprintln!("Example:");
-        eprintln!("  vm-sovd /tmp/vm-mgr-nv.bin keys/signing.pub");
+        eprintln!("Examples:");
+        eprintln!("  vm-sovd /tmp/nv.bin keys/signing.pub");
+        eprintln!("  vm-sovd /data/nv.bin /data/signing.pub --images-dir /data/images --hsm-keystore /data/vhsm-keys");
         std::process::exit(1);
     }
 
@@ -54,7 +61,9 @@ async fn main() {
     let mut hsm_daemon_path: Option<PathBuf> = None;
     let mut hsm_keystore_path = PathBuf::from("/tmp/vhsm-keys");
     let mut hsm_port: u16 = 5100;
-    let mut bind_addr = "0.0.0.0:8080";
+    let mut boot_device: Option<String> = None;
+    let mut boot_mount = PathBuf::from("/mnt/boot");
+    let mut bind_addr = "0.0.0.0:4000";
     let mut i = 3;
     while i < args.len() {
         if args[i] == "--images-dir" && i + 1 < args.len() {
@@ -74,6 +83,12 @@ async fn main() {
                 eprintln!("invalid --hsm-port: {}", args[i + 1]);
                 std::process::exit(1);
             });
+            i += 2;
+        } else if args[i] == "--boot-device" && i + 1 < args.len() {
+            boot_device = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--boot-mount" && i + 1 < args.len() {
+            boot_mount = PathBuf::from(&args[i + 1]);
             i += 2;
         } else {
             bind_addr = &args[i];
@@ -115,7 +130,7 @@ async fn main() {
         let daemon_bin = hsm_daemon_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("vhsm-test-ssd"));
-        let provider = LinuxSimHsm::new(
+        let provider = SimHsm::new(
             daemon_bin.clone(),
             hsm_keystore_path.clone(),
             hsm_port,
@@ -177,6 +192,10 @@ async fn main() {
             entity_type: "hsm".into(),
             ..ComponentConfig::default()
         }),
+        ("boot", BankSet::Boot, ComponentConfig {
+            entity_type: "boot_image".into(),
+            ..ComponentConfig::default()
+        }),
     ];
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
@@ -206,6 +225,16 @@ async fn main() {
         if set == BankSet::Hsm {
             if let Some(ref provider) = hsm_provider {
                 backend = backend.with_hsm_provider(provider.clone());
+            }
+        }
+        // Wire IFS activator into the boot backend
+        if set == BankSet::Boot {
+            if let Some(ref dev) = boot_device {
+                let activator = hypervisor_mgr::ifs::dev::DevIfsActivator::new(
+                    dev.clone(),
+                    boot_mount.clone(),
+                );
+                backend = backend.with_ifs_activator(Arc::new(activator));
             }
         }
         backends.insert(id.to_string(), Arc::new(backend));
@@ -238,7 +267,7 @@ async fn main() {
                     }
                     Ok(hsm::ProvisioningState::Unprovisioned) => {
                         // Create a temporary crypto provider to generate the CSR
-                        let tmp_hsm = LinuxSimHsm::new(
+                        let tmp_hsm = SimHsm::new(
                             PathBuf::from("unused"),
                             keystore,
                             csr_port,
@@ -287,7 +316,11 @@ async fn main() {
         tracing::info!("  vm-service socket: {}", sock.display());
     }
     tracing::info!("  HSM keystore: {}", hsm_keystore_path.display());
-    tracing::info!("  components: hypervisor, vm1, vm2, hsm");
+    if let Some(ref dev) = boot_device {
+        tracing::info!("  boot device: {} (IFS activation enabled)", dev);
+        tracing::info!("  boot mount: {}", boot_mount.display());
+    }
+    tracing::info!("  components: hypervisor, vm1, vm2, hsm, boot");
     tracing::info!("  try: curl http://{bind_addr}/vehicle/v1/components");
 
     axum::serve(listener, router).await.unwrap();
