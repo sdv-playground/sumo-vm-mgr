@@ -2,7 +2,7 @@
 //!
 //! Uses a fixed AES-128 key with a random IV for each encryption.
 //! NOT secure for production — use an HSE-backed encryptor instead.
-//! The key would typically be the same test key used by LinuxSimHsm.
+//! The key would typically be the same test key used by SimHsm.
 
 use super::{SecstoreEncryptor, SecstoreError};
 

@@ -12,8 +12,12 @@ use serde::Deserialize;
 /// Top-level service configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VmServiceConfig {
-    /// Unix socket path for the control API.
+    /// Unix socket path for the control API (Linux).
     pub socket: PathBuf,
+    /// TCP port for the control API (QNX/non-Linux, default 9100).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub tcp_port: Option<u16>,
     /// VM definitions, keyed by name (e.g., "vm1", "vm2").
     pub vms: HashMap<String, VmDefinition>,
 }
@@ -67,6 +71,12 @@ pub struct VmDefinition {
     /// Directory for host simulator binaries.
     #[serde(default)]
     pub sim_dir: Option<PathBuf>,
+    /// Path to qvm config file (QNX backend only).
+    #[serde(default)]
+    pub qvm_config: Option<PathBuf>,
+    /// Auto-start this VM when vm-service starts (default: false).
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 fn default_cpus() -> u32 { 4 }
@@ -425,6 +435,8 @@ mod tests {
             shutdown: None,
             extra_cmdline: Some("console=ttyS0".into()),
             sim_dir: None,
+            qvm_config: None,
+            auto_start: false,
         }
     }
 

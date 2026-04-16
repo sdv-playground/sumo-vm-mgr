@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use hsm::linux::LinuxSimHsm;
+use hsm::sim::SimHsm;
 use hsm::{HsmCryptoProvider, HsmProvider};
 
 use vhsm_ssd::codec;
@@ -91,7 +91,7 @@ fn main() {
     let port = vsock_port.unwrap_or(VHSM_PORT);
 
     // Create HSM provider (reads keys from keystore)
-    let hsm = LinuxSimHsm::new(
+    let hsm = SimHsm::new(
         PathBuf::from("unused"),
         keystore_path.clone(),
         port as u16,

@@ -9,6 +9,7 @@
 mod api;
 mod config;
 mod health;
+#[cfg(target_os = "linux")]
 mod ivshmem;
 mod manager;
 mod runner;
@@ -65,7 +66,17 @@ async fn main() {
     };
 
     let socket_path = config.socket.clone();
+    #[cfg(not(target_os = "linux"))]
+    let tcp_port = config.tcp_port;
     let vm_count = config.vms.len();
+
+    // Collect auto-start VM names before config is consumed
+    let auto_start_vms: Vec<String> = config
+        .vms
+        .iter()
+        .filter(|(_, def)| def.auto_start)
+        .map(|(name, _)| name.clone())
+        .collect();
 
     tracing::info!(
         "loaded config: {} VMs, socket: {}",
@@ -74,52 +85,95 @@ async fn main() {
     );
 
     let manager = Arc::new(Mutex::new(manager::VmManager::new(config)));
-    let manager_shutdown = manager.clone();
 
-    // Clean stale socket file
-    let _ = std::fs::remove_file(&socket_path);
-
-    // Ensure parent directory exists
-    if let Some(parent) = socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    // Auto-start VMs that have auto_start: true
+    if !auto_start_vms.is_empty() {
+        let mut mgr = manager.lock().await;
+        for name in &auto_start_vms {
+            tracing::info!("auto-starting VM {name}");
+            if let Err(e) = mgr.start_vm(name) {
+                tracing::warn!("auto-start {name} failed: {e}");
+            }
+        }
     }
 
-    let listener = match tokio::net::UnixListener::bind(&socket_path) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("failed to bind {}: {e}", socket_path.display());
-            std::process::exit(1);
-        }
-    };
-
-    tracing::info!("listening on {}", socket_path.display());
+    let manager_shutdown = manager.clone();
 
     let app = api::router(manager);
 
-    // Graceful shutdown on SIGTERM/SIGINT
-    let shutdown = async move {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ).expect("failed to register SIGTERM");
+    // Platform-specific listener: Unix socket on Linux, TCP on QNX
+    #[cfg(target_os = "linux")]
+    {
+        // Clean stale socket file
+        let _ = std::fs::remove_file(&socket_path);
 
-        tokio::select! {
-            _ = sigterm.recv() => {
-                tracing::info!("received SIGTERM");
-            }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("received SIGINT");
-            }
+        // Ensure parent directory exists
+        if let Some(parent) = socket_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
 
-        tracing::info!("shutting down, stopping all VMs...");
-        manager_shutdown.lock().await.stop_all();
+        let listener = match tokio::net::UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("failed to bind {}: {e}", socket_path.display());
+                std::process::exit(1);
+            }
+        };
 
-        // Clean up socket
-        let _ = std::fs::remove_file(&socket_path);
-    };
+        tracing::info!("listening on {}", socket_path.display());
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .unwrap();
+        // Graceful shutdown on SIGTERM/SIGINT
+        let shutdown = async move {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            ).expect("failed to register SIGTERM");
+
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    tracing::info!("received SIGTERM");
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("received SIGINT");
+                }
+            }
+
+            tracing::info!("shutting down, stopping all VMs...");
+            manager_shutdown.lock().await.stop_all();
+
+            // Clean up socket
+            let _ = std::fs::remove_file(&socket_path);
+        };
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let port = tcp_port.unwrap_or(9100);
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("failed to bind {addr}: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        tracing::info!("listening on {addr}");
+
+        let shutdown = async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("received shutdown signal");
+            tracing::info!("shutting down, stopping all VMs...");
+            manager_shutdown.lock().await.stop_all();
+        };
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
+            .unwrap();
+    }
 }

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use hsm::linux::LinuxSimHsm;
+use hsm::sim::SimHsm;
 use hsm::HsmCryptoProvider;
 
 use vhsm_ssd::handle_table::HandleTable;
@@ -40,7 +40,7 @@ impl TestFixture {
 
         Self::build_keystore(&keystore_path);
 
-        let hsm = LinuxSimHsm::new(
+        let hsm = SimHsm::new(
             PathBuf::from("unused"),
             keystore_path.clone(),
             5100,
@@ -167,7 +167,7 @@ impl TestFixture {
             kek_slot_index: None,
         };
 
-        let hsm = LinuxSimHsm::new(
+        let hsm = SimHsm::new(
             PathBuf::from("unused"),
             path.to_path_buf(),
             5100,

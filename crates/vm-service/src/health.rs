@@ -94,10 +94,18 @@ pub struct HealthMonitor {
 impl HealthMonitor {
     pub fn new(vm_name: &str) -> Self {
         Self {
-            shm_path: crate::ivshmem::shm_path(vm_name, "health"),
+            shm_path: Self::default_shm_path(vm_name),
             last_seq: None,
             last_seq_change: None,
         }
+    }
+
+    /// Platform-specific default shared memory path for health device.
+    fn default_shm_path(vm_name: &str) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        { PathBuf::from(format!("/dev/shm/ivshmem-{vm_name}-health")) }
+        #[cfg(not(target_os = "linux"))]
+        { PathBuf::from(format!("/dev/shmem/vm-{vm_name}-health")) }
     }
 
     /// Read detailed health from shared memory, including raw guest_state and hb_seq.

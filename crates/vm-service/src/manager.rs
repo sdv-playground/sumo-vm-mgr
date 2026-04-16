@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::config::{BackendType, VmBankConfig, VmDefinition, VmServiceConfig};
 use crate::health::{HealthDetail, HealthMonitor, HealthStatus};
 use crate::runner::dummy::DummyRunner;
+#[cfg(target_os = "linux")]
 use crate::runner::qemu::QemuRunner;
 use crate::runner::qnx::QnxRunner;
 use crate::runner::{RunnerError, VmHandle, VmRunner};
@@ -80,6 +81,7 @@ impl VmManager {
 
         for (name, def) in config.vms {
             let runner: Box<dyn VmRunner> = match def.backend {
+                #[cfg(target_os = "linux")]
                 BackendType::Qemu => {
                     let mut r = QemuRunner::new();
                     if let Some(ref sim_dir) = def.sim_dir {
@@ -91,6 +93,11 @@ impl VmManager {
                         );
                     }
                     Box::new(r)
+                }
+                #[cfg(not(target_os = "linux"))]
+                BackendType::Qemu => {
+                    tracing::warn!("QEMU backend not available on this platform, using dummy");
+                    Box::new(DummyRunner::new())
                 }
                 BackendType::Qnx => Box::new(QnxRunner::new()),
                 BackendType::Dummy => Box::new(DummyRunner::new()),

@@ -5,6 +5,7 @@
 /// - DummyRunner: instant no-ops for components without a real VM
 /// - QnxRunner: stub for QNX qvm integration (future)
 
+#[cfg(target_os = "linux")]
 pub mod qemu;
 pub mod qnx;
 pub mod dummy;

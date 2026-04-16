@@ -1,8 +1,7 @@
-/// Linux simulation HSM provider.
+/// Simulation HSM provider (portable: Linux + QNX).
 ///
-/// Wraps `vhsm-test-ssd` (file-based keystore + vsock service) for
-/// dev/test on Linux hosts. On real hardware this would be replaced
-/// by `QnxHsm` talking to the HSM firmware via QNX resource manager.
+/// Wraps `vhsm-ssd` / `vhsm-test-ssd` (file-based keystore + vsock service)
+/// for dev/test and QNX hypervisor host deployments.
 ///
 /// # Provisioning
 ///
@@ -35,7 +34,7 @@ use std::process::{Child, Command};
 use crate::payload::{self, HsmKeystore, KeySlotDef, KEY_TYPE_AES_256, KEY_TYPE_EC_P256};
 use crate::{HsmError, HsmProvider, HsmStatus, KeyInfo, KeyRole, KeyType, ProvisioningState};
 
-pub struct LinuxSimHsm {
+pub struct SimHsm {
     /// Path to `vhsm-test-ssd` binary.
     daemon_bin: PathBuf,
     /// Keystore directory (e.g. /tmp/vhsm-keys).
@@ -48,7 +47,7 @@ pub struct LinuxSimHsm {
     child: Option<Child>,
 }
 
-impl LinuxSimHsm {
+impl SimHsm {
     pub fn new(
         daemon_bin: PathBuf,
         keystore_path: PathBuf,
@@ -517,7 +516,7 @@ impl LinuxSimHsm {
     }
 }
 
-impl HsmProvider for LinuxSimHsm {
+impl HsmProvider for SimHsm {
     fn is_provisioned(&self) -> Result<bool, HsmError> {
         Ok(self.manifest_path().exists())
     }
@@ -655,7 +654,7 @@ impl HsmProvider for LinuxSimHsm {
 
         let (service_running, service_pid) = if let Some(child) = &self.child {
             let pid = child.id();
-            let alive = Path::new(&format!("/proc/{pid}")).exists();
+            let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
             (alive, Some(pid))
         } else {
             (false, None)
@@ -729,7 +728,7 @@ impl HsmProvider for LinuxSimHsm {
     }
 }
 
-impl Drop for LinuxSimHsm {
+impl Drop for SimHsm {
     fn drop(&mut self) {
         if self.is_running() {
             if let Err(e) = self.stop_service() {
@@ -1096,7 +1095,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("hsm-test-provision");
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let hsm = LinuxSimHsm::new(
+        let hsm = SimHsm::new(
             PathBuf::from("/dev/null"),
             tmp.clone(),
             5100,
@@ -1165,7 +1164,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let hsm = LinuxSimHsm::new(
+        let hsm = SimHsm::new(
             PathBuf::from("/dev/null"),
             tmp.clone(),
             5100,

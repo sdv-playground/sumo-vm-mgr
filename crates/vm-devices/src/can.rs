@@ -7,6 +7,7 @@
 //! Each ring has a 32-byte header + frame slots (72 bytes each, CAN FD format).
 //! SPSC lock-free protocol: writer advances head, reader advances tail.
 
+#[cfg(target_os = "linux")]
 pub mod socketcan;
 
 use std::sync::atomic::{AtomicBool, Ordering};

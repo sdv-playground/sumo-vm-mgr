@@ -103,16 +103,23 @@ impl Clock for SimulationClock {
 pub struct SimController {
     clock: std::sync::Arc<SimulationClock>,
     step_ns: u64,
+    #[cfg(target_os = "linux")]
     qmp: Option<Mutex<crate::qmp::QmpClient>>,
 }
 
 impl SimController {
     /// Create a controller with a fixed step size (no QMP).
     pub fn new(clock: std::sync::Arc<SimulationClock>, step_ns: u64) -> Self {
-        Self { clock, step_ns, qmp: None }
+        Self {
+            clock,
+            step_ns,
+            #[cfg(target_os = "linux")]
+            qmp: None,
+        }
     }
 
     /// Create a controller with QMP integration for vCPU pause/resume.
+    #[cfg(target_os = "linux")]
     pub fn with_qmp(
         clock: std::sync::Arc<SimulationClock>,
         step_ns: u64,
@@ -124,6 +131,7 @@ impl SimController {
     /// Advance by one step. Resumes vCPUs if paused.
     pub fn step(&self) {
         // Resume vCPUs if we have QMP and they're paused
+        #[cfg(target_os = "linux")]
         if let Some(ref qmp) = self.qmp {
             let mut q = qmp.lock().unwrap();
             let _ = q.cont();
@@ -144,16 +152,16 @@ impl SimController {
     /// vtime registers are frozen (no more `update_time()` calls).
     /// Safe to single-step the RT side without guest timeouts firing.
     pub fn pause(&self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
         if let Some(ref qmp) = self.qmp {
             let mut q = qmp.lock().unwrap();
             q.stop().map_err(|e| format!("QMP stop: {e}"))?;
             tracing::info!(mono_ns = self.clock.now_mono_ns(), "simulation paused (vCPUs halted)");
-            Ok(())
-        } else {
-            // No QMP — just stop stepping (vtime freezes, but CLOCK_MONOTONIC still runs)
-            tracing::warn!("pause without QMP: vtime frozen but CLOCK_MONOTONIC still running");
-            Ok(())
+            return Ok(());
         }
+        // No QMP — just stop stepping (vtime freezes, but CLOCK_MONOTONIC still runs)
+        tracing::warn!("pause without QMP: vtime frozen but CLOCK_MONOTONIC still running");
+        Ok(())
     }
 
     /// Resume guest vCPUs + optionally advance simulation time.
@@ -165,6 +173,7 @@ impl SimController {
         if elapsed_ns > 0 {
             self.clock.advance(elapsed_ns);
         }
+        #[cfg(target_os = "linux")]
         if let Some(ref qmp) = self.qmp {
             let mut q = qmp.lock().unwrap();
             q.cont().map_err(|e| format!("QMP cont: {e}"))?;
@@ -179,12 +188,12 @@ impl SimController {
 
     /// Check if guest is currently running.
     pub fn is_running(&self) -> bool {
+        #[cfg(target_os = "linux")]
         if let Some(ref qmp) = self.qmp {
             let mut q = qmp.lock().unwrap();
-            q.is_running().unwrap_or(true)
-        } else {
-            true
+            return q.is_running().unwrap_or(true);
         }
+        true
     }
 
     /// Get current simulation time.

@@ -7,6 +7,7 @@
 pub mod transport;
 pub mod clock;
 pub mod regs;
+#[cfg(target_os = "linux")]
 pub mod qmp;
 
 #[cfg(feature = "health")]

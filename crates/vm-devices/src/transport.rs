@@ -1,6 +1,7 @@
 //! Transport abstractions for host↔guest shared memory communication.
 
 pub mod mem;
+#[cfg(target_os = "linux")]
 pub mod ivshmem;
 
 use std::sync::atomic::Ordering;

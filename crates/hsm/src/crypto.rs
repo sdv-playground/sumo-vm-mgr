@@ -1,4 +1,4 @@
-/// HsmCryptoProvider implementation for LinuxSimHsm.
+/// HsmCryptoProvider implementation for SimHsm.
 ///
 /// Performs crypto operations in software using RustCrypto crates.
 /// Keys are read from the file-based keystore (PEM for EC-P256,
@@ -8,7 +8,7 @@
 /// Key material never leaves this module — callers (vhsm-ssd) only
 /// see operation results (signatures, ciphertexts, etc.).
 
-use crate::linux::{decode_pem, extract_ec_scalar_from_pem, LinuxSimHsm};
+use crate::sim::{decode_pem, extract_ec_scalar_from_pem, SimHsm};
 use crate::{HsmCryptoProvider, HsmError, HsmProvider, KeyInfo, KeyType};
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
@@ -20,7 +20,7 @@ use p256::ecdsa::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use sha2::Sha256;
 
-impl HsmCryptoProvider for LinuxSimHsm {
+impl HsmCryptoProvider for SimHsm {
     fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
         let key_info = self.get_key_info(key_id)?;
         if key_info.key_type != KeyType::EcP256 {
@@ -236,7 +236,7 @@ impl HsmCryptoProvider for LinuxSimHsm {
 
 // --- Internal key loading helpers ---
 
-fn load_ec_private_scalar(hsm: &LinuxSimHsm, key_id: &str) -> Result<Vec<u8>, HsmError> {
+fn load_ec_private_scalar(hsm: &SimHsm, key_id: &str) -> Result<Vec<u8>, HsmError> {
     let priv_path = hsm.keys_dir().join(format!("{key_id}.priv"));
     let pem = std::fs::read_to_string(&priv_path)
         .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", priv_path.display())))?;
@@ -244,7 +244,7 @@ fn load_ec_private_scalar(hsm: &LinuxSimHsm, key_id: &str) -> Result<Vec<u8>, Hs
 }
 
 fn load_ec_verifying_key(
-    hsm: &LinuxSimHsm,
+    hsm: &SimHsm,
     key_id: &str,
 ) -> Result<VerifyingKey, HsmError> {
     let pub_path = hsm.keys_dir().join(format!("{key_id}.pub"));
@@ -381,7 +381,7 @@ fn push_der_len(buf: &mut Vec<u8>, len: usize) {
     }
 }
 
-fn load_aes_key(hsm: &LinuxSimHsm, key_id: &str) -> Result<Vec<u8>, HsmError> {
+fn load_aes_key(hsm: &SimHsm, key_id: &str) -> Result<Vec<u8>, HsmError> {
     let path = hsm.keys_dir().join(format!("{key_id}.bin"));
     let key = std::fs::read(&path)
         .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", path.display())))?;

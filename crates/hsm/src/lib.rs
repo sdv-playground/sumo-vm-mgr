@@ -6,12 +6,16 @@
 /// guest-facing HSM service.
 ///
 /// Implementations:
-/// - LinuxSimHsm: manages vhsm-test-ssd + file-based keystore (dev/test)
+/// - SimHsm: manages vhsm-ssd + file-based keystore (dev/test + QNX host)
 /// - QnxHsm: stub for real HSM hardware via QNX resource manager
 
 pub mod types;
 pub mod payload;
-pub mod linux;
+pub mod sim;
+pub mod linux {
+    //! Backward-compatible re-export. Prefer `hsm::sim::SimHsm`.
+    pub use crate::sim::*;
+}
 pub mod qnx;
 #[cfg(feature = "crypto")]
 pub mod crypto;
@@ -86,7 +90,7 @@ pub trait HsmProvider: Send {
 /// On production hardware, the implementation routes to the HSM
 /// firmware — private keys never leave the secure boundary.
 ///
-/// On Linux simulation, `LinuxSimHsm` reads PEM keys from the
+/// In simulation mode, `SimHsm` reads PEM keys from the
 /// keystore and performs operations in software via RustCrypto.
 pub trait HsmCryptoProvider: Send + Sync {
     /// ECDSA-SHA256 sign with EC-P256 key. Returns DER-encoded signature.
