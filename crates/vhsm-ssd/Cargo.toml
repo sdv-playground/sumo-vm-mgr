@@ -18,6 +18,7 @@ rand = "0.8"
 p256 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
 rand = { version = "0.8", features = ["std"] }
+tempfile = "3"
 
 [[bin]]
 name = "vhsm-ssd"

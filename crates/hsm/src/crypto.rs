@@ -204,13 +204,88 @@ impl HsmCryptoProvider for SimHsm {
     }
 
     fn get_key_info(&self, key_id: &str) -> Result<KeyInfo, HsmError> {
-        if !self.is_provisioned()? {
+        // Manifest lookup (provisioned well-known keys)
+        if self.is_provisioned().unwrap_or(false) {
+            let keys = self.parse_manifest()?;
+            if let Some(info) = keys.into_iter().find(|k| k.key_id == key_id) {
+                return Ok(info);
+            }
+        }
+
+        // Disk fallback (dynamically-generated keys). Infer type from the
+        // file extension produced by `generate_key`:
+        //   `{key_id}.bin`  → AES-256
+        //   `{key_id}.priv` → EC-P256
+        let aes_path = self.keys_dir().join(format!("{key_id}.bin"));
+        if aes_path.exists() {
+            return Ok(KeyInfo {
+                key_id: key_id.to_string(),
+                key_type: KeyType::Aes256,
+                has_certificate: false,
+                allowed_guests: None,
+                allowed_ops: None,
+            });
+        }
+        let ec_priv_path = self.keys_dir().join(format!("{key_id}.priv"));
+        if ec_priv_path.exists() {
+            return Ok(KeyInfo {
+                key_id: key_id.to_string(),
+                key_type: KeyType::EcP256,
+                has_certificate: false,
+                allowed_guests: None,
+                allowed_ops: None,
+            });
+        }
+
+        if !self.is_provisioned().unwrap_or(false) {
             return Err(HsmError::NotProvisioned);
         }
-        let keys = self.parse_manifest()?;
-        keys.into_iter()
-            .find(|k| k.key_id == key_id)
-            .ok_or_else(|| HsmError::KeyNotFound(key_id.to_string()))
+        Err(HsmError::KeyNotFound(key_id.to_string()))
+    }
+
+    fn generate_key(&self, key_id: &str, alg: u32) -> Result<Vec<u8>, HsmError> {
+        // Algorithm constants mirror vHSM wire protocol (vhsm_proto.h /
+        // vhsm-ssd/src/proto.rs). Keep in sync.
+        const ALG_AES_256: u32 = 0x0002;
+        const ALG_ECC_P256: u32 = 0x0021;
+
+        std::fs::create_dir_all(self.keys_dir())
+            .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
+
+        match alg {
+            ALG_AES_256 => {
+                // `load_aes_key` requires a 32-byte key; AES-128 isn't
+                // supported end-to-end in this backend, reject it explicitly.
+                let mut key = vec![0u8; 32];
+                OsRng.fill_bytes(&mut key);
+                let path = self.keys_dir().join(format!("{key_id}.bin"));
+                std::fs::write(&path, &key).map_err(|e| {
+                    HsmError::KeystoreError(format!("write {}: {e}", path.display()))
+                })?;
+                // Symmetric — no public material to return.
+                Ok(Vec::new())
+            }
+            ALG_ECC_P256 => {
+                let sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+                let scalar = sk.to_bytes();
+                let vk = sk.verifying_key();
+                let pub_point = vk.to_encoded_point(false);
+
+                let priv_path = self.keys_dir().join(format!("{key_id}.priv"));
+                crate::sim::write_pem_ec_private(&priv_path, &scalar)?;
+                let pub_path = self.keys_dir().join(format!("{key_id}.pub"));
+                crate::sim::write_pem_ec_public(&pub_path, pub_point.as_bytes())?;
+
+                // Return SubjectPublicKeyInfo DER — matches `get_public_key_der`.
+                let pem = std::fs::read_to_string(&pub_path).map_err(|e| {
+                    HsmError::KeystoreError(format!("read back {}: {e}", pub_path.display()))
+                })?;
+                decode_pem(&pem, "PUBLIC KEY")
+            }
+            other => Err(HsmError::NotSupported(format!(
+                "generate_key algorithm 0x{other:04x}"
+            ))),
+        }
     }
 
     fn generate_csr(&self, key_id: &str, subject_cn: &str) -> Result<Vec<u8>, HsmError> {
@@ -392,4 +467,118 @@ fn load_aes_key(hsm: &SimHsm, key_id: &str) -> Result<Vec<u8>, HsmError> {
         )));
     }
     Ok(key)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::SimHsm;
+    use crate::HsmCryptoProvider;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    const ALG_AES_256: u32 = 0x0002;
+    const ALG_ECC_P256: u32 = 0x0021;
+    const ALG_ED25519: u32 = 0x0020;
+
+    fn new_hsm() -> (SimHsm, TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let keystore = PathBuf::from(tmp.path());
+        let hsm = SimHsm::new(PathBuf::from("unused"), keystore, 0, Vec::new());
+        (hsm, tmp)
+    }
+
+    #[test]
+    fn generate_key_aes256_produces_usable_key() {
+        let (hsm, _tmp) = new_hsm();
+
+        let pk = hsm.generate_key("k-aes", ALG_AES_256).unwrap();
+        assert!(pk.is_empty(), "AES is symmetric, no public key");
+
+        // get_key_info must find it via disk fallback (no manifest entry)
+        let info = hsm.get_key_info("k-aes").unwrap();
+        assert_eq!(info.key_type, KeyType::Aes256);
+
+        // encrypt+decrypt round-trip
+        let pt = b"hello generate_key";
+        let ct = hsm.encrypt("k-aes", pt).unwrap();
+        let rt = hsm.decrypt("k-aes", &ct).unwrap();
+        assert_eq!(rt, pt);
+
+        // mac-generate must now work (was failing with CRYPTO_ERROR before the fix)
+        let mac = hsm.mac_generate("k-aes", pt).unwrap();
+        assert_eq!(mac.len(), 16, "AES-CMAC tag is 16 bytes");
+        assert!(hsm.mac_verify("k-aes", pt, &mac).unwrap());
+    }
+
+    #[test]
+    fn generate_key_ecc_p256_returns_spki_and_signs() {
+        let (hsm, _tmp) = new_hsm();
+
+        let spki = hsm.generate_key("k-ec", ALG_ECC_P256).unwrap();
+        assert!(!spki.is_empty(), "EC must return public key DER");
+        // SubjectPublicKeyInfo starts with SEQUENCE (0x30)
+        assert_eq!(spki[0], 0x30, "SPKI should be ASN.1 SEQUENCE");
+
+        let info = hsm.get_key_info("k-ec").unwrap();
+        assert_eq!(info.key_type, KeyType::EcP256);
+
+        // get_public_key_der returns the same SPKI bytes
+        let spki_via_getter = hsm.get_public_key_der("k-ec").unwrap();
+        assert_eq!(spki, spki_via_getter);
+
+        // sign+verify round-trip
+        let digest = [0xAA_u8; 32];
+        let sig = hsm.sign("k-ec", &digest).unwrap();
+        assert!(hsm.verify("k-ec", &digest, &sig).unwrap());
+    }
+
+    #[test]
+    fn generate_key_rejects_unsupported_alg() {
+        let (hsm, _tmp) = new_hsm();
+        let err = hsm.generate_key("k-ed", ALG_ED25519).unwrap_err();
+        assert!(matches!(err, HsmError::NotSupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn generate_key_creates_files_in_keystore() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("sym", ALG_AES_256).unwrap();
+        hsm.generate_key("asym", ALG_ECC_P256).unwrap();
+
+        assert!(hsm.keys_dir().join("sym.bin").exists());
+        assert!(hsm.keys_dir().join("asym.priv").exists());
+        assert!(hsm.keys_dir().join("asym.pub").exists());
+
+        // .bin is exactly 32 bytes
+        let aes_bytes = std::fs::read(hsm.keys_dir().join("sym.bin")).unwrap();
+        assert_eq!(aes_bytes.len(), 32);
+    }
+
+    #[test]
+    fn get_key_info_falls_back_to_disk_when_not_provisioned() {
+        let (hsm, _tmp) = new_hsm();
+        // HSM is not provisioned — but generate_key still creates disk files.
+        assert!(!hsm.is_provisioned().unwrap());
+        hsm.generate_key("dyn", ALG_AES_256).unwrap();
+
+        let info = hsm.get_key_info("dyn").unwrap();
+        assert_eq!(info.key_id, "dyn");
+        assert_eq!(info.key_type, KeyType::Aes256);
+    }
+
+    #[test]
+    fn get_key_info_key_not_found_still_errors() {
+        let (hsm, _tmp) = new_hsm();
+        let err = hsm.get_key_info("never-generated").unwrap_err();
+        // Not provisioned and key not on disk
+        assert!(
+            matches!(err, HsmError::NotProvisioned | HsmError::KeyNotFound(_)),
+            "got {err:?}"
+        );
+    }
 }

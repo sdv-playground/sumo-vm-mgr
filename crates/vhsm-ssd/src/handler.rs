@@ -96,14 +96,18 @@ fn handle_key_generate(
     // Generate a key_id for internal use
     let key_id = format!("gen-{}-{}", caller_cid, handle_table.len());
 
-    // TODO: call crypto.generate_key() when trait is extended
-    // For now, generate EC key pair using existing infrastructure
-    let pubkey = match algorithm {
-        ALG_ECC_P256 => match crypto.get_public_key_der(&key_id) {
-            Ok(pk) => pk,
-            Err(_) => Vec::new(), // Key doesn't exist yet — placeholder
-        },
-        _ => Vec::new(),
+    // Actually create the key material on disk (AES .bin or EC .priv+.pub)
+    // and collect the public key DER (empty for symmetric).
+    let pubkey = match crypto.generate_key(&key_id, algorithm) {
+        Ok(pk) => pk,
+        Err(e) => {
+            tracing::warn!(key = %key_id, alg = algorithm, error = %e, "generate_key failed");
+            let status = match e {
+                hsm::HsmError::NotSupported(_) => StatusCode::InvalidParam,
+                _ => StatusCode::Internal,
+            };
+            return Response::err(req.op, req.session_id, status);
+        }
     };
 
     let handle = match handle_table.allocate(
@@ -386,5 +390,135 @@ fn handle_get_cert(
             tracing::warn!(key = %entry.key_id, error = %e, "get_cert failed");
             Response::err(req.op, req.session_id, StatusCode::Internal)
         }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hsm::sim::SimHsm;
+    use std::path::PathBuf;
+
+    fn new_hsm() -> (SimHsm, PathBuf, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let keystore = PathBuf::from(tmp.path());
+        // Matches SimHsm's internal keys_dir() — keystore_path/keys.
+        let keys_dir = keystore.join("keys");
+        let hsm = SimHsm::new(PathBuf::from("unused"), keystore, 0, Vec::new());
+        (hsm, keys_dir, tmp)
+    }
+
+    /// Build a key_generate payload: algorithm(4) + permitted_ops(4) +
+    /// persistent(1) + pad(3) + label(32) = 44 bytes.
+    fn make_keygen_payload(alg: u32, permitted_ops: u32) -> Vec<u8> {
+        let mut p = Vec::with_capacity(44);
+        p.extend_from_slice(&alg.to_le_bytes());
+        p.extend_from_slice(&permitted_ops.to_le_bytes());
+        p.push(0); // persistent=false
+        p.extend_from_slice(&[0u8; 3]); // pad
+        p.extend_from_slice(&[0u8; LABEL_LEN]); // empty label
+        p
+    }
+
+    #[test]
+    fn key_generate_aes256_creates_real_key_and_returns_handle() {
+        let (hsm, keys_dir, _tmp) = new_hsm();
+        let mut table = HandleTable::new();
+
+        let req = Request {
+            op: Op::KeyGenerate as u32,
+            session_id: 0,
+            payload: make_keygen_payload(
+                ALG_AES_256,
+                PERM_ENCRYPT | PERM_DECRYPT | PERM_MAC_GEN | PERM_MAC_VFY,
+            ),
+        };
+        let resp = handle_key_generate(&req, 51296, &mut table, &hsm);
+        assert_eq!(resp.status, StatusCode::Ok as u32);
+
+        // Response: handle(4) + pubkey_len(4) + pubkey
+        assert!(resp.payload.len() >= 8);
+        let handle = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        let pubkey_len = u32::from_le_bytes(resp.payload[4..8].try_into().unwrap());
+        assert_eq!(pubkey_len, 0, "AES is symmetric — no public key");
+        assert!(handle >= 0x0100, "dynamic handle in 0x0100+ range");
+
+        // Key file must actually exist on disk (regression test for the
+        // pre-fix TODO where the handler allocated handles without calling
+        // generate_key — mac-generate then failed with CRYPTO_ERROR).
+        assert!(keys_dir.join("gen-51296-0.bin").exists());
+    }
+
+    #[test]
+    fn key_generate_ecc_p256_returns_pubkey_in_response() {
+        let (hsm, keys_dir, _tmp) = new_hsm();
+        let mut table = HandleTable::new();
+
+        let req = Request {
+            op: Op::KeyGenerate as u32,
+            session_id: 0,
+            payload: make_keygen_payload(ALG_ECC_P256, PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY),
+        };
+        let resp = handle_key_generate(&req, 51296, &mut table, &hsm);
+        assert_eq!(resp.status, StatusCode::Ok as u32);
+
+        let pubkey_len = u32::from_le_bytes(resp.payload[4..8].try_into().unwrap()) as usize;
+        assert!(pubkey_len > 0, "EC-P256 must return a public key");
+        assert!(resp.payload.len() >= 8 + pubkey_len);
+        let pubkey = &resp.payload[8..8 + pubkey_len];
+        // SubjectPublicKeyInfo DER starts with SEQUENCE (0x30).
+        assert_eq!(pubkey[0], 0x30);
+
+        assert!(keys_dir.join("gen-51296-0.priv").exists());
+        assert!(keys_dir.join("gen-51296-0.pub").exists());
+    }
+
+    #[test]
+    fn key_generate_unsupported_alg_rejected() {
+        let (hsm, keys_dir, _tmp) = new_hsm();
+        let mut table = HandleTable::new();
+
+        let req = Request {
+            op: Op::KeyGenerate as u32,
+            session_id: 0,
+            payload: make_keygen_payload(ALG_ED25519, 0),
+        };
+        let resp = handle_key_generate(&req, 51296, &mut table, &hsm);
+        assert_eq!(
+            resp.status,
+            StatusCode::InvalidParam as u32,
+            "unsupported alg should map to InvalidParam"
+        );
+    }
+
+    #[test]
+    fn key_generate_then_mac_generate_roundtrip() {
+        // End-to-end integration test: without the fix, the dynamic handle
+        // pointed at a non-existent key_id and `mac_generate` failed with
+        // `CRYPTO_ERROR` because `get_key_info` couldn't find the key.
+        use hsm::HsmCryptoProvider;
+        let (hsm, keys_dir, _tmp) = new_hsm();
+        let mut table = HandleTable::new();
+
+        let req = Request {
+            op: Op::KeyGenerate as u32,
+            session_id: 0,
+            payload: make_keygen_payload(
+                ALG_AES_256,
+                PERM_ENCRYPT | PERM_DECRYPT | PERM_MAC_GEN | PERM_MAC_VFY,
+            ),
+        };
+        let resp = handle_key_generate(&req, 42, &mut table, &hsm);
+        assert_eq!(resp.status, StatusCode::Ok as u32);
+        let handle = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+
+        let key_id = table.get(handle).expect("handle in table").key_id.clone();
+        let mac = hsm.mac_generate(&key_id, b"hello").unwrap();
+        assert_eq!(mac.len(), 16, "AES-CMAC tag");
+        assert!(hsm.mac_verify(&key_id, b"hello", &mac).unwrap());
     }
 }

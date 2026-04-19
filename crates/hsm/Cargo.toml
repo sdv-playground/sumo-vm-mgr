@@ -26,6 +26,9 @@ rand = { version = "0.8", optional = true }
 cmac = { version = "0.7", optional = true }
 aes = { version = "0.8", optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = ["suit"]
 suit = ["dep:sumo-onboard", "dep:sumo-crypto", "dep:sumo-codec"]

@@ -126,6 +126,20 @@ pub trait HsmCryptoProvider: Send + Sync {
     /// Get key metadata including ACL information.
     fn get_key_info(&self, key_id: &str) -> Result<KeyInfo, HsmError>;
 
+    /// Generate a new key in the keystore.
+    ///
+    /// `alg` uses the VHSM_ALG_* constants as defined by the vHSM wire protocol:
+    /// - `0x0002` → AES-256 (symmetric)
+    /// - `0x0021` → ECC-P256 (asymmetric)
+    ///
+    /// Returns the public key as SubjectPublicKeyInfo DER for asymmetric
+    /// algorithms, or an empty `Vec` for symmetric ones. Implementations
+    /// may reject other algorithms with `NotSupported`.
+    fn generate_key(&self, key_id: &str, alg: u32) -> Result<Vec<u8>, HsmError> {
+        let _ = (key_id, alg);
+        Err(HsmError::NotSupported("generate_key".into()))
+    }
+
     /// Generate a PKCS#10 CSR signed by the given key. Returns DER bytes.
     /// Used for CSR-based device provisioning — device proves possession
     /// of its private key without exposing it.

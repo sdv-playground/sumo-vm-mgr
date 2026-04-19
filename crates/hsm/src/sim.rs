@@ -875,7 +875,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 ///
 /// The raw 32-byte scalar is wrapped in the ASN.1 ECPrivateKey structure
 /// with the P-256 OID, then base64-encoded as PEM.
-fn write_pem_ec_private(path: &Path, scalar: &[u8]) -> Result<(), HsmError> {
+pub(crate) fn write_pem_ec_private(path: &Path, scalar: &[u8]) -> Result<(), HsmError> {
     if scalar.len() != 32 {
         return Err(HsmError::PayloadInvalid(format!(
             "EC private key must be 32 bytes, got {}",
@@ -917,7 +917,7 @@ fn write_pem_ec_private(path: &Path, scalar: &[u8]) -> Result<(), HsmError> {
 }
 
 /// Write an EC P-256 public key as PEM (SubjectPublicKeyInfo).
-fn write_pem_ec_public(path: &Path, uncompressed: &[u8]) -> Result<(), HsmError> {
+pub(crate) fn write_pem_ec_public(path: &Path, uncompressed: &[u8]) -> Result<(), HsmError> {
     if uncompressed.len() != 65 || uncompressed[0] != 0x04 {
         return Err(HsmError::PayloadInvalid(format!(
             "EC public key must be 65 bytes (uncompressed), got {}",
