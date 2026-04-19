@@ -304,6 +304,83 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     }
 
     // =================================================================
+    // Accessors used by component_adapter::VmBackendComponent.
+    // Kept narrow on purpose — the adapter is the only outside caller.
+    // =================================================================
+
+    pub fn entity_info(&self) -> &EntityInfo {
+        &self.entity_info
+    }
+
+    pub fn component_config(&self) -> &ComponentConfig {
+        &self.config
+    }
+
+    pub fn bank_set(&self) -> BankSet {
+        self.bank_set
+    }
+
+    pub fn has_vm_service(&self) -> bool {
+        self.vm_service_socket.is_some()
+    }
+
+    pub fn has_hsm_provider(&self) -> bool {
+        self.hsm_provider.is_some()
+    }
+
+    pub fn running_bank(&self) -> Result<Bank, std::sync::PoisonError<std::sync::MutexGuard<'_, Bank>>> {
+        self.running_bank.lock().map(|g| *g)
+    }
+
+    pub fn nv_lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, NvStore<D>>, std::sync::PoisonError<std::sync::MutexGuard<'_, NvStore<D>>>>
+    {
+        self.nv.lock()
+    }
+
+    pub fn nv_lock_mut(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, NvStore<D>>, std::sync::PoisonError<std::sync::MutexGuard<'_, NvStore<D>>>>
+    {
+        self.nv.lock()
+    }
+
+    /// Returns the HSM provisioning state if an HSM provider is wired up.
+    /// `None` if no provider configured.
+    pub fn hsm_provisioning_state(&self) -> Option<Result<hsm::ProvisioningState, hsm::HsmError>> {
+        self.hsm_provider
+            .as_ref()
+            .map(|p| p.lock().unwrap().provisioning_state())
+    }
+
+    /// Drop any in-flight flash session state. Safe to call when no session
+    /// is in flight (no-op). Does NOT undo a finalized install (bank pointer
+    /// stays where it was) — that's the caller's responsibility, gated by
+    /// `FlashCaps.abortable_after_finalize`.
+    pub fn clear_flash_session(&self) {
+        *self.flash_session.lock().unwrap() = None;
+        *self.flash_transfer.lock().unwrap() = None;
+        *self.upload_phase.lock().unwrap() = None;
+        self.packages.lock().unwrap().clear();
+        self.manifests.lock().unwrap().clear();
+        self.payloads.lock().unwrap().clear();
+    }
+
+    /// True if the in-flight flash session has progressed past finalize
+    /// (i.e. the staged bank is now the next-boot bank, awaiting reset).
+    pub fn flash_is_finalized(&self) -> bool {
+        let ft = self.flash_transfer.lock().unwrap();
+        match ft.as_ref().map(|t| t.state) {
+            Some(FlashState::AwaitingReboot)
+            | Some(FlashState::Activated)
+            | Some(FlashState::Committed)
+            | Some(FlashState::RolledBack) => true,
+            _ => false,
+        }
+    }
+
+    // =================================================================
     // Separate manifest + payload upload methods (new flash path)
     // =================================================================
 
@@ -516,11 +593,11 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 *session = Some(FlashSessionState::Complete);
             }
 
-            // Flash transfer → AwaitingExit (staged, ready for finalize + reset)
+            // Flash transfer → AwaitingActivation (staged, ready for finalize + reset)
             {
                 let mut ft = self.flash_transfer.lock().unwrap();
                 if let Some(ref mut t) = *ft {
-                    t.state = FlashState::AwaitingExit;
+                    t.state = FlashState::AwaitingActivation;
                     t.package_id = id.clone();
                 }
             }
@@ -658,10 +735,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 *session = Some(FlashSessionState::Complete);
                 tracing::info!("all payloads received — ready for transferexit");
 
-                // Update flash transfer state to AwaitingExit
+                // Update flash transfer state to AwaitingActivation
                 let mut ft = self.flash_transfer.lock().unwrap();
                 if let Some(ref mut t) = *ft {
-                    t.state = FlashState::AwaitingExit;
+                    t.state = FlashState::AwaitingActivation;
                     t.image_size = image_size as u64;
                 }
             } else {
@@ -690,7 +767,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         Ok(())
     }
 
-    fn nv_bytes_to_string(data: &[u8]) -> String {
+    pub(crate) fn nv_bytes_to_string(data: &[u8]) -> String {
         let end = data.iter().position(|&c| c == 0).unwrap_or(data.len());
         String::from_utf8_lossy(&data[..end]).to_string()
     }
@@ -1246,7 +1323,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             *ft = Some(FlashTransferState {
                 transfer_id: transfer_id.clone(),
                 package_id: package_id.to_string(),
-                state: FlashState::AwaitingExit,
+                state: FlashState::AwaitingActivation,
                 image_size: 0,
             });
             return Ok(transfer_id);
@@ -1353,7 +1430,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             if let Some(ref mut t) = *ft {
                 // Reuse existing transfer from streaming upload path
                 t.package_id = package_id.to_string();
-                t.state = FlashState::AwaitingExit;
+                t.state = FlashState::AwaitingActivation;
                 t.image_size = image_size;
                 return Ok(t.transfer_id.clone());
             }
@@ -1362,7 +1439,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             *ft = Some(FlashTransferState {
                 transfer_id: transfer_id.clone(),
                 package_id: package_id.to_string(),
-                state: FlashState::AwaitingExit,
+                state: FlashState::AwaitingActivation,
                 image_size,
             });
             return Ok(transfer_id);
@@ -1506,7 +1583,20 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
         let mut ft = self.flash_transfer.lock().unwrap();
         if let Some(ref mut t) = *ft {
-            t.state = FlashState::AwaitingReset;
+            // Single-bank components (HSM): finalize *writes* the new keys
+            // immediately to the live store. There's no reboot trial — the
+            // new state is in effect now. Skip AwaitingReboot and report
+            // Activated directly so the orchestrator/viewer don't see a
+            // theatrical "awaiting reboot" step that never happens.
+            //
+            // Dual-bank (boot, hypervisor, vm1, vm2): finalize flips the
+            // next-boot bank pointer; new code starts running after the
+            // orchestrator-driven `ecu_reset`.
+            t.state = if self.config.single_bank {
+                FlashState::Activated
+            } else {
+                FlashState::AwaitingReboot
+            };
         }
         Ok(())
     }
@@ -1818,15 +1908,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 // DID helpers (adapted from old models.rs)
 // ---------------------------------------------------------------------------
 
-struct DidEntry {
-    id: &'static str,
-    did: u16,
-    name: &'static str,
-    data_type: &'static str,
-    writable: bool,
+pub(crate) struct DidEntry {
+    pub(crate) id: &'static str,
+    pub(crate) did: u16,
+    pub(crate) name: &'static str,
+    pub(crate) data_type: &'static str,
+    pub(crate) writable: bool,
 }
 
-static DID_REGISTRY: &[DidEntry] = &[
+pub(crate) static DID_REGISTRY: &[DidEntry] = &[
     DidEntry { id: "spare_part_number", did: did::DID_SPARE_PART_NUMBER, name: "Spare Part Number", data_type: "string", writable: false },
     DidEntry { id: "ecu_sw_number", did: did::DID_ECU_SW_NUMBER, name: "ECU Software Number", data_type: "string", writable: false },
     DidEntry { id: "fw_version", did: did::DID_FW_VERSION, name: "Firmware Version", data_type: "string", writable: false },
@@ -1852,7 +1942,7 @@ static DID_REGISTRY: &[DidEntry] = &[
     DidEntry { id: "heartbeat_seq", did: did::DID_HEARTBEAT_SEQ, name: "Heartbeat Seq", data_type: "uint32", writable: false },
 ];
 
-fn resolve_param(param_id: &str) -> Option<(u16, Option<&'static DidEntry>)> {
+pub(crate) fn resolve_param(param_id: &str) -> Option<(u16, Option<&'static DidEntry>)> {
     if let Some(entry) = DID_REGISTRY.iter().find(|d| d.id == param_id) {
         return Some((entry.did, Some(entry)));
     }
@@ -1867,7 +1957,7 @@ fn resolve_param(param_id: &str) -> Option<(u16, Option<&'static DidEntry>)> {
     None
 }
 
-fn did_value_to_json(_did_num: u16, value: &[u8], reg: Option<&DidEntry>) -> serde_json::Value {
+pub(crate) fn did_value_to_json(_did_num: u16, value: &[u8], reg: Option<&DidEntry>) -> serde_json::Value {
     let data_type = reg.map(|r| r.data_type).unwrap_or("bytes");
     match data_type {
         "bool" => serde_json::Value::Bool(value.first().copied().unwrap_or(0) != 0),

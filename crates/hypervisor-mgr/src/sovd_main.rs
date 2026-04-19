@@ -8,13 +8,18 @@ use nv_store::types::{BankSet, NvBootState};
 
 use sovd_core::DiagnosticBackend;
 
-use hypervisor_mgr::backend::{VmBackend, ComponentConfig};
+use hypervisor_mgr::backend::{ComponentConfig, VmBackend};
+use hypervisor_mgr::component_adapter::VmBackendComponent;
+use hypervisor_mgr::diag_backend::ComponentDiagBackend;
 use hypervisor_mgr::sovd::security::TestSecurityProvider;
 use hypervisor_mgr::suit_provider::SuitProvider;
 
+use machine_mgr::{Machine, MachineRegistry};
+use sovd_core::EntityInfo;
+
 use axum::response::IntoResponse;
-use hsm::{HsmProvider, KeyRole};
 use hsm::sim::SimHsm;
+use hsm::{HsmProvider, KeyRole};
 
 #[tokio::main]
 async fn main() {
@@ -27,11 +32,15 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: vm-sovd <nv-store-path> <provisioning-authority-path> [options] [bind-addr]");
+        eprintln!(
+            "Usage: vm-sovd <nv-store-path> <provisioning-authority-path> [options] [bind-addr]"
+        );
         eprintln!();
         eprintln!("Positional:");
         eprintln!("  nv-store-path              NV store file (created if missing)");
-        eprintln!("  provisioning-authority-path COSE_Key public key for HSM key envelope validation");
+        eprintln!(
+            "  provisioning-authority-path COSE_Key public key for HSM key envelope validation"
+        );
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --images-dir <path>        Directory for A/B bank image files (enables real image OTA)");
@@ -43,7 +52,9 @@ async fn main() {
         eprintln!("  --boot-mount <path>        Boot partition mount point (default: /mnt/boot)");
         eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
         eprintln!();
-        eprintln!("Software authority and device decryption keys are loaded from HSM after provisioning.");
+        eprintln!(
+            "Software authority and device decryption keys are loaded from HSM after provisioning."
+        );
         eprintln!("Firmware flash is rejected until HSM is provisioned.");
         eprintln!();
         eprintln!("Examples:");
@@ -98,7 +109,10 @@ async fn main() {
 
     // Load provisioning authority (validates HSM key envelopes)
     let provisioning_authority = std::fs::read(&provisioning_authority_path).unwrap_or_else(|e| {
-        eprintln!("failed to read provisioning authority {}: {e}", provisioning_authority_path.display());
+        eprintln!(
+            "failed to read provisioning authority {}: {e}",
+            provisioning_authority_path.display()
+        );
         std::process::exit(1);
     });
 
@@ -168,7 +182,9 @@ async fn main() {
                 }
             }
         } else {
-            tracing::info!("HSM not yet provisioned — firmware flash disabled until HSM provisioning");
+            tracing::info!(
+                "HSM not yet provisioned — firmware flash disabled until HSM provisioning"
+            );
         }
 
         // Ensure device key pair exists (generates on first boot)
@@ -181,24 +197,45 @@ async fn main() {
 
     // Create one backend per bank set
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
-        ("hypervisor", BankSet::Hypervisor, ComponentConfig {
-            entity_type: "hpc".into(), ..ComponentConfig::default()
-        }),
+        (
+            "hypervisor",
+            BankSet::Hypervisor,
+            ComponentConfig {
+                entity_type: "hpc".into(),
+                ..ComponentConfig::default()
+            },
+        ),
         ("vm1", BankSet::Vm1, ComponentConfig::default()),
         ("vm2", BankSet::Vm2, ComponentConfig::default()),
-        ("hsm", BankSet::Hsm, ComponentConfig {
-            supports_rollback: false,
-            single_bank: true,
-            entity_type: "hsm".into(),
-            ..ComponentConfig::default()
-        }),
-        ("boot", BankSet::Boot, ComponentConfig {
-            entity_type: "boot_image".into(),
-            ..ComponentConfig::default()
-        }),
+        (
+            "hsm",
+            BankSet::Hsm,
+            ComponentConfig {
+                supports_rollback: false,
+                single_bank: true,
+                entity_type: "hsm".into(),
+                ..ComponentConfig::default()
+            },
+        ),
+        (
+            "boot",
+            BankSet::Boot,
+            ComponentConfig {
+                entity_type: "boot_image".into(),
+                ..ComponentConfig::default()
+            },
+        ),
     ];
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    let mut machine_builder = MachineRegistry::builder(EntityInfo {
+        id: "vehicle".into(),
+        name: "Vehicle".into(),
+        entity_type: "vehicle".into(),
+        description: None,
+        href: "/vehicle/v1".into(),
+        status: None,
+    });
     for (id, set, config) in components {
         let mut backend = VmBackend::with_options(
             set,
@@ -230,67 +267,75 @@ async fn main() {
         // Wire IFS activator into the boot backend
         if set == BankSet::Boot {
             if let Some(ref dev) = boot_device {
-                let activator = hypervisor_mgr::ifs::dev::DevIfsActivator::new(
-                    dev.clone(),
-                    boot_mount.clone(),
-                );
+                let activator =
+                    hypervisor_mgr::ifs::dev::DevIfsActivator::new(dev.clone(), boot_mount.clone());
                 backend = backend.with_ifs_activator(Arc::new(activator));
             }
         }
-        backends.insert(id.to_string(), Arc::new(backend));
+        // Wrap as ComponentDiagBackend so wired Component methods route through
+        // machine-mgr; everything else falls through to the underlying VmBackend.
+        let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);
+        let mut component_inner = VmBackendComponent::new(backend_arc.clone());
+        // Wire CSR signing for the HSM component so the route below can
+        // call machine.component("hsm").get_csr() instead of building a
+        // transient SimHsm at request time.
+        if set == BankSet::Hsm {
+            component_inner =
+                component_inner.with_csr_keystore(hsm_keystore_path.clone(), hsm_port);
+        }
+        let component: Arc<dyn machine_mgr::Component> = Arc::new(component_inner);
+
+        machine_builder = machine_builder.with_arc(component.clone());
+
+        let fallback: Arc<dyn DiagnosticBackend> = backend_arc.clone();
+        let diag = ComponentDiagBackend::new(component, fallback);
+        backends.insert(id.to_string(), Arc::new(diag) as Arc<dyn DiagnosticBackend>);
     }
+
+    let machine: Arc<dyn Machine> = Arc::new(machine_builder.build());
 
     let state = sovd_api::AppState::new(backends);
     let router = sovd_api::create_router(state);
 
-    // Add CSR endpoint for device provisioning (gated by UNPROVISIONED state)
-    let csr_hsm = hsm_provider.clone();
-    let csr_keystore = hsm_keystore_path.clone();
-    let csr_port = hsm_port;
+    // CSR endpoint for device provisioning. Routes through the Machine so
+    // the actual CSR-signing logic lives in `VmBackendComponent::get_csr`,
+    // not inline here.
+    let csr_machine = machine.clone();
     let router = router.route(
         "/vehicle/v1/components/hsm/csr",
         axum::routing::get(move || {
-            let hsm = csr_hsm.clone();
-            let keystore = csr_keystore.clone();
+            let machine = csr_machine.clone();
             async move {
-                let Some(hsm) = hsm else {
+                let Some(comp) = machine.component("hsm") else {
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "HSM provider not configured".to_string(),
-                    ).into_response();
+                        "no hsm component".to_string(),
+                    )
+                        .into_response();
                 };
-                let state = hsm.lock().unwrap().provisioning_state();
-                match state {
-                    Ok(hsm::ProvisioningState::Provisioned) => {
-                        (axum::http::StatusCode::FORBIDDEN, "device already provisioned".to_string())
+                match comp.get_csr().await {
+                    Ok(csr) => {
+                        tracing::info!("CSR generated for device-decrypt ({} bytes)", csr.0.len());
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/pkcs10")],
+                            csr.0.to_vec(),
+                        )
                             .into_response()
                     }
-                    Ok(hsm::ProvisioningState::Unprovisioned) => {
-                        // Create a temporary crypto provider to generate the CSR
-                        let tmp_hsm = SimHsm::new(
-                            PathBuf::from("unused"),
-                            keystore,
-                            csr_port,
-                            Vec::new(),
-                        );
-                        use hsm::HsmCryptoProvider;
-                        match tmp_hsm.generate_csr("device-decrypt", "cvc-vm-device") {
-                            Ok(csr_der) => {
-                                tracing::info!("CSR generated for device-decrypt ({} bytes)", csr_der.len());
-                                (
-                                    [(axum::http::header::CONTENT_TYPE, "application/pkcs10")],
-                                    csr_der,
-                                ).into_response()
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "CSR generation failed");
-                                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("CSR error: {e}"))
-                                    .into_response()
-                            }
-                        }
+                    Err(machine_mgr::MachineError::PolicyRejected(s)) => {
+                        (axum::http::StatusCode::FORBIDDEN, s).into_response()
                     }
+                    Err(machine_mgr::MachineError::NotSupported(_)) => (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "CSR not configured".to_string(),
+                    )
+                        .into_response(),
                     Err(e) => {
-                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("HSM error: {e}"))
+                        tracing::error!(error = %e, "CSR generation failed");
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("CSR error: {e}"),
+                        )
                             .into_response()
                     }
                 }
@@ -307,8 +352,18 @@ async fn main() {
 
     tracing::info!("vm-sovd listening on {bind_addr}");
     tracing::info!("  NV store: {}", nv_path.display());
-    tracing::info!("  provisioning authority: {}", provisioning_authority_path.display());
-    tracing::info!("  software authority: {}", if manifest_provider.has_software_authority() { "loaded from HSM" } else { "not yet available (awaiting HSM provisioning)" });
+    tracing::info!(
+        "  provisioning authority: {}",
+        provisioning_authority_path.display()
+    );
+    tracing::info!(
+        "  software authority: {}",
+        if manifest_provider.has_software_authority() {
+            "loaded from HSM"
+        } else {
+            "not yet available (awaiting HSM provisioning)"
+        }
+    );
     if let Some(ref dir) = images_dir {
         tracing::info!("  images dir: {} (real image OTA enabled)", dir.display());
     }

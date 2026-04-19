@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 nv-store = { path = "../nv-store" }
+machine-mgr = { path = "../machine-mgr" }
 sha2 = "0.10"
 crc32fast = "1"
 bytes = "1"
