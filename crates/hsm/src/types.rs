@@ -124,3 +124,104 @@ pub struct HsmStatus {
     pub keystore_path: std::path::PathBuf,
     pub vsock_port: u16,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hsm_error_display_covers_every_variant() {
+        // One case per variant — catches accidental duplicate/wrong arm additions.
+        assert_eq!(format!("{}", HsmError::NotProvisioned), "HSM not provisioned");
+        assert_eq!(format!("{}", HsmError::AlreadyProvisioned), "HSM already provisioned");
+        assert_eq!(format!("{}", HsmError::NotRunning), "HSM service not running");
+        assert_eq!(format!("{}", HsmError::AlreadyRunning), "HSM service already running");
+        assert_eq!(
+            format!("{}", HsmError::KeystoreError("disk full".into())),
+            "keystore error: disk full"
+        );
+        assert_eq!(
+            format!("{}", HsmError::ProcessError("exited 1".into())),
+            "process error: exited 1"
+        );
+        assert_eq!(
+            format!("{}", HsmError::ConfigError("bad toml".into())),
+            "config error: bad toml"
+        );
+        assert_eq!(
+            format!("{}", HsmError::EnvelopeInvalid("no tag".into())),
+            "invalid SUIT envelope: no tag"
+        );
+        assert_eq!(
+            format!("{}", HsmError::PayloadInvalid("bad cbor".into())),
+            "invalid key material payload: bad cbor"
+        );
+        assert_eq!(
+            format!("{}", HsmError::DecryptionFailed("tag mismatch".into())),
+            "decryption failed: tag mismatch"
+        );
+        assert_eq!(
+            format!("{}", HsmError::RollbackRejected { current: 7, attempted: 3 }),
+            "rollback rejected: security_version 3 <= current 7"
+        );
+        assert_eq!(
+            format!("{}", HsmError::NotSupported("alg".into())),
+            "not supported: alg"
+        );
+        assert_eq!(
+            format!("{}", HsmError::CryptoError("sig".into())),
+            "crypto error: sig"
+        );
+        assert_eq!(
+            format!("{}", HsmError::KeyNotFound("abc".into())),
+            "key not found: abc"
+        );
+    }
+
+    #[test]
+    fn hsm_error_is_std_error() {
+        fn assert_err<E: std::error::Error>(_e: &E) {}
+        assert_err(&HsmError::NotProvisioned);
+    }
+
+    #[test]
+    fn keyrole_slot_index_matches_repr_u8() {
+        assert_eq!(KeyRole::Kek.slot_index(), 0);
+        assert_eq!(KeyRole::SoftwareAuthority.slot_index(), 1);
+        assert_eq!(KeyRole::DeviceDecryption.slot_index(), 2);
+        assert_eq!(KeyRole::EcuSigning.slot_index(), 3);
+    }
+
+    #[test]
+    fn keyrole_key_id_is_unique_per_role() {
+        use std::collections::HashSet;
+        let roles = [
+            KeyRole::Kek,
+            KeyRole::SoftwareAuthority,
+            KeyRole::DeviceDecryption,
+            KeyRole::EcuSigning,
+        ];
+        let ids: HashSet<_> = roles.iter().map(|r| r.key_id()).collect();
+        assert_eq!(ids.len(), roles.len(), "key_id() must be unique per role");
+
+        // Freeze the wire format — these are used in filenames on disk.
+        assert_eq!(KeyRole::Kek.key_id(), "kek");
+        assert_eq!(KeyRole::SoftwareAuthority.key_id(), "sw-authority");
+        assert_eq!(KeyRole::DeviceDecryption.key_id(), "device-decrypt");
+        assert_eq!(KeyRole::EcuSigning.key_id(), "ecu-signing");
+    }
+
+    #[test]
+    fn keytype_display_matches_crypto_names() {
+        assert_eq!(format!("{}", KeyType::EcP256), "EC-P256");
+        assert_eq!(format!("{}", KeyType::Aes256), "AES-256");
+    }
+
+    #[test]
+    fn provisioning_state_equality_and_debug() {
+        assert_eq!(ProvisioningState::Unprovisioned, ProvisioningState::Unprovisioned);
+        assert_ne!(ProvisioningState::Unprovisioned, ProvisioningState::Provisioned);
+        // Debug format is used in logs — make sure it doesn't accidentally silently change.
+        assert_eq!(format!("{:?}", ProvisioningState::Provisioned), "Provisioned");
+    }
+}

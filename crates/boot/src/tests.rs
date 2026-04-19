@@ -666,3 +666,138 @@ fn device_needs_simulator() {
     assert!(!DeviceConfig::Network { mac: None, ssh_port: None }.needs_simulator());
     assert!(!DeviceConfig::Console.needs_simulator());
 }
+
+// --- Arch enum ---
+
+#[test]
+fn arch_from_str_accepts_common_aliases() {
+    assert_eq!(Arch::from_str("aarch64"), Some(Arch::Aarch64));
+    assert_eq!(Arch::from_str("arm64"), Some(Arch::Aarch64));
+    assert_eq!(Arch::from_str("x86_64"), Some(Arch::X86_64));
+    assert_eq!(Arch::from_str("amd64"), Some(Arch::X86_64));
+    assert_eq!(Arch::from_str("riscv64"), None);
+    assert_eq!(Arch::from_str(""), None);
+}
+
+#[test]
+fn arch_selects_distinct_qemu_binary_per_arch() {
+    assert_ne!(Arch::Aarch64.qemu_binary(), Arch::X86_64.qemu_binary());
+    assert!(Arch::Aarch64.qemu_binary().contains("aarch64"));
+    assert!(Arch::X86_64.qemu_binary().contains("x86_64"));
+}
+
+#[test]
+fn arch_machine_type_console_and_cpu_defaults_are_distinct() {
+    // These go straight onto the QEMU command line — smoke-test they're non-empty and differ.
+    for (a, b) in [
+        (Arch::Aarch64.machine_type(), Arch::X86_64.machine_type()),
+        (Arch::Aarch64.console_device(), Arch::X86_64.console_device()),
+        (Arch::Aarch64.default_cpu(), Arch::X86_64.default_cpu()),
+    ] {
+        assert!(!a.is_empty());
+        assert!(!b.is_empty());
+        assert_ne!(a, b);
+    }
+}
+
+#[test]
+fn arch_virtio_device_uses_expected_transport_suffix() {
+    assert_eq!(Arch::Aarch64.virtio_device("blk"), "virtio-blk-device");
+    assert_eq!(Arch::X86_64.virtio_device("net"), "virtio-net-pci");
+}
+
+#[test]
+fn arch_reverse_disk_order_true_only_on_aarch64() {
+    assert!(Arch::Aarch64.reverse_disk_order());
+    assert!(!Arch::X86_64.reverse_disk_order());
+}
+
+#[test]
+fn vm_profile_arch_default_is_aarch64() {
+    let toml = r#"
+[vm]
+bank_set = "vm1"
+"#;
+    let profile = VmProfile::from_toml(toml).unwrap();
+    assert_eq!(profile.arch(), Arch::Aarch64);
+}
+
+#[test]
+fn vm_profile_arch_parses_x86_64() {
+    let toml = r#"
+[vm]
+bank_set = "vm1"
+arch = "x86_64"
+"#;
+    let profile = VmProfile::from_toml(toml).unwrap();
+    assert_eq!(profile.arch(), Arch::X86_64);
+}
+
+#[test]
+fn vm_profile_unknown_arch_falls_back_to_aarch64() {
+    // arch() is the only consumer and is defined to fall back on unknown strings.
+    let toml = r#"
+[vm]
+bank_set = "vm1"
+arch = "potato"
+"#;
+    let profile = VmProfile::from_toml(toml).unwrap();
+    assert_eq!(profile.arch(), Arch::Aarch64);
+}
+
+// --- DeviceConfig::ivshmem_label / ivshmem_magic ---
+
+#[test]
+fn ivshmem_label_for_health_time_and_can() {
+    use crate::config::DeviceConfig;
+    assert_eq!(
+        DeviceConfig::Health { backend: "simulated".into() }.ivshmem_label().as_deref(),
+        Some("health")
+    );
+    assert_eq!(
+        DeviceConfig::Time { backend: "simulated".into() }.ivshmem_label().as_deref(),
+        Some("time")
+    );
+    assert_eq!(
+        DeviceConfig::Can { index: 3, backend: "simulated".into(), interface: None }
+            .ivshmem_label()
+            .as_deref(),
+        Some("can3")
+    );
+}
+
+#[test]
+fn ivshmem_label_none_for_non_shm_devices() {
+    use crate::config::DeviceConfig;
+    assert!(DeviceConfig::Hsm { keystore: None, keygen_bin: None, port: 1 }.ivshmem_label().is_none());
+    assert!(DeviceConfig::Network { mac: None, ssh_port: None }.ivshmem_label().is_none());
+    assert!(DeviceConfig::Console.ivshmem_label().is_none());
+    // CAN passthrough: needs_ivshmem=false → label=None
+    assert!(DeviceConfig::Can {
+        index: 0,
+        backend: "host-passthrough".into(),
+        interface: Some("vcan0".into())
+    }
+    .ivshmem_label()
+    .is_none());
+}
+
+#[test]
+fn ivshmem_magic_matches_guest_driver_constants() {
+    // These magics are read by the guest drivers — wire-format-freeze check.
+    use crate::config::DeviceConfig;
+    assert_eq!(
+        DeviceConfig::Health { backend: "simulated".into() }.ivshmem_magic(),
+        Some(0x48544C48) // "HLTH"
+    );
+    assert_eq!(
+        DeviceConfig::Time { backend: "simulated".into() }.ivshmem_magic(),
+        Some(0x54494D45) // "TIME"
+    );
+    assert_eq!(
+        DeviceConfig::Can { index: 0, backend: "simulated".into(), interface: None }
+            .ivshmem_magic(),
+        Some(0x4E414356) // "VCAN"
+    );
+    assert!(DeviceConfig::Console.ivshmem_magic().is_none());
+}

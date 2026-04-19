@@ -76,3 +76,30 @@ pub trait VmRunner: Send {
         self.stop(handle)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runner_error_display_covers_all_variants() {
+        let ioe = RunnerError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "x"));
+        let cfg = RunnerError::Config("bad config".into());
+        let proc = RunnerError::ProcessFailed("spawn failed".into());
+        assert!(ioe.to_string().contains("I/O"));
+        assert!(cfg.to_string().contains("config"));
+        assert!(proc.to_string().contains("process"));
+    }
+
+    #[test]
+    fn runner_error_from_io_error() {
+        let e: RunnerError = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope").into();
+        assert!(matches!(e, RunnerError::Io(_)));
+    }
+
+    #[test]
+    fn runner_error_is_std_error() {
+        fn take<E: std::error::Error>(_: E) {}
+        take(RunnerError::Config("x".into()));
+    }
+}

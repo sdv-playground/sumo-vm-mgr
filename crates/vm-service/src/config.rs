@@ -550,4 +550,167 @@ extra_cmdline: "debug"
         assert_eq!(merged.images.kernel.as_deref(), Some("vmlinuz-new"));
         assert_eq!(merged.images.rootfs.as_deref(), Some("rootfs.img")); // unchanged
     }
+
+    // -----------------------------------------------------------------
+    // Top-level VmServiceConfig parsing
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn vm_service_config_parses_minimal_yaml() {
+        let yaml = r#"
+socket: /tmp/vm-service.sock
+vms:
+  vm1:
+    backend: dummy
+    image_dir: /var/lib/vms/vm1
+"#;
+        let cfg: VmServiceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.socket, PathBuf::from("/tmp/vm-service.sock"));
+        assert_eq!(cfg.vms.len(), 1);
+        let vm1 = cfg.vms.get("vm1").unwrap();
+        assert!(matches!(vm1.backend, BackendType::Dummy));
+        // Defaults
+        assert_eq!(vm1.cpus, default_cpus());
+        assert_eq!(vm1.ram_mb, default_ram());
+        assert!(!vm1.auto_start);
+    }
+
+    #[test]
+    fn vm_definition_honors_explicit_fields() {
+        let yaml = r#"
+socket: /tmp/s.sock
+vms:
+  hostvm:
+    backend: qemu
+    os_type: linux
+    arch: amd64
+    cpus: 2
+    ram_mb: 1024
+    image_dir: /data/images/host
+    auto_start: true
+"#;
+        let cfg: VmServiceConfig = serde_yaml::from_str(yaml).unwrap();
+        let v = cfg.vms.get("hostvm").unwrap();
+        assert!(matches!(v.backend, BackendType::Qemu));
+        assert_eq!(v.cpus, 2);
+        assert_eq!(v.ram_mb, 1024);
+        assert!(v.auto_start);
+    }
+
+    #[test]
+    fn vm_service_config_missing_required_field_errors() {
+        // `socket` is required
+        let yaml = r#"
+vms:
+  vm1:
+    backend: dummy
+    image_dir: /x
+"#;
+        let err = serde_yaml::from_str::<VmServiceConfig>(yaml).err();
+        assert!(err.is_some(), "missing socket should fail");
+    }
+
+    // -----------------------------------------------------------------
+    // VmDefinition accessor methods
+    // -----------------------------------------------------------------
+
+    fn minimal_vm(image_dir: &str) -> VmDefinition {
+        let yaml = format!(
+            r#"
+backend: dummy
+image_dir: {image_dir}
+"#
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn arch_defaults_to_aarch64() {
+        let v = minimal_vm("/x");
+        assert_eq!(v.arch(), Arch::Aarch64);
+    }
+
+    #[test]
+    fn arch_parses_from_arch_field() {
+        let y = r#"backend: dummy
+image_dir: /x
+arch: amd64
+"#;
+        let v: VmDefinition = serde_yaml::from_str(y).unwrap();
+        assert_eq!(v.arch(), Arch::X86_64);
+    }
+
+    #[test]
+    fn shutdown_timeout_has_sensible_default() {
+        let v = minimal_vm("/x");
+        let t = v.shutdown_timeout_secs();
+        assert!(t > 0 && t <= 120, "sane default in seconds, got {t}");
+    }
+
+    #[test]
+    fn ssh_port_absent_when_no_ssh_device() {
+        let v = minimal_vm("/x");
+        assert_eq!(v.ssh_port(), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Arch methods
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn arch_from_str_accepts_common_aliases() {
+        for s in ["amd64", "x86_64"] {
+            assert_eq!(Arch::from_str(s), Some(Arch::X86_64), "{s}");
+        }
+        for s in ["aarch64", "arm64"] {
+            assert_eq!(Arch::from_str(s), Some(Arch::Aarch64), "{s}");
+        }
+        assert_eq!(Arch::from_str("ppc64"), None);
+    }
+
+    #[test]
+    fn arch_provides_qemu_binary_and_machine_type() {
+        // Smoke: values are non-empty for both supported arches.
+        for a in &[Arch::X86_64, Arch::Aarch64] {
+            assert!(!a.qemu_binary().is_empty());
+            assert!(!a.machine_type().is_empty());
+            assert!(!a.default_cpu().is_empty());
+            assert!(!a.console_device().is_empty());
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Backend + OsType enums
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn backend_type_deserializes_snake_case() {
+        for (s, want) in [
+            ("qemu", BackendType::Qemu),
+            ("qnx", BackendType::Qnx),
+            ("dummy", BackendType::Dummy),
+        ] {
+            let yaml = format!("backend: {s}\nimage_dir: /x\n");
+            let v: VmDefinition = serde_yaml::from_str(&yaml).unwrap();
+            assert!(std::mem::discriminant(&v.backend) == std::mem::discriminant(&want));
+        }
+    }
+
+    #[test]
+    fn os_type_defaults_to_linux() {
+        let v = minimal_vm("/x");
+        assert!(matches!(v.os_type, OsType::Linux));
+    }
+
+    // -----------------------------------------------------------------
+    // VmBankConfig::from_dir — positive + negative
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bank_config_from_dir_rejects_malformed_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vm-config.yaml"), "this: is: broken::").unwrap();
+        // Malformed yaml → from_dir returns None rather than panicking.
+        assert!(VmBankConfig::from_dir(dir.path()).is_none());
+    }
 }

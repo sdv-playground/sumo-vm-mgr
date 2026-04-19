@@ -192,3 +192,205 @@ pub fn write_did<D: BlockDevice>(
     nv.write_runtime(set, active, &mut runtime)?;
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nv_store::block::MemBlockDevice;
+    use nv_store::store::MIN_NV_DEVICE_SIZE;
+
+    fn make_nv() -> NvStore<MemBlockDevice> {
+        NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize))
+    }
+
+    fn init_boot_state(nv: &mut NvStore<MemBlockDevice>) {
+        let mut state = NvBootState::default();
+        // Bank A active, committed — applies to all sets by default.
+        for b in &mut state.banks {
+            b.active_bank = Bank::A;
+            b.committed = true;
+        }
+        nv.write_boot_state(&mut state).unwrap();
+    }
+
+    #[test]
+    fn didvalue_as_str_trims_nul_padding() {
+        let mut bytes = vec![0u8; 16];
+        bytes[..3].copy_from_slice(b"VIN");
+        let v = DidValue::Bytes(bytes);
+        assert_eq!(v.as_str(), Some("VIN"));
+    }
+
+    #[test]
+    fn didvalue_as_str_no_nul_uses_full_slice() {
+        let v = DidValue::Bytes(b"ABC".to_vec());
+        assert_eq!(v.as_str(), Some("ABC"));
+    }
+
+    #[test]
+    fn didvalue_as_str_rejects_invalid_utf8() {
+        let v = DidValue::Bytes(vec![0xFF, 0xFE]);
+        assert!(v.as_str().is_none());
+    }
+
+    #[test]
+    fn didvalue_as_str_notfound_returns_none() {
+        assert!(DidValue::NotFound.as_str().is_none());
+    }
+
+    #[test]
+    fn read_did_with_uninitialized_nv_returns_notfound() {
+        // No boot state written yet — every read should short-circuit.
+        let nv = make_nv();
+        assert_eq!(
+            read_did(&nv, BankSet::Vm1, DID_VIN, None),
+            DidValue::NotFound
+        );
+    }
+
+    #[test]
+    fn read_did_fw_meta_returns_spare_part_number() {
+        let mut nv = make_nv();
+        init_boot_state(&mut nv);
+
+        let mut meta = NvFwMeta::default();
+        meta.spare_part_number[..5].copy_from_slice(b"SP-42");
+        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+
+        match read_did(&nv, BankSet::Vm1, DID_SPARE_PART_NUMBER, None) {
+            DidValue::Bytes(b) => assert_eq!(&b[..5], b"SP-42"),
+            DidValue::NotFound => panic!("expected bytes"),
+        }
+    }
+
+    #[test]
+    fn read_did_factory_returns_vin() {
+        let mut nv = make_nv();
+        init_boot_state(&mut nv);
+
+        let mut f = NvFactory::default();
+        f.vin[..17].copy_from_slice(b"WBALI00000TEST001");
+        nv.write_factory(&mut f).unwrap();
+
+        match read_did(&nv, BankSet::Vm1, DID_VIN, None) {
+            DidValue::Bytes(b) => assert_eq!(&b, b"WBALI00000TEST001"),
+            DidValue::NotFound => panic!("expected VIN bytes"),
+        }
+    }
+
+    #[test]
+    fn read_did_dynamic_active_bank() {
+        let mut nv = make_nv();
+        init_boot_state(&mut nv);
+
+        match read_did(&nv, BankSet::Vm1, DID_ACTIVE_BANK, None) {
+            DidValue::Bytes(b) => assert_eq!(b, b"A"),
+            DidValue::NotFound => panic!("expected active bank letter"),
+        }
+        match read_did(&nv, BankSet::Vm1, DID_ACTIVE_BANK, Some(Bank::B)) {
+            DidValue::Bytes(b) => assert_eq!(b, b"B"),
+            DidValue::NotFound => panic!("expected B"),
+        }
+    }
+
+    #[test]
+    fn read_did_dynamic_committed_reflects_flag() {
+        let mut nv = make_nv();
+        let mut state = NvBootState::default();
+        let idx = BankSet::Vm1 as usize;
+        state.banks[idx].active_bank = Bank::A;
+        state.banks[idx].committed = false;
+        state.banks[idx].boot_count = 3;
+        nv.write_boot_state(&mut state).unwrap();
+
+        let committed = read_did(&nv, BankSet::Vm1, DID_COMMITTED, None);
+        assert_eq!(committed, DidValue::Bytes(vec![0]));
+
+        let boot_count = read_did(&nv, BankSet::Vm1, DID_BOOT_COUNT, None);
+        assert_eq!(boot_count, DidValue::Bytes(vec![3]));
+    }
+
+    #[test]
+    fn read_did_dynamic_security_ver_without_fw_meta_is_zero() {
+        let mut nv = make_nv();
+        init_boot_state(&mut nv);
+        let v = read_did(&nv, BankSet::Vm1, DID_CURRENT_SECURITY_VER, None);
+        assert_eq!(v, DidValue::Bytes(0u32.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn read_did_dynamic_security_ver_uses_fw_meta() {
+        let mut nv = make_nv();
+        init_boot_state(&mut nv);
+        let mut meta = NvFwMeta::default();
+        meta.fw_secver = 0x1234_5678;
+        meta.min_security_ver = 0x0000_00AB;
+        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+
+        let cur = read_did(&nv, BankSet::Vm1, DID_CURRENT_SECURITY_VER, None);
+        assert_eq!(cur, DidValue::Bytes(0x1234_5678u32.to_le_bytes().to_vec()));
+
+        let min = read_did(&nv, BankSet::Vm1, DID_MIN_SECURITY_VER, None);
+        assert_eq!(min, DidValue::Bytes(0x0000_00ABu32.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn read_did_unknown_did_returns_notfound() {
+        let mut nv = make_nv();
+        init_boot_state(&mut nv);
+        let v = read_did(&nv, BankSet::Vm1, 0x1234, None);
+        assert_eq!(v, DidValue::NotFound);
+    }
+
+    #[test]
+    fn write_did_then_read_did_roundtrip_via_runtime() {
+        let mut nv = make_nv();
+        init_boot_state(&mut nv);
+
+        let ok = write_did(&mut nv, BankSet::Vm1, DID_SYSTEM_NAME, b"vm1-linux").unwrap();
+        assert!(ok);
+
+        match read_did(&nv, BankSet::Vm1, DID_SYSTEM_NAME, None) {
+            DidValue::Bytes(b) => assert_eq!(&b, b"vm1-linux"),
+            DidValue::NotFound => panic!("runtime did not mask fw_meta read"),
+        }
+    }
+
+    #[test]
+    fn write_did_updates_existing_did_in_place() {
+        let mut nv = make_nv();
+        init_boot_state(&mut nv);
+
+        write_did(&mut nv, BankSet::Vm1, 0xFD10, b"old").unwrap();
+        write_did(&mut nv, BankSet::Vm1, 0xFD10, b"newer-value").unwrap();
+
+        let v = read_did(&nv, BankSet::Vm1, 0xFD10, None);
+        assert_eq!(v, DidValue::Bytes(b"newer-value".to_vec()));
+
+        // Should still be a single DID (update in place, not append).
+        let rt = nv.read_runtime(BankSet::Vm1, Bank::A).unwrap();
+        let count = (0..rt.did_count as usize)
+            .filter(|i| rt.dids[*i].did == 0xFD10)
+            .count();
+        assert_eq!(count, 1, "duplicate DID entry after update");
+    }
+
+    #[test]
+    fn write_did_truncates_payload_to_32_bytes() {
+        let mut nv = make_nv();
+        init_boot_state(&mut nv);
+        let payload = vec![0xAAu8; 50];
+        write_did(&mut nv, BankSet::Vm1, 0xFD11, &payload).unwrap();
+        match read_did(&nv, BankSet::Vm1, 0xFD11, None) {
+            DidValue::Bytes(b) => assert_eq!(b.len(), 32),
+            DidValue::NotFound => panic!("expected truncated bytes"),
+        }
+    }
+
+    #[test]
+    fn write_did_without_boot_state_returns_false() {
+        let mut nv = make_nv();
+        let ok = write_did(&mut nv, BankSet::Vm1, 0xFD12, b"x").unwrap();
+        assert!(!ok);
+    }
+}

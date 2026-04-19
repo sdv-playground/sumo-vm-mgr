@@ -6,3 +6,6 @@ description = "Encrypted key metadata persistence with pluggable backends"
 
 [dependencies]
 tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

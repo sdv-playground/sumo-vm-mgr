@@ -103,3 +103,61 @@ pub fn seqcount_write(shm: &dyn SharedMemory, seq_offset: usize, write_fn: impl 
     shm.fence(Ordering::Release);
     shm.write_u32(seq_offset, seq.wrapping_add(2)); // even = done
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::mem::MemSharedMemory;
+
+    #[test]
+    fn transport_error_display_io_variant() {
+        let e = TransportError::Io(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        assert!(format!("{e}").contains("boom"));
+    }
+
+    #[test]
+    fn transport_error_display_out_of_bounds() {
+        let e = TransportError::OutOfBounds { offset: 10, len: 4, size: 8 };
+        let s = format!("{e}");
+        assert!(s.contains("offset=10"));
+        assert!(s.contains("len=4"));
+        assert!(s.contains("size=8"));
+    }
+
+    #[test]
+    fn transport_error_is_std_error() {
+        fn as_error(_e: &dyn std::error::Error) {}
+        let e = TransportError::OutOfBounds { offset: 0, len: 0, size: 0 };
+        as_error(&e);
+    }
+
+    #[test]
+    fn seqcount_write_leaves_even_seq() {
+        // Starting at 0 → after one write cycle, seq must be even (== 2).
+        let shm = MemSharedMemory::new(16);
+        seqcount_write(&shm, 0, || {
+            shm.write_u32(4, 42);
+        });
+        assert_eq!(shm.read_u32(0), 2);
+        assert_eq!(shm.read_u32(4), 42);
+    }
+
+    #[test]
+    fn seqcount_write_increments_by_two_per_call() {
+        let shm = MemSharedMemory::new(16);
+        for expected in [2u32, 4, 6, 8] {
+            seqcount_write(&shm, 0, || {});
+            assert_eq!(shm.read_u32(0), expected);
+        }
+    }
+
+    #[test]
+    fn seqcount_write_odd_during_write_closure() {
+        // Observable inside the closure: seq is odd (writing in progress).
+        let shm = MemSharedMemory::new(16);
+        seqcount_write(&shm, 0, || {
+            let mid = shm.read_u32(0);
+            assert_eq!(mid & 1, 1, "seq must be odd mid-write, got {mid}");
+        });
+    }
+}

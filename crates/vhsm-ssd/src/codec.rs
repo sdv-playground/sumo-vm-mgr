@@ -107,9 +107,9 @@ mod tests {
         buf.extend_from_slice(&req.payload);
 
         let parsed = read_request(&mut &buf[..]).unwrap();
-        assert_eq!(parsed.op, Op::Sign as u32);
-        assert_eq!(parsed.session_id, 42);
-        assert_eq!(parsed.payload, vec![1, 2, 3, 4]);
+        assert!(parsed.op == Op::Sign as u32);
+        assert!(parsed.session_id == 42);
+        assert!(parsed.payload == vec![1, 2, 3, 4]);
 
         // Test response
         let resp = Response::ok(Op::Sign as u32, 42, vec![5, 6, 7]);
@@ -121,5 +121,115 @@ mod tests {
             u32::from_le_bytes([out[4], out[5], out[6], out[7]]),
             Op::Sign as u32
         );
+    }
+
+    /// Helper: build a valid request header + payload.
+    fn make_req_bytes(op: u32, session_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&VHSM_MAGIC);
+        buf.push(VHSM_VERSION);
+        buf.extend_from_slice(&op.to_le_bytes());
+        buf.extend_from_slice(&session_id.to_le_bytes());
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[test]
+    fn read_request_rejects_bad_magic() {
+        let mut bytes = make_req_bytes(Op::Sign as u32, 0, &[]);
+        bytes[0] = b'X'; // clobber magic
+        let err = match read_request(&mut &bytes[..]) {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("bad magic"));
+    }
+
+    #[test]
+    fn read_request_rejects_bad_version() {
+        let mut bytes = make_req_bytes(Op::Sign as u32, 0, &[]);
+        bytes[3] = 0xFF; // clobber version
+        let err = match read_request(&mut &bytes[..]) {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("unsupported version"));
+    }
+
+    #[test]
+    fn read_request_rejects_payload_over_max() {
+        // Build header that claims payload_len = MAX_PAYLOAD + 1.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&VHSM_MAGIC);
+        bytes.push(VHSM_VERSION);
+        bytes.extend_from_slice(&(Op::Sign as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let oversized = (MAX_PAYLOAD as u32).saturating_add(1);
+        bytes.extend_from_slice(&oversized.to_le_bytes());
+        let err = match read_request(&mut &bytes[..]) {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("payload too large"));
+    }
+
+    #[test]
+    fn read_request_rejects_truncated_header() {
+        // Header is 16 bytes; give only 8.
+        let bytes = vec![0u8; 8];
+        let err = match read_request(&mut &bytes[..]) {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn read_request_rejects_truncated_payload() {
+        // Header declares 16-byte payload but we provide 4 bytes.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&VHSM_MAGIC);
+        bytes.push(VHSM_VERSION);
+        bytes.extend_from_slice(&(Op::Sign as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        let err = match read_request(&mut &bytes[..]) {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn read_request_accepts_zero_length_payload() {
+        let bytes = make_req_bytes(Op::GetPubkey as u32, 0, &[]);
+        let req = read_request(&mut &bytes[..]).unwrap();
+        assert!(req.op == Op::GetPubkey as u32);
+        assert!(req.payload.is_empty());
+    }
+
+    #[test]
+    fn write_response_serializes_status_field() {
+        // Error responses set status != 0 and clear payload.
+        let resp = Response::err(Op::Sign as u32, 42, StatusCode::PermissionDeny);
+        let mut out = Vec::new();
+        write_response(&mut out, &resp).unwrap();
+        // payload_len = 0
+        assert_eq!(u32::from_le_bytes([out[12], out[13], out[14], out[15]]), 0);
+        // status
+        let status = u32::from_le_bytes([out[16], out[17], out[18], out[19]]);
+        assert_eq!(status, StatusCode::PermissionDeny as u32);
+        assert_eq!(out.len(), RESPONSE_HEADER_SIZE);
+    }
+
+    #[test]
+    fn roundtrip_request_with_empty_payload() {
+        let bytes = make_req_bytes(Op::GetHandleInfo as u32, 7, &[]);
+        let req = read_request(&mut &bytes[..]).unwrap();
+        assert!(req.session_id == 7);
+        assert!(req.payload.is_empty());
     }
 }

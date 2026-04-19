@@ -189,3 +189,187 @@ impl Response {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn op_from_u32_roundtrips_all_variants() {
+        // Every variant must survive the u32 → Op → u32 round-trip.
+        for op in [
+            Op::GetRandom,
+            Op::KeyGenerate,
+            Op::KeyImport,
+            Op::KeyDerive,
+            Op::KeyDelete,
+            Op::Encrypt,
+            Op::Decrypt,
+            Op::MacGenerate,
+            Op::MacVerify,
+            Op::Sign,
+            Op::Verify,
+            Op::GetHandleInfo,
+            Op::GetPubkey,
+            Op::GetCert,
+        ] {
+            let v = op as u32;
+            assert_eq!(Op::from_u32(v), Some(op), "op {op:?} (0x{v:04x})");
+        }
+    }
+
+    #[test]
+    fn op_from_u32_rejects_unknown() {
+        assert_eq!(Op::from_u32(0x0000), None);
+        assert_eq!(Op::from_u32(0xFFFF_FFFF), None);
+        assert_eq!(Op::from_u32(0x0099), None);
+    }
+
+    #[test]
+    fn op_is_host_only_matches_spec() {
+        assert!(Op::KeyImport.is_host_only());
+        assert!(Op::KeyDerive.is_host_only());
+        assert!(Op::KeyDelete.is_host_only());
+        // Everything else is guest-facing.
+        for op in [
+            Op::GetRandom,
+            Op::KeyGenerate,
+            Op::Encrypt,
+            Op::Decrypt,
+            Op::MacGenerate,
+            Op::MacVerify,
+            Op::Sign,
+            Op::Verify,
+            Op::GetHandleInfo,
+            Op::GetPubkey,
+            Op::GetCert,
+        ] {
+            assert!(!op.is_host_only(), "{op:?} should be guest-facing");
+        }
+    }
+
+    #[test]
+    fn op_required_perm_maps_each_crypto_op_to_distinct_bit() {
+        assert_eq!(Op::Encrypt.required_perm(), Some(PERM_ENCRYPT));
+        assert_eq!(Op::Decrypt.required_perm(), Some(PERM_DECRYPT));
+        assert_eq!(Op::MacGenerate.required_perm(), Some(PERM_MAC_GEN));
+        assert_eq!(Op::MacVerify.required_perm(), Some(PERM_MAC_VFY));
+        assert_eq!(Op::Sign.required_perm(), Some(PERM_SIGN));
+        assert_eq!(Op::Verify.required_perm(), Some(PERM_VERIFY));
+        assert_eq!(Op::KeyDerive.required_perm(), Some(PERM_DERIVE));
+        assert_eq!(Op::KeyDelete.required_perm(), Some(PERM_DELETE));
+        assert_eq!(Op::GetPubkey.required_perm(), Some(PERM_GET_PUBKEY));
+        assert_eq!(Op::GetCert.required_perm(), Some(PERM_GET_CERT));
+        assert_eq!(Op::KeyGenerate.required_perm(), Some(PERM_KEY_GENERATE));
+        // No permission bit required for these
+        assert_eq!(Op::GetRandom.required_perm(), None);
+        assert_eq!(Op::GetHandleInfo.required_perm(), None);
+        assert_eq!(Op::KeyImport.required_perm(), None);
+    }
+
+    #[test]
+    fn permission_bits_are_all_distinct() {
+        // Each permission bit must be unique — catches typos like duplicated shifts.
+        let perms = [
+            PERM_ENCRYPT,
+            PERM_DECRYPT,
+            PERM_MAC_GEN,
+            PERM_MAC_VFY,
+            PERM_SIGN,
+            PERM_VERIFY,
+            PERM_DERIVE,
+            PERM_DELETE,
+            PERM_GET_PUBKEY,
+            PERM_GET_CERT,
+            PERM_KEY_GENERATE,
+        ];
+        for (i, a) in perms.iter().enumerate() {
+            // Each must be a power of two (single bit set)
+            assert!(a.is_power_of_two(), "perm 0x{a:x} must be single bit");
+            for b in &perms[i + 1..] {
+                assert_eq!(a & b, 0, "perms 0x{a:x} and 0x{b:x} overlap");
+            }
+        }
+    }
+
+    #[test]
+    fn well_known_handle_range_boundary() {
+        // Everything in [0x0001, 0x0100) is well-known; below/above isn't.
+        assert!(!handle_is_well_known(HANDLE_INVALID));
+        assert!(handle_is_well_known(HANDLE_KEK));
+        assert!(handle_is_well_known(HANDLE_SW_AUTHORITY));
+        assert!(handle_is_well_known(HANDLE_STORAGE));
+        assert!(handle_is_well_known(HANDLE_DYNAMIC_BASE - 1));
+        assert!(!handle_is_well_known(HANDLE_DYNAMIC_BASE));
+        assert!(!handle_is_well_known(HANDLE_DYNAMIC_BASE + 1));
+        assert!(!handle_is_well_known(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn well_known_handles_have_distinct_values() {
+        let hs = [
+            HANDLE_KEK,
+            HANDLE_SW_AUTHORITY,
+            HANDLE_DEVICE_DECRYPT,
+            HANDLE_ECU_SIGNING,
+            HANDLE_JWT_SIGNING,
+            HANDLE_STORAGE,
+        ];
+        for (i, a) in hs.iter().enumerate() {
+            for b in &hs[i + 1..] {
+                assert_ne!(a, b, "duplicate well-known handle 0x{a:04x}");
+            }
+        }
+    }
+
+    #[test]
+    fn magic_and_version_are_vhs_v2() {
+        assert_eq!(&VHSM_MAGIC, b"VHS");
+        assert_eq!(VHSM_VERSION, 0x02);
+    }
+
+    #[test]
+    fn response_ok_sets_status_zero() {
+        let r = Response::ok(Op::GetRandom as u32, 42, b"hi".to_vec());
+        assert_eq!(r.status, StatusCode::Ok as u32);
+        assert_eq!(r.status, 0);
+        assert_eq!(r.session_id, 42);
+        assert_eq!(r.payload, b"hi");
+    }
+
+    #[test]
+    fn response_err_clears_payload() {
+        let r = Response::err(Op::Sign as u32, 7, StatusCode::PermissionDeny);
+        assert_eq!(r.status, StatusCode::PermissionDeny as u32);
+        assert_eq!(r.status, 0x02);
+        assert_eq!(r.session_id, 7);
+        assert!(r.payload.is_empty());
+    }
+
+    #[test]
+    fn status_code_values_match_protocol_spec() {
+        // These are wire-visible constants — freeze them so accidental
+        // reordering of the enum doesn't silently renumber the wire.
+        assert_eq!(StatusCode::Ok as u32, 0);
+        assert_eq!(StatusCode::InvalidHandle as u32, 1);
+        assert_eq!(StatusCode::PermissionDeny as u32, 2);
+        assert_eq!(StatusCode::PolicyReject as u32, 3);
+        assert_eq!(StatusCode::HseError as u32, 4);
+        assert_eq!(StatusCode::InvalidParam as u32, 5);
+        assert_eq!(StatusCode::NoResource as u32, 6);
+        assert_eq!(StatusCode::StorageError as u32, 7);
+        assert_eq!(StatusCode::CryptoError as u32, 8);
+        assert_eq!(StatusCode::Internal as u32, 9);
+    }
+
+    #[test]
+    fn op_values_match_protocol_spec() {
+        // Wire-visible operation codes — freeze against accidental reordering.
+        assert_eq!(Op::GetRandom as u32, 0x0001);
+        assert_eq!(Op::KeyGenerate as u32, 0x0010);
+        assert_eq!(Op::Encrypt as u32, 0x0020);
+        assert_eq!(Op::MacGenerate as u32, 0x0030);
+        assert_eq!(Op::Sign as u32, 0x0040);
+        assert_eq!(Op::GetHandleInfo as u32, 0x0050);
+    }
+}

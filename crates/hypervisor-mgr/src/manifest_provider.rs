@@ -96,3 +96,98 @@ pub trait ManifestProvider: Send + Sync {
     /// Default is no-op for providers that don't support dynamic key updates.
     fn update_keys(&self, _sw_authority: Vec<u8>, _device_key: Option<Vec<u8>>) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_error_display_parse_error() {
+        let e = ManifestError::ParseError("bad cbor".into());
+        assert_eq!(format!("{e}"), "manifest parse error: bad cbor");
+    }
+
+    #[test]
+    fn manifest_error_display_signature_invalid() {
+        let e = ManifestError::SignatureInvalid("bad sig".into());
+        assert_eq!(format!("{e}"), "signature invalid: bad sig");
+    }
+
+    #[test]
+    fn manifest_error_display_rollback_rejected() {
+        let e = ManifestError::RollbackRejected { seq: 3, min: 5 };
+        assert_eq!(format!("{e}"), "rollback rejected: sequence 3 < minimum 5");
+    }
+
+    #[test]
+    fn manifest_error_display_digest_mismatch() {
+        let e = ManifestError::DigestMismatch;
+        assert_eq!(format!("{e}"), "image digest mismatch");
+    }
+
+    #[test]
+    fn manifest_error_display_size_mismatch() {
+        let e = ManifestError::SizeMismatch { expected: 100, actual: 50 };
+        assert_eq!(format!("{e}"), "image size mismatch: expected 100, got 50");
+    }
+
+    #[test]
+    fn manifest_error_display_component_unknown() {
+        let e = ManifestError::ComponentUnknown("os99".into());
+        assert_eq!(format!("{e}"), "unknown component: os99");
+    }
+
+    #[test]
+    fn manifest_type_equality_and_copy() {
+        // Ensures Copy + PartialEq derive exists — used by match branches in OTA path.
+        let a = ManifestType::Firmware;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(ManifestType::Firmware, ManifestType::HsmKeys);
+    }
+
+    /// Stub provider that returns success with a minimal ValidatedFirmware to
+    /// exercise the default trait methods (validate_header_only delegates,
+    /// software/device key snapshots default to None, update_keys is a no-op).
+    struct StubProvider;
+    impl ManifestProvider for StubProvider {
+        fn validate(
+            &self,
+            _data: &[u8],
+            _min: u32,
+        ) -> Result<ValidatedFirmware, ManifestError> {
+            Ok(ValidatedFirmware {
+                bank_set: BankSet::Vm1,
+                manifest_type: ManifestType::Firmware,
+                image_meta: ImageMeta::default(),
+                image_data: Vec::new(),
+                version_display: "1.0.0".into(),
+                image_sha256: None,
+                image_size: None,
+                raw_envelope: None,
+            })
+        }
+    }
+
+    #[test]
+    fn validate_header_only_default_delegates_to_validate() {
+        let p = StubProvider;
+        let vf = p.validate_header_only(&[], 0).unwrap();
+        assert_eq!(vf.bank_set, BankSet::Vm1);
+        assert_eq!(vf.version_display, "1.0.0");
+    }
+
+    #[test]
+    fn key_accessors_default_to_none() {
+        let p = StubProvider;
+        assert!(p.software_authority_key().is_none());
+        assert!(p.device_decryption_key().is_none());
+    }
+
+    #[test]
+    fn update_keys_default_is_noop() {
+        // Just verify it doesn't panic.
+        let p = StubProvider;
+        p.update_keys(vec![1, 2, 3], Some(vec![4, 5]));
+    }
+}

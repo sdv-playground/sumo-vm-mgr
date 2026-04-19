@@ -235,4 +235,145 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---------------------------------------------------------------------
+    // Additional coverage
+    // ---------------------------------------------------------------------
+
+    fn tmp_store() -> (Secstore<LinuxSimEncryptor, FileBackend>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Secstore::new(
+            LinuxSimEncryptor::new([0x42; 16]),
+            FileBackend::new(dir.path()),
+        );
+        (s, dir)
+    }
+
+    fn make_meta(handle: u32, key_id: &str) -> KeyMetadata {
+        KeyMetadata {
+            vhsm_handle: handle,
+            key_id: key_id.into(),
+            algorithm: 0x0002,
+            permitted_ops: 0x03,
+            owner_cid: 3,
+            persistent: true,
+            label: String::new(),
+        }
+    }
+
+    #[test]
+    fn multiple_handles_roundtrip_independently() {
+        let (store, _tmp) = tmp_store();
+        store.store(&make_meta(0x100, "k1")).unwrap();
+        store.store(&make_meta(0x101, "k2")).unwrap();
+        store.store(&make_meta(0x102, "k3")).unwrap();
+
+        let mut loaded = store.load_all().unwrap();
+        loaded.sort_by_key(|m| m.vhsm_handle);
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].key_id, "k1");
+        assert_eq!(loaded[1].key_id, "k2");
+        assert_eq!(loaded[2].key_id, "k3");
+    }
+
+    #[test]
+    fn delete_specific_handle_leaves_others() {
+        let (store, _tmp) = tmp_store();
+        store.store(&make_meta(0x100, "k1")).unwrap();
+        store.store(&make_meta(0x101, "k2")).unwrap();
+
+        store.delete(0x100).unwrap();
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].key_id, "k2");
+    }
+
+    #[test]
+    fn delete_nonexistent_handle_is_ok() {
+        // FileBackend::delete treats missing files as success (idempotent).
+        let (store, _tmp) = tmp_store();
+        store.delete(0xDEAD_BEEF).unwrap();
+    }
+
+    #[test]
+    fn store_overwrites_existing_handle() {
+        let (store, _tmp) = tmp_store();
+        store.store(&make_meta(0x100, "original")).unwrap();
+        let mut updated = make_meta(0x100, "overwritten");
+        updated.permitted_ops = 0xFF;
+        store.store(&updated).unwrap();
+
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].key_id, "overwritten");
+        assert_eq!(loaded[0].permitted_ops, 0xFF);
+    }
+
+    #[test]
+    fn empty_store_loads_empty_vec() {
+        let (store, _tmp) = tmp_store();
+        let loaded = store.load_all().unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn deserialize_rejects_truncated_buffer() {
+        let short = vec![0u8; 5]; // needs at least 17 bytes of fixed fields
+        assert!(deserialize_metadata(&short).is_none());
+    }
+
+    #[test]
+    fn deserialize_rejects_string_length_past_end() {
+        // vhsm_handle(4) + algorithm(4) + permitted_ops(4) + owner_cid(4) +
+        // persistent(1) + key_id_len(2)=big + (key_id missing) → must fail
+        let mut buf = vec![0u8; 4 + 4 + 4 + 4 + 1];
+        buf.extend_from_slice(&(9999_u16).to_le_bytes()); // absurd key_id len
+        assert!(deserialize_metadata(&buf).is_none());
+    }
+
+    #[test]
+    fn different_encryptor_key_cannot_decrypt() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let store_a = Secstore::new(
+            LinuxSimEncryptor::new([0xAA; 16]),
+            FileBackend::new(dir.path()),
+        );
+        store_a.store(&make_meta(0x100, "k")).unwrap();
+
+        let store_b = Secstore::new(
+            LinuxSimEncryptor::new([0xBB; 16]),
+            FileBackend::new(dir.path()),
+        );
+        // Different key → decryption produces garbage → metadata parse fails
+        // → entry is silently skipped (per load_all's if-let). Verifies isolation.
+        let loaded = store_b.load_all().unwrap();
+        assert!(loaded.is_empty(), "wrong key must not decrypt valid data");
+    }
+
+    #[test]
+    fn linux_sim_encryptor_roundtrip() {
+        let enc = LinuxSimEncryptor::new([0x33; 16]);
+        let pt = b"hello secstore";
+        let ct = enc.encrypt(pt).unwrap();
+        assert_ne!(ct, pt);
+        let rt = enc.decrypt(&ct).unwrap();
+        assert_eq!(rt, pt);
+    }
+
+    #[test]
+    fn secstore_error_display_and_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let e: SecstoreError = io_err.into();
+        assert!(matches!(e, SecstoreError::Io(_)));
+        // Smoke: Display doesn't panic
+        let _ = e.to_string();
+    }
+
+    #[test]
+    fn secstore_error_is_std_error() {
+        fn take<E: std::error::Error>(_: E) {}
+        take(SecstoreError::Crypto("bad".into()));
+        take(SecstoreError::Format("bad".into()));
+    }
 }
