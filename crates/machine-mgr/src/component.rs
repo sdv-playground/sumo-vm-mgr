@@ -1,0 +1,173 @@
+use async_trait::async_trait;
+use bytes::Bytes;
+
+use crate::error::{MachineError, MachineResult};
+use crate::types::{
+    Capabilities, Csr, DidFilter, DidKind, DtcFilter, EnvelopeStream, FlashId, FlashSession,
+    RuntimeState,
+};
+use crate::{ActivationState, ClearFaultsResult, Fault};
+
+/// One independently-updatable thing on the machine: the host OS, a guest VM,
+/// the HSM, an attached ECU.
+///
+/// Required: `id`, `capabilities`. Everything else has a `NotSupported`
+/// default — concrete components only implement the operations they support
+/// and the `Capabilities` they return must be consistent with that.
+#[async_trait]
+pub trait Component: Send + Sync {
+    /// Stable identifier (matches the `/components/{id}` path in SOVD).
+    fn id(&self) -> &str;
+
+    /// Capability descriptor. Controls which operations the orchestrator may
+    /// attempt and (loosely) which trait methods it should expect to succeed.
+    fn capabilities(&self) -> &Capabilities;
+
+    // ------------------------------------------------------------------
+    // DID store
+    // ------------------------------------------------------------------
+
+    /// List the DIDs this component exposes (factory and runtime).
+    async fn list_dids(&self, _filter: &DidFilter) -> MachineResult<Vec<DidEntry>> {
+        Err(MachineError::NotSupported("list_dids"))
+    }
+
+    async fn read_did(&self, _key: u16, _kind: DidKind) -> MachineResult<Bytes> {
+        Err(MachineError::NotSupported("read_did"))
+    }
+
+    async fn write_did(&self, _key: u16, _kind: DidKind, _value: &[u8]) -> MachineResult<()> {
+        Err(MachineError::NotSupported("write_did"))
+    }
+
+    // ------------------------------------------------------------------
+    // Install pipeline
+    //
+    // Lifecycle:
+    //   start_install   → opens a session
+    //   upload_envelope → streams a SUIT envelope to staging on disk;
+    //                     verified inline; NOT yet applied
+    //   finalize_install → APPLIES the staged image:
+    //                       dual-bank: flips next-boot pointer (reboot needed)
+    //                       single-bank (HSM): writes to live store immediately
+    //   commit_install  → post-reboot/post-finalize: raise security version
+    //                     floor, mark permanent
+    //   rollback_install → dual-bank only: revert to previous bank
+    //   abort_install   → discard session; pre-finalize always works,
+    //                     post-finalize gated by FlashCaps.abortable_after_finalize
+    // ------------------------------------------------------------------
+
+    /// Open a new install session for this component. Returns the handle the
+    /// caller uses for the rest of the pipeline.
+    async fn start_install(&self) -> MachineResult<FlashSession> {
+        Err(MachineError::NotSupported("start_install"))
+    }
+
+    /// Stream a SUIT envelope into staging. Validates signature + security
+    /// version + command sequence inline. Decrypts and decompresses payloads
+    /// as they stream. Does NOT apply the install — staging only.
+    ///
+    /// Multi-file SOVD uploads (manifest, then per-payload) all hit this
+    /// method; the impl owns session continuity. The `id` is informational —
+    /// today's `VmBackendComponent` ignores it because `VmBackend` tracks one
+    /// in-flight session per component.
+    ///
+    /// Returns a per-upload identifier (e.g. SOVD package_id). Callers may
+    /// surface it on the wire or discard it.
+    ///
+    /// If the envelope references payloads by URI (rather than carrying them
+    /// integrated), the implementation is expected to fetch them transparently.
+    async fn upload_envelope(
+        &self,
+        _id: &FlashId,
+        _stream: EnvelopeStream,
+    ) -> MachineResult<String> {
+        Err(MachineError::NotSupported("upload_envelope"))
+    }
+
+    /// Apply the staged install. Dual-bank: flips next-boot pointer (reboot
+    /// required for new code to run). Single-bank (HSM): writes to live store
+    /// immediately. After this point, `abort_install` is rejected unless
+    /// `FlashCaps.abortable_after_finalize` is true.
+    async fn finalize_install(&self, _id: &FlashId) -> MachineResult<()> {
+        Err(MachineError::NotSupported("finalize_install"))
+    }
+
+    /// Post-reboot (or post-finalize for single-bank): raise the security
+    /// version floor and mark this install permanent. The orchestrator calls
+    /// this after verifying the new code is healthy.
+    async fn commit_install(&self, _id: &FlashId) -> MachineResult<()> {
+        Err(MachineError::NotSupported("commit_install"))
+    }
+
+    /// Dual-bank only: revert to the previously-active bank. Requires another
+    /// reboot to take effect.
+    async fn rollback_install(&self, _id: &FlashId) -> MachineResult<()> {
+        Err(MachineError::NotSupported("rollback_install"))
+    }
+
+    /// Discard the install session. Always works pre-finalize. Post-finalize
+    /// only works if `FlashCaps.abortable_after_finalize` is true.
+    async fn abort_install(&self, _id: &FlashId) -> MachineResult<()> {
+        Err(MachineError::NotSupported("abort_install"))
+    }
+
+    /// State of bank activation (which bank is active, supports rollback,
+    /// versions). `None` means the component has no concept of activation.
+    async fn activation_state(&self) -> MachineResult<Option<ActivationState>> {
+        Ok(None)
+    }
+
+    // ------------------------------------------------------------------
+    // Lifecycle
+    // ------------------------------------------------------------------
+
+    /// Restart the component. For the host this means reboot; for a guest VM
+    /// it means stop+start through the VM lifecycle service; for HSM it may
+    /// be a no-op or a daemon restart.
+    async fn restart(&self) -> MachineResult<()> {
+        Err(MachineError::NotSupported("restart"))
+    }
+
+    async fn runtime_state(&self) -> MachineResult<RuntimeState> {
+        Err(MachineError::NotSupported("runtime_state"))
+    }
+
+    // ------------------------------------------------------------------
+    // HSM-specific
+    // ------------------------------------------------------------------
+
+    async fn get_csr(&self) -> MachineResult<Csr> {
+        Err(MachineError::NotSupported("get_csr"))
+    }
+
+    async fn install_keys(&self, _envelope: &[u8]) -> MachineResult<()> {
+        Err(MachineError::NotSupported("install_keys"))
+    }
+
+    // ------------------------------------------------------------------
+    // Faults / DTCs
+    // ------------------------------------------------------------------
+
+    async fn read_dtcs(&self, _filter: &DtcFilter) -> MachineResult<Vec<Fault>> {
+        Err(MachineError::NotSupported("read_dtcs"))
+    }
+
+    async fn clear_dtcs(&self, _group: Option<u32>) -> MachineResult<ClearFaultsResult> {
+        Err(MachineError::NotSupported("clear_dtcs"))
+    }
+}
+
+/// Metadata for a single DID exposed by a component. Returned by `list_dids`.
+#[derive(Debug, Clone)]
+pub struct DidEntry {
+    pub key: u16,
+    pub kind: DidKind,
+    /// Stable string identifier used by wire protocols as a path segment
+    /// (e.g. `"serial_number"` or `"runtime_F40C"`).
+    pub id: String,
+    /// Human-readable display name, e.g. `"Serial Number"`.
+    pub name: String,
+    /// True if the DID is writable via `write_did`.
+    pub writable: bool,
+}

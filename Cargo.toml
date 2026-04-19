@@ -4,10 +4,18 @@ members = [
     "crates/nv-store",
     "crates/boot",
     "crates/hypervisor-mgr",
+    "crates/machine-mgr",
     "crates/vm-service",
     "crates/hsm",
     "crates/vhsm-ssd",
     "crates/vm-devices",
     "crates/secstore",
 ]
+
+# Temporary: point sovd-* deps at the local SOVDd checkout while iterating
+# on the FlashState rename (AwaitingExit→AwaitingActivation, AwaitingReset→
+# AwaitingReboot). Remove once SOVDd is committed + pushed.
+[patch."ssh://git@github.com/sdv-playground/SOVDd.git"]
+sovd-core = { path = "../SOVDd/crates/sovd-core" }
+sovd-api = { path = "../SOVDd/crates/sovd-api" }
 
