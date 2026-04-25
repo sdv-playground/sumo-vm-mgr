@@ -1,37 +1,34 @@
-# Architecture: vm-mgr
+# Architecture: sumo-vm-mgr
 
 ## Overview
 
-Platform-agnostic VM lifecycle manager for automotive ECUs. Handles A/B bank switching, boot decisions with trial boot and auto-rollback, OTA updates with SUIT manifest validation and encrypted firmware, and automotive diagnostics (UDS DIDs, DTCs) via SOVD REST API. Two-process architecture: vm-service (QEMU lifecycle) + vm-sovd (diagnostics/OTA). Developed and tested on Linux (file-backed storage + QEMU), deployable on any hypervisor (QNX qvm, Xen) via the backend trait.
+Platform-agnostic VM lifecycle manager for automotive ECUs. Handles A/B bank switching, boot decisions with trial boot and auto-rollback, OTA updates with SUIT manifest validation and encrypted firmware, and automotive diagnostics (UDS DIDs, DTCs) via SOVD REST API. Two-process architecture: `vm-service` (QEMU / qvm lifecycle) + `vm-sovd` (diagnostics/OTA). Developed and tested on Linux (file-backed storage + QEMU); the `machine-mgr` trait layer plus per-crate `BlockDevice` / `SharedMemory` / `HsmCryptoProvider` traits let the same business logic run on QNX (qvm hypervisor) once the concrete impls exist.
 
-**Stack:** Rust 2021 edition, Axum 0.8 (HTTP), Tokio (async runtime), SHA-256 (image verification), CRC-32 (sector integrity), serde_yaml (manifests)
+**Stack:** Rust 2021 edition, Axum 0.8 (HTTP), Tokio (async runtime), SHA-256 (image verification), CRC-32 (sector integrity), serde_yaml (manifests), SUIT envelopes (AES-128-GCM + ECDH-ES+A128KW encryption)
 
-| Language | Files | Code | Comments | Blanks |
-|----------|-------|------|----------|--------|
-| Rust     | 27    | 5626 | 319      | 938    |
-| TOML     | 6     | 94   | 3        | 16     |
-| YAML     | 3     | 34   | 0        | 4      |
-| Shell    | 2     | 81   | 26       | 16     |
-| Markdown | 6     | 0    | 980      | 241    |
-| **Total**| **44**| **5835** | **1328** | **1215** |
+The workspace now spans nine crates (see `Cargo.toml`): `nv-store`, `secstore`, `vm-boot`, `hsm`, `vhsm-ssd`, `vm-devices`, `vm-service`, `machine-mgr`, `hypervisor-mgr`.
 
 ## Project Structure
 
 ```
-vm-mgr/
-+-- Cargo.toml                  # Workspace root (3 crates)
+sumo-vm-mgr/
++-- Cargo.toml                  # Workspace root (9 crates)
 +-- CLAUDE.md                   # AI assistant instructions
 +-- README.md                   # Project overview & quick start
-+-- scripts/
-|   +-- run.sh                  # Boot loop launcher (builds, factory-init, starts SOVD + vm-runner)
-|   +-- mkbundle.sh             # Creates VMFB firmware bundle from manifest + image
 +-- example/
+|   +-- run.sh                  # Build + factory-init + start SOVD server + security helper
+|   +-- build.sh                # Generate SUIT signing keys and demo encrypted firmware
+|   +-- build_hsm_keys.rs       # Example: build an HSM key envelope
 |   +-- factory/                # Example factory provisioning manifests
 |   |   +-- factory.yaml        # Serial, VIN, HW IDs
 |   |   +-- hypervisor.yaml     # Hypervisor firmware manifest (version, DIDs)
 |   |   +-- vm1.yaml            # VM1 firmware manifest (version, DIDs)
+|   |   +-- vm2.yaml            # VM2 firmware manifest (version, DIDs)
+|   |   +-- hsm.yaml            # HSM firmware manifest (version, DIDs)
+|   +-- config/secrets.toml     # SOVD-security-helper ECU secrets
+|   +-- profiles/               # Per-VM TOML device profiles (vm1-*, etc.)
+|   +-- templates/              # SUIT manifest templates (l2-encrypted, crl, hsm-keys)
 |   +-- keys/                   # Generated SUIT signing keys
-|   +-- output/                 # Generated SUIT envelopes (vm1-v1, vm1-v2, etc.)
 +-- specs/
 |   +-- disk-layout.md          # GPT partition table specification
 |   +-- nv-store-format.md      # NV partition internal layout & wire formats
@@ -43,37 +40,74 @@ vm-mgr/
     |       +-- types.rs         # NvBootState, NvFactory, NvFwMeta, NvRuntime, NvApp, NvRecord trait
     |       +-- block.rs         # BlockDevice trait, MemBlockDevice, FileBlockDevice
     |       +-- store.rs         # NvStore<D> API, sector rotation read/write, NV layout offsets
-    |       +-- tests.rs         # 21 tests (roundtrip, rotation, corruption, isolation, copy-on-update)
-    +-- boot/                   # Boot-time logic, backend trait, QEMU/QNX backends
+    |       +-- tests.rs         # Roundtrip, rotation, corruption, isolation, copy-on-update
+    +-- secstore/               # Encrypted key-metadata persistence
+    |   +-- src/
+    |       +-- lib.rs           # SecstoreEncryptor + SecstoreBackend traits, Secstore<E,B>
+    |       +-- file_backend.rs  # FileBackend (atomic write-to-temp + rename)
+    |       +-- linux_encryptor.rs # LinuxSimEncryptor (static key for dev)
+    +-- boot/                   # Boot-time decision logic (platform-independent)
     |   +-- src/
     |       +-- lib.rs           # BootManager, BootAction, HashCheck, BootError
     |       +-- main.rs          # vm-boot CLI binary
-    |       +-- bin/runner.rs    # vm-runner boot loop orchestrator (Ctrl+C aware)
-    |       +-- backend.rs       # BootBackend trait, BackendError, VmHandle
-    |       +-- qemu.rs          # QemuBackend (ivshmem, simulators, QEMU launch, cleanup)
-    |       +-- qnx.rs           # QnxBackend (stub for production)
     |       +-- config.rs        # VmProfile, VmConfig, DeviceConfig (TOML, serde)
-    |       +-- tests.rs         # 30+ tests (boot cycle, hash verification, config parsing, QEMU args)
-    +-- vm-service/             # VM lifecycle manager (QEMU process management)
+    |       +-- tests.rs         # Boot cycle, hash verification, config parsing
+    +-- hsm/                    # HSM provider trait + SimHsm (file keystore)
     |   +-- src/
+    |       +-- lib.rs           # HsmProvider + HsmCryptoProvider traits
+    |       +-- sim.rs           # SimHsm: spawns vhsm-ssd + file keystore
+    |       +-- crypto.rs        # RustCrypto implementation of HsmCryptoProvider
+    |       +-- payload.rs       # HsmKeystore CBOR schema
+    |       +-- qnx.rs           # QnxHsm stub (real HSM via resource manager)
+    +-- vhsm-ssd/               # Host-side daemon for v2 handle-based vHSM protocol
+    |   +-- src/
+    |       +-- lib.rs           # Module exports
+    |       +-- proto.rs + codec.rs   # Wire format
+    |       +-- handle_table.rs  # Dynamic handle allocator (0x0100+)
+    |       +-- policy.rs        # Per-CID ACL
+    |       +-- handler.rs       # Op dispatch → HsmCryptoProvider
+    |       +-- transport.rs     # vsock (Linux/QEMU) + QNX shm/IPC
+    +-- vm-devices/             # Host-side virtual CAN / health / time simulators
+    |   +-- src/
+    |       +-- lib.rs           # Module exports
+    |       +-- transport.rs     # ivshmem vs QNX shm abstraction
+    |       +-- clock.rs         # Real-time / simulation-stepping / gPTP
+    |       +-- regs.rs          # Shared-memory register layout
+    |       +-- can.rs + health.rs + time.rs # Per-device simulators
+    +-- vm-service/             # VM lifecycle manager (QEMU/qvm process management)
+    |   +-- src/
+    |       +-- main.rs          # vm-service binary
     |       +-- config.rs        # VmServiceConfig, VmDefinition, VmBankConfig (per-bank overrides)
     |       +-- manager.rs       # VmManager: start/stop/restart VMs, IPC listener
-    |       +-- qemu.rs          # QemuRunner: QEMU process launch + arg builder
-    |       +-- main.rs          # vm-service binary
-    +-- diagserver/             # Diagnostic server: SOVD REST API + SUIT OTA engine
+    |       +-- api.rs           # Unix-socket / TCP control protocol
+    |       +-- health.rs        # HealthMonitor (liveness)
+    |       +-- ivshmem.rs       # ivshmem-server lifecycle (Linux)
+    |       +-- runner/qemu.rs   # QemuRunner: QEMU process launch + arg builder
+    |       +-- runner/qnx.rs    # QnxRunner: qvm stub for production
+    |       +-- runner/dummy.rs  # DummyRunner: no-op for components without a VM
+    +-- machine-mgr/            # Platform-agnostic Machine + Component trait layer
+    |   +-- src/
+    |       +-- lib.rs           # Hierarchy doc + sovd-core re-exports
+    |       +-- component.rs     # Component trait (async, ~35 methods with NotSupported defaults)
+    |       +-- machine.rs       # Machine trait + MachineRegistry composition
+    |       +-- types.rs         # Capabilities, FlashCaps, LifecycleCaps, HsmCaps, DidKind, FlashId, ...
+    |       +-- error.rs         # MachineError (NotSupported / NotFound / PolicyRejected / ...)
+    +-- hypervisor-mgr/         # SOVD wire adapter, SUIT OTA engine, DID resolution
         +-- src/
-            +-- lib.rs           # Module exports
-            +-- backend.rs       # VmBackend: DiagnosticBackend implementation
-            +-- suit_provider.rs # SUIT envelope validation + orchestrator integration
-            +-- manifest_provider.rs # ManifestProvider trait
-            +-- streaming.rs     # Streaming payload pipeline (decrypt + decompress)
+            +-- lib.rs           # Module exports + layering doc
+            +-- main.rs          # vm-diagserver CLI binary (status/install/commit/rollback/dids/factory-init)
+            +-- sovd_main.rs     # vm-sovd HTTP server binary (Axum + Tokio)
+            +-- backend.rs       # VmBackend: legacy per-bank-set state machine, ComponentConfig
+            +-- component_adapter.rs # VmBackendComponent: exposes VmBackend via Component
+            +-- diag_backend.rs  # ComponentDiagBackend: routes sovd-core::DiagnosticBackend → Component
+            +-- suit_provider.rs # SUIT envelope validation (signature, digest, secver)
+            +-- manifest_provider.rs # ManifestProvider trait (pluggable validation)
+            +-- manifest.rs      # YAML FirmwareManifest / FactoryManifest for factory-init
+            +-- streaming.rs     # Streaming payload pipeline (decrypt + decompress + hash)
             +-- did.rs           # DID resolution (Runtime > FwMeta > Factory > Dynamic)
             +-- ota.rs           # OTA install/commit/rollback engine
-            +-- tests.rs         # Unit tests (DID, OTA, backend)
-            +-- sovd_main.rs     # vm-sovd HTTP server binary (Axum + Tokio)
-            +-- sovd/
-                +-- mod.rs       # SOVD module exports
-                +-- security.rs  # SecurityProvider trait + TestSecurityProvider
+            +-- ifs/             # Boot-image (IFS) activation (mount + copy on Linux / QNX)
+            +-- sovd/security.rs # SecurityProvider trait + TestSecurityProvider
 ```
 
 ## System Architecture
@@ -82,70 +116,112 @@ vm-mgr/
 graph TB
     subgraph Binaries
         VMB["vm-boot<br/>(CLI diagnostic)"]
-        VMR["vm-runner<br/>(boot loop)"]
-        VMD["vm-diagserver<br/>(CLI, 10 commands)"]
+        VMD["vm-diagserver<br/>(CLI: status/install/commit/...)"]
+        VMV["vm-service<br/>(QEMU / qvm lifecycle daemon)"]
         VMS["vm-sovd<br/>(HTTP server :4000)"]
+        VHSM["vhsm-ssd<br/>(vHSM v2 daemon)"]
     end
 
     subgraph "vm-boot crate (lib)"
         BM["BootManager&lt;D&gt;"]
-        BB["BootBackend trait"]
-        QB["QemuBackend"]
-        QN["QnxBackend (stub)"]
         CFG["VmProfile / Config"]
     end
 
-    subgraph "vm-diagserver crate (lib)"
+    subgraph "hypervisor-mgr crate (lib)"
+        DIAG["ComponentDiagBackend<br/>(SOVD wire adapter)"]
+        ADAPT["VmBackendComponent<br/>(Component impl)"]
+        VMBK["VmBackend&lt;D&gt;<br/>(per-component state)"]
         DID["DID Resolution"]
         OTA["OTA Engine"]
-        MAN["Manifest / Bundle"]
-        SOVD["SOVD Handlers"]
-        RTR["Axum Router"]
-        UPL["Upload Store"]
+        STRM["Streaming Pipeline<br/>(decrypt + decompress)"]
+        MANI["SUIT / YAML Manifest"]
+        IFS["IFS Activator"]
+        SEC["SecurityProvider"]
     end
 
-    subgraph "nv-store crate (lib)"
+    subgraph "machine-mgr crate (lib)"
+        MACH["Machine + MachineRegistry"]
+        COMP["Component trait"]
+        CAPS["Capabilities / types"]
+    end
+
+    subgraph "vm-service crate (lib+bin)"
+        MGR["VmManager"]
+        QR["QemuRunner"]
+        QNR["QnxRunner (stub)"]
+        IVS["ivshmem-server mgmt"]
+        HMON["HealthMonitor"]
+    end
+
+    subgraph "hsm + vhsm-ssd crates"
+        HSMP["HsmProvider<br/>(SimHsm / QnxHsm)"]
+        HCP["HsmCryptoProvider"]
+        POL["Policy / HandleTable"]
+    end
+
+    subgraph "vm-devices crate (lib)"
+        VCAN["CAN / Health / Time sims"]
+        CLK["Clock (real / sim / gPTP)"]
+    end
+
+    subgraph "nv-store + secstore crates"
         NVS["NvStore&lt;D&gt;"]
-        SR["Sector Rotation"]
         BD["BlockDevice trait"]
         TY["NV Types<br/>(BootState, Factory,<br/>FwMeta, Runtime, App)"]
+        SSTORE["Secstore&lt;E,B&gt;<br/>(key metadata)"]
     end
 
     subgraph External
-        QEMU["QEMU aarch64"]
+        QEMU["QEMU / qvm"]
         NVP["NV Partition<br/>(file or block device)"]
-        SIM["Simulators<br/>(CAN, Health, Time, HSM)"]
+        SIM["Device simulators"]
         HTTP["HTTP Clients<br/>(curl, SOVD Explorer)"]
         YAML["YAML Manifests<br/>(example/factory/)"]
+        GUEST["Guest /dev/vhsm"]
     end
 
     VMB --> BM
-    VMR --> BM
-    VMR --> QB
-    VMR --> CFG
     VMD --> DID
     VMD --> OTA
-    VMD --> MAN
-    VMS --> RTR
-    RTR --> SOVD
-    SOVD --> DID
-    SOVD --> OTA
-    SOVD --> MAN
-    SOVD --> UPL
+    VMD --> MANI
+    VMV --> MGR
+    MGR --> QR
+    MGR --> QNR
+    MGR --> IVS
+    MGR --> HMON
+    VMS --> DIAG
+    DIAG --> MACH
+    MACH --> COMP
+    ADAPT -- implements --> COMP
+    ADAPT --> VMBK
+    VMBK --> DID
+    VMBK --> OTA
+    VMBK --> STRM
+    VMBK --> MANI
+    VMBK --> SEC
+    VMBK --> IFS
+    VMBK --> HSMP
 
     BM --> NVS
     DID --> NVS
     OTA --> NVS
+    VMBK --> NVS
+    SSTORE --> BD
+    VHSM --> HCP
+    VHSM --> POL
+    VHSM --> SSTORE
+    HSMP --> HCP
+    MGR --> VCAN
+    VCAN --> CLK
 
-    BB --> QB
-    BB --> QN
-    QB --> QEMU
-    QB --> SIM
-    NVS --> SR
-    SR --> BD
+    QR --> QEMU
+    IVS --> SIM
+    VCAN --> SIM
+    NVS --> BD
     BD --> NVP
     HTTP --> VMS
-    MAN --> YAML
+    GUEST --> VHSM
+    MANI --> YAML
 ```
 
 ## Module Hierarchy
@@ -160,64 +236,135 @@ graph TB
 
 **Dependencies:** `crc32fast`
 
+### secstore
+
+| Module | Purpose | Key Exports |
+|--------|---------|-------------|
+| `lib` | Encrypted key-metadata store | `SecstoreEncryptor` + `SecstoreBackend` traits, `Secstore<E, B>`, `KeyMetadata`, `SecstoreError` |
+| `file_backend` | POSIX file backend | `FileBackend` (atomic write-to-temp + rename) |
+| `linux_encryptor` | Dev encryptor | `LinuxSimEncryptor` (static AES key) |
+
+**Dependencies:** `aes-gcm`, `tempfile`
+
 ### vm-boot
 
 | Module | Purpose | Key Exports |
 |--------|---------|-------------|
 | `lib` | Boot decision engine | `BootManager<D>`, `BootAction` (6 variants), `HashCheck`, `BootError` |
-| `backend` | Platform abstraction | `BootBackend` trait (5 methods), `BackendError`, `VmHandle` |
-| `qemu` | QEMU backend | `QemuBackend` (ivshmem server launch, simulator management, QEMU arg builder, cleanup on Drop) |
-| `qnx` | QNX backend (stub) | `QnxBackend` (all methods return "not yet implemented") |
-| `config` | TOML profile parsing | `VmProfile`, `VmConfig`, `DeviceConfig` (7 variants: Can, Health, Time, Hsm, Network, Disk, Console) |
+| `config` | TOML profile parsing | `VmProfile`, `VmConfig`, `DeviceConfig` (7 variants: Can, Health, Time, Hsm, Network, Disk, Console), `Arch` |
 | `main` | CLI entry point | `vm-boot <nv-path> [--init]` |
-| `bin/runner` | Boot loop orchestrator | `vm-runner --profile <toml> --nv <path> --images <dir> [--sim-dir <dir>] [--init]` |
 
-**Dependencies:** `nv-store`, `sha2`, `serde`, `toml`, `libc`, `ctrlc`
+Launching / stopping VMs is no longer a `BootBackend` trait in this crate; it's the `VmRunner` trait in `vm-service` (see below).
+
+**Dependencies:** `nv-store`, `sha2`, `serde`, `toml`
+
+### hsm
+
+| Module | Purpose | Key Exports |
+|--------|---------|-------------|
+| `lib` | HSM management + crypto trait | `HsmProvider`, `HsmCryptoProvider`, `KeyRole`, `KeyInfo`, `HsmError`, `ProvisioningState` |
+| `sim` | Dev/test provider | `SimHsm` (spawns `vhsm-ssd` + file keystore) |
+| `crypto` | Software crypto | RustCrypto implementation of `HsmCryptoProvider` |
+| `payload` | Keystore CBOR schema | `HsmKeystore` (SUIT-envelope-carried key material) |
+| `qnx` | Production stub | `QnxHsm` (waiting on HSE integration) |
+
+**Dependencies:** `cbor` / `coset`, `sha2`, `aes-gcm`, `p256`, `pkcs8`, optional `rustcrypto` feature
+
+### vhsm-ssd
+
+| Module | Purpose | Key Exports |
+|--------|---------|-------------|
+| `proto` + `codec` | v2 handle-based vHSM wire format | Frame parser / serializer |
+| `handle_table` | Dynamic handle allocator | Well-known (`0x0001..=0x00FF`) + dynamic (`0x0100+`) handles |
+| `policy` | Per-CID ACL | Enforced before every op dispatch |
+| `handler` | Op dispatch | Delegates crypto to `HsmCryptoProvider` |
+| `transport` | Wire transports | vsock (Linux/QEMU), QNX-native shm/IPC |
+
+**Dependencies:** `hsm` (with `crypto` feature), `secstore`, `tokio`, `bytes`
+
+### vm-devices
+
+| Module | Purpose | Key Exports |
+|--------|---------|-------------|
+| `transport` | Shared-memory abstraction | ivshmem vs QNX native shm |
+| `clock` | Clock abstraction | Real-time / simulation-stepping / gPTP-corrected |
+| `regs` | Register layout | Shared-memory register map for all device sims |
+| `can` / `health` / `time` | Per-device simulators | Feature-gated |
+| `qmp` | QEMU monitor integration | Linux-only |
 
 ### vm-service
 
 | Module | Purpose | Key Exports |
 |--------|---------|-------------|
-| `config` | VM definition + per-bank overrides | `VmServiceConfig`, `VmDefinition`, `VmBankConfig`, `ImagePaths`, `with_bank_overrides()` |
-| `manager` | VM lifecycle management | `VmManager` (start/stop/restart VMs, IPC socket listener) |
-| `qemu` | QEMU process launch | `QemuRunner` (arg builder, process management, KVM detection) |
-| `main` | Service binary | `vm-service --config <yaml> [--images-dir <dir>] [--socket <path>]` |
+| `config` | VM definition + per-bank overrides | `VmServiceConfig`, `VmDefinition`, `VmBankConfig`, `BackendType` |
+| `manager` | VM lifecycle management | `VmManager` (start/stop/restart VMs, IPC socket listener), `StopHandle` |
+| `api` | Control protocol | Unix socket (Linux) / TCP (QNX) request handling |
+| `health` | Liveness monitoring | `HealthMonitor`, `HealthStatus`, `HealthDetail` |
+| `ivshmem` | ivshmem-server lifecycle | `HostProcess`, server launch + cleanup (Linux) |
+| `runner/qemu` | QEMU process launch | `QemuRunner` (arg builder, KVM detection) |
+| `runner/qnx` | qvm stub | `QnxRunner` (placeholder for production) |
+| `runner/dummy` | No-op runner | `DummyRunner` (for components without a VM) |
+| `main` | Service binary | `vm-service --config <yaml>` |
 
-**Dependencies:** `nv-store`, `serde`, `serde_yaml`, `tokio`, `tracing`
+**Dependencies:** `vm-devices`, `serde`, `serde_yaml`, `tokio`, `tracing`, `libc`
 
-### vm-diagserver
+### machine-mgr
 
 | Module | Purpose | Key Exports |
 |--------|---------|-------------|
-| `backend` | SOVD backend implementation | `VmBackend` (implements `DiagnosticBackend`), `ComponentConfig` |
-| `suit_provider` | SUIT envelope validation | `SuitProvider` (signature, digest, security version checks) |
-| `manifest_provider` | Provider trait | `ManifestProvider` trait (pluggable validation) |
-| `streaming` | Payload pipeline | Streaming decrypt (AES-128-GCM) + decompress (zstd) for multi-component uploads |
-| `did` | DID resolution (4-layer priority) | `read_did`, `write_did`, `DidValue`, 21 DID constants (F187-F19E, FD00-FD04) |
-| `ota` | OTA lifecycle engine | `install`, `commit`, `rollback`, `status`, `OtaError`, `BankStatus` |
-| `sovd/security` | Security provider | `SecurityProvider` trait, `TestSecurityProvider` (XOR 0xFF for dev) |
-| `sovd_main` | HTTP server entry point | `vm-sovd <nv-path> <provisioning-authority> [options] [bind-addr]` |
+| `component` | Async component trait | `Component` (`id`, `capabilities`, + DID / install / lifecycle / HSM methods, all defaulted to `NotSupported`), `DidEntry` |
+| `machine` | Top-level registry | `Machine` trait, `MachineRegistry`, `MachineRegistryBuilder` |
+| `types` | Domain types | `Capabilities`, `FlashCaps`, `LifecycleCaps`, `HsmCaps`, `DidKind`, `DidFilter`, `DtcFilter`, `FlashId`, `FlashSession`, `RuntimeState`, `Csr`, `EnvelopeStream` |
+| `error` | Error enum | `MachineError` (`NotSupported`, `NotFound`, `InvalidArgument`, `PolicyRejected`, `ManifestInvalid`, `UnknownFlashSession`, `Storage`, `Internal`), `MachineResult` |
 
-**Dependencies:** `nv-store`, `sovd-core`, `sovd-api`, `sumo-onboard`, `sumo-processor`, `sumo-crypto`, `hsm`, `axum`, `tokio`, `tracing`
+Re-exports `ActivationState`, `FlashState`, `FlashStatus`, `FlashProgress`, `Fault`, `FaultsResult`, `ClearFaultsResult`, `PackageInfo`, `VerifyResult`, `EntityInfo`, `ParameterInfo`, `DataValue` from `sovd-core`.
+
+**Dependencies:** `async-trait`, `bytes`, `serde`, `sovd-core`
+
+### hypervisor-mgr
+
+| Module | Purpose | Key Exports |
+|--------|---------|-------------|
+| `backend` | Legacy per-component state machine | `VmBackend<D>` (implements `sovd-core::DiagnosticBackend` historically), `ComponentConfig` |
+| `component_adapter` | Component impl | `VmBackendComponent<D>` — thin wrapper that exposes `VmBackend` via `machine_mgr::Component` |
+| `diag_backend` | SOVD wire adapter | `ComponentDiagBackend` — routes `sovd-core::DiagnosticBackend` calls through to `Component` |
+| `suit_provider` | SUIT envelope validation | `SuitProvider` (signature, digest, security version checks) |
+| `manifest_provider` | Validation trait | `ManifestProvider` (pluggable) |
+| `manifest` | Factory YAML | `FirmwareManifest`, `FactoryManifest`, `ImageMeta` |
+| `streaming` | Upload pipeline | Streaming decrypt (AES-128-GCM + ECDH-ES+A128KW) + decompress (zstd) |
+| `did` | DID resolution | `read_did`, `write_did`, `DidValue`, DID constants (F187-F19E + FD00-FD06) |
+| `ota` | OTA lifecycle | `install`, `commit`, `rollback`, `status`, `OtaError`, `BankStatus` |
+| `ifs` | Boot-image activation | `IfsActivator` trait, `IfsError`, `dev::` + `hardware::` impls |
+| `sovd/security` | Security provider | `SecurityProvider` trait, `TestSecurityProvider` (XOR 0xFF for dev) |
+| `main` | CLI | `vm-diagserver <nv-path> <cmd> [...]` |
+| `sovd_main` | HTTP server | `vm-sovd <nv-path> <provisioning-authority> [options] [bind-addr]` |
+
+**Dependencies:** `nv-store`, `machine-mgr`, `hsm` (crypto feature), `sovd-core`, `sovd-api`, `sumo-onboard`, `sumo-processor`, `sumo-crypto`, `sumo-codec`, `axum`, `tokio`, `tracing`, `coset`, `ruzstd`
 
 ```mermaid
 graph LR
-    subgraph diagserver
+    subgraph hypervisor-mgr
+        DB[diag_backend.rs<br/>ComponentDiagBackend]
+        CA[component_adapter.rs<br/>VmBackendComponent]
+        VB[backend.rs<br/>VmBackend]
         D[did.rs]
         O[ota.rs]
         MF[manifest.rs]
-        H[sovd/handlers.rs]
-        R[sovd/router.rs]
-        S[sovd/state.rs]
-        M[sovd/models.rs]
-        E[sovd/error.rs]
+        SP[suit_provider.rs]
+        ST[streaming.rs]
+        IF[ifs/]
+        SEC[sovd/security.rs]
+    end
+
+    subgraph machine-mgr
+        CT[Component trait]
+        MA[Machine + MachineRegistry]
+        TYS[types / Capabilities]
     end
 
     subgraph boot
         BM2[BootManager]
-        BE[BootBackend]
-        QE[QemuBackend]
-        CF[Config]
+        CF[VmProfile / Config]
     end
 
     subgraph nv-store
@@ -226,18 +373,21 @@ graph LR
         BL[BlockDevice]
     end
 
-    H --> D
-    H --> O
-    H --> MF
-    H --> S
-    H --> M
-    H --> E
-    R --> H
+    DB --> MA
+    DB --> CA
+    CA -- implements --> CT
+    CA --> VB
+    VB --> D
+    VB --> O
+    VB --> MF
+    VB --> SP
+    VB --> ST
+    VB --> SEC
+    VB --> IF
     D --> NV
     O --> NV
-    S --> NV
+    VB --> NV
     BM2 --> NV
-    QE -.-> BE
     NV --> TY2
     NV --> BL
 ```
@@ -260,8 +410,8 @@ classDiagram
         Vm1 = 1
         Vm2 = 2
         Hsm = 3
-        Qtd = 4 (reserved)
-        +all() [BankSet; 4]
+        Boot = 4 (IFS image, A/B)
+        +all() [BankSet; 5]
         +from_str(s) Option~BankSet~
     }
 
@@ -364,7 +514,7 @@ classDiagram
 
     class BootManager~D~ {
         nv: NvStore~D~
-        +process_boot() [BootAction; 3]
+        +process_boot() [BootAction; NUM_BANK_SETS]
         +verify_image(set, bank, data) HashCheck
         +handle_hash_failure(set) BootAction
         +active_bank(set) Option~Bank~
@@ -389,13 +539,6 @@ classDiagram
         +to_image_meta() ImageMeta
     }
 
-    class FirmwareBundle {
-        manifest: FirmwareManifest
-        image: Vec~u8~
-        +pack(manifest, image) Vec~u8~
-        +unpack(data) Result
-    }
-
     NvBootState ..|> NvRecord
     NvFactory ..|> NvRecord
     NvFwMeta ..|> NvRecord
@@ -413,7 +556,6 @@ classDiagram
     NvStore --> BlockDevice
     BootManager --> NvStore
     BootManager ..> BootAction
-    FirmwareBundle --> FirmwareManifest
 ```
 
 ## Data Flow
@@ -422,41 +564,39 @@ classDiagram
 
 ```mermaid
 sequenceDiagram
-    participant R as vm-runner
+    participant S as vm-service
     participant BM as BootManager
     participant NV as NvStore
-    participant Q as QemuBackend
-    participant VM as QEMU VM
+    participant R as QemuRunner
+    participant IVS as ivshmem / vm-devices
+    participant VM as QEMU / qvm
 
-    R->>NV: Open NV file (re-opens each iteration)
-    R->>BM: process_boot()
+    S->>NV: Open NV store (FileBlockDevice)
+    S->>BM: process_boot()
     BM->>NV: read_boot_state()
-    NV-->>BM: NvBootState (3 bank sets)
+    NV-->>BM: NvBootState (NUM_BANK_SETS entries)
 
     alt First Boot
         BM->>NV: write_boot_state(defaults)
-        BM-->>R: [FirstBoot; 3]
+        BM-->>S: [FirstBoot; NUM_BANK_SETS]
     else Committed
-        BM-->>R: Boot { bank }
-    else Trial (count <= 10)
+        BM-->>S: Boot { bank }
+    else Trial (count <= MAX_TRIAL_BOOTS)
         BM->>NV: write_boot_state(count+1)
-        BM-->>R: TrialBoot { bank, count }
-    else Trial (count > 10)
+        BM-->>S: TrialBoot { bank, count }
+    else Trial (count > MAX_TRIAL_BOOTS)
         BM->>NV: write_boot_state(other bank, committed)
-        BM-->>R: AutoRollback { from, to }
+        BM-->>S: AutoRollback { from, to }
     end
 
-    R->>Q: start_vm(profile, set, bank, image_dir)
-    Q->>Q: Start ivshmem-server(s) + wait for socket
-    Q->>Q: Start simulators (health, time, CAN, HSM)
-    Q->>Q: Sleep 500ms for init
-    Q->>Q: build_qemu_args(profile, ivshmem sockets)
-    Q->>VM: Launch QEMU (spawn)
-    R->>Q: wait_vm(handle)
-    VM-->>Q: Exit
-    Q-->>R: exit code
-    R->>Q: cleanup() [kill processes, remove sockets, clean /dev/shm]
-    Note over R: Check Ctrl+C flag, loop restarts
+    S->>R: start(name, def)
+    R->>IVS: Start ivshmem-server(s) + device sims (health, time, CAN)
+    R->>R: build QEMU / qvm args per VmDefinition + VmBankConfig
+    R->>VM: Launch (spawn)
+    S->>VM: HealthMonitor polls liveness
+    VM-->>R: Exit
+    S->>R: stop / cleanup (kill processes, remove sockets, clean /dev/shm)
+    Note over S: control-socket clients can request restart, which re-runs process_boot
 ```
 
 ### OTA Update via SOVD (Full Flash Flow)
@@ -464,40 +604,45 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant C as HTTP Client
-    participant H as VmBackend
+    participant D as ComponentDiagBackend
+    participant V as VmBackend (vm1)
     participant S as SuitProvider
+    participant ST as streaming pipeline
     participant NV as NvStore
     participant FS as Bank Directory
 
-    C->>H: PUT /components/vm1/modes/session { "programming" }
-    C->>H: PUT /components/vm1/modes/security { seed/key }
+    C->>D: PUT /components/vm1/modes/session { "programming" }
+    C->>D: PUT /components/vm1/modes/security { seed/key }
 
-    C->>H: POST /components/vm1/files (SUIT envelope)
-    H->>S: validate(envelope) — signature + security version
-    H-->>C: { upload_id: "1", state: "uploaded" }
+    C->>D: POST /components/vm1/files (SUIT envelope)
+    D->>V: upload envelope
+    V->>S: validate(envelope) — signature + security version
+    V-->>C: { upload_id, state: "uploaded" }
 
-    C->>H: POST /components/vm1/files/1/verify
-    H->>S: verify digests against manifest
-    H-->>C: { state: "verified" }
+    C->>D: POST /components/vm1/files/{upload_id}/verify
+    V->>S: verify digests against manifest
+    V-->>C: { state: "verified" }
 
-    C->>H: POST /components/vm1/flash/transfer { file_id: "1" }
-    Note over H: Streaming multi-payload flash
-    C->>H: PUT payloads: #kernel, #firmware, #config
-    H->>H: decrypt (AES-128-GCM) + decompress (zstd) each payload
-    H->>FS: write kernel + rootfs to staged files
-    H->>FS: write vm-config.yaml to staged file
-    H->>NV: copy_runtime(Vm1, A -> B)
-    H->>FS: rename staged files → target bank directory
-    H->>FS: flip current symlink → target bank
-    H->>NV: write_fw_meta(Vm1, B, new_meta)
-    H->>NV: write_boot_state(active=B, committed=false)
-    H-->>C: { transfer_id, state: "completed" }
+    C->>D: POST /components/vm1/flash/transfer { file_id }
+    Note over V,ST: Streaming multi-payload flash
+    C->>D: PUT payloads: #kernel, #firmware, #config
+    V->>ST: decrypt (AES-128-GCM + ECDH-ES+A128KW) + decompress (zstd)
+    ST->>FS: write kernel + rootfs to staged files
+    ST->>FS: write vm-config.yaml to staged file
+    V->>NV: copy_runtime(Vm1, A -> B)
+    V->>FS: rename staged files → target bank directory
+    V->>FS: flip current symlink → target bank
+    V->>NV: write_fw_meta(Vm1, B, new_meta)
+    V->>NV: write_boot_state(active=B, committed=false)
+    V-->>C: { transfer_id, state: AwaitingActivation }
+
+    Note over C,V: state machine now follows sovd-core::FlashState:<br/>AwaitingActivation → AwaitingReboot → Activated → Committed
 
     Note over C: POST /restart → vm-service restarts VM with new bank config
 
-    C->>H: POST /components/vm1/flash/commit
-    H->>NV: raise min_security_ver, write committed=true
-    H-->>C: { success: true }
+    C->>D: POST /components/vm1/flash/commit
+    V->>NV: raise min_security_ver, write committed=true
+    V-->>C: { state: Committed }
 ```
 
 ### DID Resolution
@@ -531,7 +676,7 @@ sequenceDiagram
             alt Found in Factory
                 D-->>H: Bytes(data)
             else Not in Factory
-                Note over D: 4. Dynamic DIDs (FD00-FD04)
+                Note over D: 4. Dynamic DIDs (FD00-FD06)
                 alt Known Dynamic DID
                     D-->>H: Bytes(computed from boot state)
                 else Unknown
@@ -554,7 +699,7 @@ sequenceDiagram
     participant NV as NvStore
 
     S->>S: cargo build
-    S->>D: factory-init example/factory/ --runner-path target/debug/vm-runner
+    S->>D: factory-init example/factory/ [--runner-path <binary>]
 
     D->>NV: Open/create NV file
     D->>NV: Ensure boot state exists
@@ -562,32 +707,32 @@ sequenceDiagram
     D->>D: Parse example/factory/factory.yaml
     D->>NV: write_factory(serial, VIN, HW IDs)
 
-    loop For each {hypervisor, vm1, vm2}.yaml
+    loop For each {hypervisor, vm1, vm2, hsm}.yaml
         D->>D: Parse manifest YAML
-        D->>D: Hash corresponding image (if exists)
+        D->>D: Hash corresponding image (runner binary for hypervisor, {name}.img otherwise)
         D->>NV: write_fw_meta(set, Bank::A, meta)
     end
 
     D-->>S: "initialization complete"
-    S->>S: Start vm-sovd on :4000
+    S->>S: Start vm-sovd on :4000 (+ SOVD-security-helper on :9100)
 ```
 
 ## State Management
 
 | State | Type | Location | Reads | Writes |
 |-------|------|----------|-------|--------|
-| Boot State | `NvBootState` (5x `BankBootState`) | NV offset 0x0, 2 sectors | `process_boot`, `status`, `read_did` (dynamic DIDs), `install`, `commit`, `rollback` | `process_boot`, `install`, `commit`, `rollback` |
+| Boot State | `NvBootState` (`NUM_BANK_SETS` x `BankBootState`) | NV offset 0x0, 2 sectors | `process_boot`, `status`, `read_did` (dynamic DIDs), `install`, `commit`, `rollback` | `process_boot`, `install`, `commit`, `rollback` |
 | Factory Data | `NvFactory` | NV offset 0x2000, 2 sectors | `read_did` (F18A-F193) | `provision`, `factory-init` (write-once) |
 | FW Metadata | `NvFwMeta` (per set, per bank) | NV offset 0x10000+, 4 sectors each | `read_did` (F187-F19E), `verify_image`, `status`, `install` (anti-rollback check) | `install`, `commit` (raise floor), `factory-init` |
 | Runtime DIDs/DTCs | `NvRuntime` (per set, per bank) | NV offset varies, 8 sectors each | `read_did`, `list_faults` | `write_did`, `install` (copy-on-update), `clear_faults` |
-| App Data | `NvApp` | NV offset 0x4000, 2 sectors | (not yet used by diagserver) | (not yet used by diagserver) |
-| SOVD shared NV | `AppState<D>` = `Arc<Mutex<NvStore<D>>>` | In-memory (Tokio) | All SOVD handlers | All mutating handlers |
-| Upload Store | `UploadStore` = `Arc<Mutex<{files, transfers}>>` | In-memory (Tokio) | `get_upload_status`, `verify_file`, `start_transfer`, `transfer_progress`, `finalize_transfer` | `upload_file`, `verify_file`, `start_transfer` |
-| VM process state | `QemuBackend.host_processes` + `sockets` | In-memory | `is_running`, `wait_vm` | `start_vm`, `stop_vm`, `cleanup`, `Drop` |
-| Ctrl+C flag | `AtomicBool` (SeqCst) | In-memory (vm-runner) | Boot loop condition | `ctrlc` signal handler |
+| App Data | `NvApp` | NV offset 0x4000, 2 sectors | (reserved) | (reserved) |
+| Secstore blobs | `Secstore<E, B>` (key metadata) | File backend (dev) or board-specific | `vhsm-ssd` handler on every op | `vhsm-ssd` on key generate / delete |
+| SOVD shared state | `Arc<dyn Machine>` wrapping per-component `Arc<Mutex<VmBackend<D>>>` | In-memory (Tokio) | All SOVD handlers | All mutating handlers |
+| Upload/transfer state | Per-component mutex-guarded maps inside `VmBackend` | In-memory (Tokio) | upload status / verify / transfer handlers | upload / verify / transfer handlers |
+| VM process state | `VmManager` / per-runner `HostProcess` tracking | In-memory (vm-service) | `VmManager::status`, HealthMonitor | `start`, `stop`, `restart`, `Drop` |
 
 **NV State Lifecycle:**
-- **Initialized:** First call to `process_boot()`, `vm-boot --init`, or diagserver auto-creates
+- **Initialized:** First call to `process_boot()`, `vm-boot --init`, or `vm-diagserver` / `vm-sovd` auto-creates
 - **Provisioned:** `factory-init` or `provision` writes factory + FW meta (one-time)
 - **Updated:** OTA install writes FW meta + boot state; commit/rollback modifies boot state
 - **Persisted:** Every NV write calls `dev.sync()` for power-loss safety
@@ -602,46 +747,49 @@ sequenceDiagram
 | `vm-boot <nv-path>` | Process boot decisions, print actions for all bank sets |
 | `vm-boot <nv-path> --init` | Create NV file if missing, then process boot |
 
-### CLI: vm-runner
-
-| Command | Description |
-|---------|-------------|
-| `vm-runner --profile <toml> --nv <path> --images <dir> [--sim-dir <dir>] [--init]` | Continuous boot loop: process_boot -> start QEMU -> wait -> cleanup -> repeat. Ctrl+C exits after current VM. |
-
 ### CLI: vm-diagserver
 
 | Command | Description |
 |---------|-------------|
 | `vm-diagserver <nv> status <set>` | Show bank status (active bank, committed, boot count, versions) |
-| `vm-diagserver <nv> install <set> <image> <ver> <secver>` | Install OTA image to inactive bank |
-| `vm-diagserver <nv> install-bundle <bundle.vmfb>` | Install from VMFB bundle (auto-resolves bank set) |
+| `vm-diagserver <nv> install <set> <image> <ver> <secver>` | Install OTA image to inactive bank (raw image, for local testing) |
 | `vm-diagserver <nv> commit <set>` | Commit trial bank, raise anti-rollback floor |
 | `vm-diagserver <nv> rollback <set>` | Rollback to previous bank |
-| `vm-diagserver <nv> read-did <set> <did-hex>` | Read DID value (e.g., F189, 0xFD10) |
+| `vm-diagserver <nv> read-did <set> <did-hex>` | Read DID value (e.g., F189, 0xFD04) |
 | `vm-diagserver <nv> write-did <set> <did-hex> <val>` | Write runtime DID |
 | `vm-diagserver <nv> provision <serial> <vin>` | Write factory data (one-time) |
 | `vm-diagserver <nv> factory-init <dir> [--runner-path <path>]` | Initialize from YAML manifests in directory |
-| `vm-diagserver _ pack <manifest.yaml> <image> <output.vmfb>` | Create VMFB firmware bundle |
+
+`<set>` is one of `hypervisor`, `vm1`, `vm2`, `hsm` (with legacy aliases `hyp`, `os1`, `os2`, and `boot`/`qtd` for the IFS bank). The production OTA path is SUIT envelopes over the SOVD HTTP API — the CLI `install` command is a dev-only fast-path that skips SUIT validation.
+
+### Binary: vm-service
+
+| Invocation | Description |
+|------------|-------------|
+| `vm-service --config <path.yaml>` | VM lifecycle daemon. Loads a `VmServiceConfig`, auto-starts any VMs flagged `auto_start`, and exposes a control API on a Unix socket (Linux) or TCP port (QNX). |
 
 ### HTTP: vm-sovd (SOVD REST API)
 
+Wire-compatible with `sovd-core` / `sovd-api`. The surface below is the current adapter — see `sovd-api` for the canonical schema.
+
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check (`{ status: "ok", components: 4 }`) |
 | GET | `/vehicle/v1/components` | List components (hypervisor, vm1, vm2, hsm) with capabilities |
 | GET | `/vehicle/v1/components/{id}` | Get single component info |
-| GET | `/vehicle/v1/components/{id}/data` | List all DIDs (21 standard + runtime DIDs) |
+| GET | `/vehicle/v1/components/{id}/data` | List all DIDs (standard + runtime DIDs) |
 | GET | `/vehicle/v1/components/{id}/data/{param}` | Read DID by name (`fw_version`) or hex (`F189`, `0xF189`) |
 | PUT | `/vehicle/v1/components/{id}/data/{param}` | Write runtime DID (`{"value": "..."}`) — read-only DIDs return 403 |
 | GET | `/vehicle/v1/components/{id}/faults` | List DTCs with status and active flag |
 | DELETE | `/vehicle/v1/components/{id}/faults` | Clear all DTCs |
-| POST | `/vehicle/v1/components/{id}/files` | Upload VMFB firmware bundle (octet-stream body) |
-| GET | `/vehicle/v1/components/{id}/files/{upload_id}` | Get upload status (uploaded/verified) |
-| POST | `/vehicle/v1/components/{id}/files/{upload_id}/verify` | Verify image hash and size against manifest |
-| POST | `/vehicle/v1/components/{id}/flash/transfer` | Start flash transfer (`{"file_id": "..."}`) |
-| GET | `/vehicle/v1/components/{id}/flash/transfer/{id}` | Get transfer progress (percent) |
-| PUT | `/vehicle/v1/components/{id}/flash/transfer/{id}` | Finalize transfer |
-| GET | `/vehicle/v1/components/{id}/flash/activation` | Get activation state (committed/trial, versions) |
+| PUT | `/vehicle/v1/components/{id}/modes/session` | Set diagnostic session (e.g. `programming`) |
+| PUT | `/vehicle/v1/components/{id}/modes/security` | Seed/key security unlock |
+| POST | `/vehicle/v1/components/{id}/files` | Upload SUIT envelope (octet-stream body) |
+| GET | `/vehicle/v1/components/{id}/files/{upload_id}` | Get upload status |
+| POST | `/vehicle/v1/components/{id}/files/{upload_id}/verify` | Verify digests against manifest |
+| POST | `/vehicle/v1/components/{id}/flash/transfer` | Start flash transfer |
+| GET | `/vehicle/v1/components/{id}/flash/transfer/{id}` | Get transfer progress |
+| PUT | `/vehicle/v1/components/{id}/flash/transfer/{id}` | Stream encrypted payloads (`#kernel`, `#firmware`, `#config`) |
+| GET | `/vehicle/v1/components/{id}/flash/activation` | Get activation state (see `FlashState`: `AwaitingActivation`, `AwaitingReboot`, `Activated`, `Committed`, `RolledBack`, `Failed`) |
 | POST | `/vehicle/v1/components/{id}/flash/commit` | Commit trial bank |
 | POST | `/vehicle/v1/components/{id}/flash/rollback` | Rollback trial bank |
 
@@ -649,16 +797,17 @@ sequenceDiagram
 
 | Command | Description |
 |---------|-------------|
-| `./example/run.sh` | Build, factory-init, start SOVD server on :4000 |
-| `./example/run.sh --profile <toml> --images <dir>` | Full boot loop + SOVD server |
+| `./example/run.sh` | Build, factory-init, start SOVD server (:4000) + SOVD-security-helper (:9100) |
+| `./example/run.sh --fresh` | Wipe NV store first |
 | `./example/run.sh --no-init` | Skip factory initialization |
 | `./example/run.sh --addr <host:port>` | Custom SOVD bind address |
+| `./example/run.sh --profile <toml> --images <dir>` | Full boot loop variant (depends on a `vm-runner` binary that is not currently built) |
 
-### Script: mkbundle.sh
+### Script: build.sh
 
 | Command | Description |
 |---------|-------------|
-| `./scripts/mkbundle.sh <manifest.yaml> <image> <output.vmfb>` | Create VMFB firmware bundle |
+| `./example/build.sh` | Generate SUIT signing keys, reference manifests, and encrypted demo firmware for the integration tests |
 
 ## External Dependencies
 
@@ -674,11 +823,17 @@ sequenceDiagram
 | `serde_yaml` | 0.9 | Firmware/factory manifest parsing | Any YAML parser |
 | `axum` | 0.8 | HTTP framework for SOVD server | Any async HTTP framework |
 | `tokio` | 1 | Async runtime (rt-multi-thread, macros, net) | Required by Axum |
-| `tower-http` | 0.6 | CORS middleware | Any CORS middleware |
+| `async-trait` | 0.1 | `async` in the `Component` trait | Required until native async-trait |
 | `tracing` | 0.1 | Structured logging | Any logging framework |
 | `tracing-subscriber` | 0.3 | Log output with env-filter | Any log subscriber |
-| `libc` | 0.2 | Process existence check (`kill(pid, 0)`) | Direct syscall |
-| `ctrlc` | 3 | Ctrl+C signal handling in boot loop | Manual signal handling |
+| `libc` | 0.2 | Process existence check (`kill(pid, 0)`), signal handling | Direct syscall |
+| `bytes` | 1 | Zero-copy buffers for the streaming pipeline | Any buffer type |
+| `ruzstd` | 0.7 | zstd decompression for SUIT payloads | `zstd` crate |
+| `coset` | 0.3 | COSE envelope parsing (SUIT + HSM keys) | Any COSE lib |
+| `futures` | 0.3 | Stream combinators for upload pipeline | Required |
+| `tokio-util` | 0.7 | `io` integration for streaming body → async-read | Required |
+| `sovd-core` / `sovd-api` | git | SOVD wire types + `DiagnosticBackend` trait | Owned by the SOVDd project |
+| `sumo-onboard` / `sumo-crypto` / `sumo-codec` / `sumo-processor` | git | SUIT validation, streaming crypto, decompression, command interpreter | Owned by the sumo-rs project |
 
 ### Dev/Test Only
 
@@ -687,6 +842,9 @@ sequenceDiagram
 | `http-body-util` | 0.1 | Body extraction in SOVD integration tests |
 | `tower` | 0.5 | `ServiceExt::oneshot()` for test HTTP calls |
 | `hyper` | 1 | Low-level HTTP for test request building |
+| `ciborium` | 0.2 | CBOR roundtrip in unit tests |
+| `tempfile` | 3 | Temp dirs/files in integration tests |
+| `sumo-offboard` | git | Test-side SUIT envelope builder |
 
 ## Design Patterns & Decisions
 
@@ -699,11 +857,17 @@ Each NV region has 2-8 rotated sectors. Writes go to the sector with the lowest 
 ### NvRecord Trait for Uniform Serialization
 All NV types implement `NvRecord` with a common pattern: 4-byte magic, 4-byte write_seq, payload, CRC at sector end. This allows generic `read_record<T>` / `write_record<T>` functions. Wire format is manual little-endian byte packing (no serde) for deterministic binary layout.
 
-### Backend Trait for Hypervisor Abstraction
-`BootBackend` trait abstracts VM launch/stop/wait/cleanup. `QemuBackend` is the full development implementation (ivshmem-server management, simulator lifecycle, QEMU arg construction, automatic cleanup on Drop). `QnxBackend` is a placeholder for production QNX qvm integration.
+### Runner Trait for Hypervisor Abstraction
+`VmRunner` (in `vm-service::runner`) abstracts VM launch/stop/wait/cleanup. `QemuRunner` is the full Linux development implementation (ivshmem-server management via `vm-service::ivshmem`, device-simulator lifecycle via `vm-devices`, QEMU arg construction, cleanup on `Drop`). `QnxRunner` is a stub for production QNX qvm integration; `DummyRunner` is a no-op for components that don't own a VM (e.g. HSM, IFS). Device simulators, shared-memory transport, and clocks live in `vm-devices` so the same code compiles on Linux (ivshmem) and QNX (native shm).
+
+### Component Trait for Semantic API
+`machine_mgr::Component` is the per-component async API behind the SOVD wire adapter. Each `Component` declares `Capabilities` and exposes only the operations it actually supports — everything else has a `NotSupported` default. Today every concrete component is a `hypervisor_mgr::component_adapter::VmBackendComponent<D>` wrapping a `VmBackend<D>` bound to a `BankSet`; as the rewrite progresses, more methods will be implemented directly on the adapter and the legacy `VmBackend` surface will shrink.
+
+### SOVD Wire Adapter
+`hypervisor_mgr::diag_backend::ComponentDiagBackend` implements `sovd-core::DiagnosticBackend`. It holds an `Arc<dyn Machine>` and routes each SOVD call to the appropriate `Component`. Wire compatibility with `sovd-client` and the SOVD Explorer stays intact; machine-side code sees only the `Component` trait.
 
 ### DID Resolution Priority Chain
-Runtime (writable, per-bank) > FW Meta (software identity, per-bank) > Factory (hardware identity, shared) > Dynamic (computed from boot state). This mirrors automotive UDS conventions where workshop-written values override factory defaults. Dynamic DIDs (0xFD00-FD04) are computed on-the-fly from boot state.
+Runtime (writable, per-bank) > FW Meta (software identity, per-bank) > Factory (hardware identity, shared) > Dynamic (computed from boot state). This mirrors automotive UDS conventions where workshop-written values override factory defaults. Dynamic DIDs (0xFD00-FD06) are computed on-the-fly from boot state and health telemetry.
 
 ### Copy-on-Update
 Before OTA writes to the inactive bank, runtime DIDs and DTCs are cloned from the active bank. This preserves user configuration across updates. If the source bank has no runtime data, an empty default is written.
@@ -717,36 +881,36 @@ Hypervisor, VM1, and VM2 have completely independent A/B state machines with sep
 ### Multi-Component SUIT Envelopes
 Firmware updates use SUIT envelopes with multiple components: kernel (#kernel), rootfs (#firmware), and VM config (#config). All payloads are compressed (zstd) and encrypted (AES-128-GCM + ECDH-ES+A128KW) per-device. The VM config (vm-config.yaml) is delivered alongside firmware so it rolls back automatically with the firmware bank.
 
-### Arc<Mutex<NvStore>> for SOVD Concurrency
-The HTTP server wraps `NvStore` in `Arc<Mutex<>>` so multiple Axum handlers can safely share mutable access. Lock scope is kept minimal (per-handler). Upload state is separately mutex'd to avoid contention.
-
-### Fluent Builder for QemuBackend
-`QemuBackend::new().qemu_bin(...).sim_dir(...).try_kvm(true)` - optional configuration without complex constructors. KVM is auto-detected on aarch64 with `/dev/kvm`.
+### Per-Component Mutex for SOVD Concurrency
+The HTTP server holds an `Arc<dyn Machine>`; each component is an `Arc<Mutex<VmBackend<D>>>` under the adapter. Multiple Axum handlers can safely share mutable access to the same component, and the four components lock independently. Upload/transfer state is separately mutex'd inside `VmBackend` to avoid contention with NV writes.
 
 ### QEMU Device Enumeration
 Devices are added in reverse order in QEMU args because the virt machine enumerates PCI devices in reverse. This ensures rootfs is always `/dev/vda`, data is `/dev/vdb`, etc.
+
+### Encrypted Key Metadata (Secstore)
+The `secstore` crate separates "where bytes live" (`SecstoreBackend`) from "how they are encrypted" (`SecstoreEncryptor`). Dev builds pair `FileBackend` with `LinuxSimEncryptor` (static AES key). Production replaces the encryptor with an HSE-backed implementation so the wrapping key never leaves the secure boundary. `vhsm-ssd` is the single writer — writes are atomic (write-to-temp + rename) to survive power loss.
 
 ## Recreation Blueprint
 
 ### 1. Project Scaffolding
 
 ```bash
-cargo init --name vm-mgr
+cargo init --name sumo-vm-mgr
 # Convert to workspace
-mkdir -p crates/{nv-store,boot,diagserver}/src
-mkdir -p specs profiles firmware scripts
+mkdir -p crates/{nv-store,secstore,boot,hsm,vhsm-ssd,vm-devices,vm-service,machine-mgr,hypervisor-mgr}/src
+mkdir -p specs example/{factory,profiles,templates,config,keys}
 # Edit Cargo.toml: [workspace] resolver = "2", members = [...]
 ```
 
 ### 2. Core Types to Define First (nv-store)
 
-1. `Bank` enum (A/B) with `other()` and `from_u8()`, and `BankSet` enum (Hypervisor/Vm1/Vm2/Hsm/Qtd) with `from_str()` and `all()`
+1. `Bank` enum (A/B) with `other()` and `from_u8()`, and `BankSet` enum (Hypervisor/Vm1/Vm2/Hsm/Boot) with `from_str()` and `all()`
 2. `BlockDevice` trait with `read`, `write`, `sync`, `size`
 3. `MemBlockDevice` (for tests) and `FileBlockDevice` (open + create)
 4. `NvRecord` trait with `MAGIC`, `serialize`, `deserialize`, `size`, `write_seq`, `set_write_seq`
 5. Helper functions: `put_u32_le`, `get_u32_le`, `put_u16_le`, `get_u16_le`, `put_bytes`, `get_bytes<N>`
-6. Wire format structs: `NvBootState` (20 bytes), `NvFactory` (200 bytes), `NvFwMeta` (324 bytes), `NvRuntime` (792 bytes), `NvApp` (2060 bytes)
-7. `DidEntry` (35 bytes wire) and `DtcEntry` (5 bytes wire)
+6. Wire format structs for `NvBootState`, `NvFactory`, `NvFwMeta`, `NvRuntime`, `NvApp` (each sized to fit within sector padding + CRC)
+7. `DidEntry` and `DtcEntry` fixed-size records
 
 **Critical detail:** All serialization is manual little-endian byte packing (no serde for wire format). CRC-32 covers bytes `[0..4092]`, stored at `[4092..4096]`. Sector size is exactly 4096 bytes.
 
@@ -755,30 +919,30 @@ mkdir -p specs profiles firmware scripts
 | Phase | Crate | Module | Depends On |
 |-------|-------|--------|------------|
 | 1 | nv-store | `types`, `block` | crc32fast |
-| 2 | nv-store | `store` (rotation + NvStore<D>) | types, block |
-| 3 | boot | `lib` (BootManager) | nv-store, sha2 |
-| 4 | boot | `config` (VmProfile) | serde, toml |
-| 5 | boot | `backend`, `qemu`, `qnx` | config, libc |
-| 6 | boot | `main`, `bin/runner` | lib, backend, config, ctrlc |
-| 7 | diagserver | `did` | nv-store |
-| 8 | diagserver | `ota` | nv-store, sha2, crc32fast |
-| 9 | diagserver | `manifest` | ota, serde_yaml |
-| 10 | diagserver | `main` (CLI, 10 commands) | did, ota, manifest |
-| 11 | diagserver | `sovd/*` (HTTP server) | did, ota, manifest, axum, tokio |
-| 12 | diagserver | `sovd_main` | sovd/router |
+| 2 | nv-store | `store` (rotation + `NvStore<D>`) | types, block |
+| 3 | secstore | `SecstoreEncryptor`, `SecstoreBackend`, `Secstore<E,B>`, `FileBackend`, `LinuxSimEncryptor` | aes-gcm |
+| 4 | boot | `lib` (`BootManager`) + `config` (`VmProfile`) | nv-store, sha2, serde, toml |
+| 5 | hsm | `HsmProvider` + `HsmCryptoProvider` traits, `SimHsm`, CBOR payload schema | secstore, RustCrypto (with `crypto` feature) |
+| 6 | vhsm-ssd | proto + codec, handle table, policy, handler, transport | hsm (crypto), secstore |
+| 7 | vm-devices | transport, clock, regs, can/health/time sims | libc, shared-memory primitives |
+| 8 | vm-service | config, runner trait + `QemuRunner` / `QnxRunner` / `DummyRunner`, `VmManager`, `HealthMonitor`, control API | vm-devices, serde_yaml, tokio |
+| 9 | machine-mgr | types (`Capabilities`, `FlashId`, ...), `Component` trait, `Machine` + `MachineRegistry`, re-exports from `sovd-core` | async-trait, sovd-core |
+| 10 | hypervisor-mgr | `ota`, `did`, `manifest`, `suit_provider`, `streaming`, `ifs`, `sovd::security` | nv-store, sumo-onboard / crypto / codec / processor, sovd-core / sovd-api, hsm |
+| 11 | hypervisor-mgr | `backend::VmBackend`, `component_adapter::VmBackendComponent`, `diag_backend::ComponentDiagBackend` | machine-mgr, above |
+| 12 | hypervisor-mgr | `main` (vm-diagserver CLI) + `sovd_main` (vm-sovd HTTP server) | all of the above, axum |
 
 ### 4. Key Implementation Notes
 
-- **NV partition layout offsets** are hardcoded constants in `store.rs:layout`. Each bank set's base is at `0x010000 + set_index * 0x018000`. FW Meta A/B and Runtime A/B are at fixed relative offsets within each bank set.
+- **NV partition layout offsets** are hardcoded constants in `nv-store::store::layout`. Each bank set's base is at `0x010000 + set_index * 0x018000`. FW Meta A/B and Runtime A/B are at fixed relative offsets within each bank set.
 - **Sector rotation**: always scan all sectors to find max `write_seq`. Never assume write order. An empty sector (wrong magic) is preferred over overwriting the oldest valid one. The sequence number wraps with `wrapping_add(1)`.
-- **QEMU backend**: ivshmem-server sockets at `/tmp/bali-ivshmem-*.sock`, shared memory at `/dev/shm/ivshmem-*`. Stale sockets/shm are cleaned before launch. Wait up to 5s (50 * 100ms) for socket creation. 500ms delay after simulator start before QEMU launch.
-- **Image naming convention**: `{set}-{bank}.img` (e.g., `vm1-a.img`, `hypervisor-b.img`).
+- **ivshmem / device sims**: ivshmem-server sockets and `/dev/shm/ivshmem-*` segments are cleaned before launch. Device simulators (`vm-devices`) attach to the same shared-memory region on the host side; guests see a standard ivshmem PCI device on Linux and shm/IPC on QNX.
+- **Image naming convention**: `{set}-{bank}.img` (e.g., `vm1-a.img`, `hypervisor-b.img`) in `--images-dir`.
 - **DID hex parsing**: Both SOVD handlers and CLI accept `"F189"`, `"0xF189"`, and `"0xf189"` formats.
 - **Factory provision is write-once**: no update path. The `factory-init` command skips if data exists.
-- **SOVD handler locking**: acquire mutex, do NV operations, drop lock before returning. Upload store has separate mutex to avoid contention with NV.
-- **VMFB bundle**: Magic `VMFB` (4 bytes), version 1 (u32 LE), manifest YAML length (u32 LE), YAML bytes, image bytes. `component_id` last element resolves to BankSet.
-- **QEMU cleanup on Drop**: `QemuBackend` implements `Drop` to kill all host processes and clean up sockets/shm, preventing resource leaks.
-- **vm-runner re-opens NV** each loop iteration because the diagserver may have written to it concurrently.
+- **SOVD handler locking**: per-component `Arc<Mutex<VmBackend<D>>>`; acquire, do NV / upload / transfer work, drop before returning.
+- **SUIT envelope**: multi-payload COSE_Sign1 envelope carrying `#kernel`, `#firmware`, and `#config`; signature validated against the provisioning-authority public key, secver checked against the anti-rollback floor, payloads decrypted (AES-128-GCM + ECDH-ES+A128KW) and decompressed (zstd) on the fly.
+- **Cleanup on Drop**: each runner (`QemuRunner` etc.) implements `Drop` to kill host processes and clean up sockets/shm, preventing resource leaks.
+- **vm-sovd can run standalone** — if `--vm-service-socket` isn't passed it still serves diagnostics; VM lifecycle commands just fail fast.
 
 ### 5. Configuration & Environment
 
@@ -786,14 +950,17 @@ mkdir -p specs profiles firmware scripts
 |----------|---------|---------|
 | `VM_MGR_NV` | `/tmp/vm-mgr-nv.bin` | NV store file path (run.sh) |
 | `VM_MGR_SOVD_ADDR` | `0.0.0.0:4000` | SOVD server bind address (run.sh) |
+| `VM_MGR_HELPER_PORT` | `9100` | SOVD-security-helper bind port (run.sh) |
 | `RUST_LOG` | (none) | Tracing filter (e.g., `vm_sovd=info,tower_http=debug`) |
 
 ### 6. Testing Approach
 
-- **Unit tests** use `MemBlockDevice` (zero I/O, deterministic, instant)
-- **NV store tests** (21): roundtrip serialization, sector rotation, CRC corruption detection/fallback, bank isolation, copy-on-update
-- **Boot tests** (30+): first boot, committed boot, trial increment, auto-rollback at 10, hash verification, bank set independence, full OTA cycle, config parsing, QEMU command generation
-- **Diagserver tests** (50+): DID resolution priority, factory/FW meta/runtime DID reads, runtime write/update/full, dynamic DIDs, OTA install/commit/rollback lifecycle, anti-rollback enforcement, manifest parsing, bundle pack/unpack
-- **SOVD integration tests** (30+): HTTP handler tests using `tower::ServiceExt::oneshot()` (no real server), covering all endpoints, error cases (404, 403, 409), full flash upload/verify/transfer/commit flow, CORS headers
-- **No external test dependencies** (no Docker, no network, no filesystem for unit tests)
-- **Total:** ~100+ tests across the workspace (`cargo test`)
+- **Unit tests** use `MemBlockDevice` (zero I/O, deterministic, instant).
+- **nv-store tests:** roundtrip serialization, sector rotation, CRC corruption detection/fallback, bank isolation, copy-on-update.
+- **boot tests:** first boot, committed boot, trial increment, auto-rollback at `MAX_TRIAL_BOOTS`, hash verification, bank-set independence, config parsing.
+- **secstore tests:** metadata roundtrip, delete/list idempotency, wrong-key rejection, truncated-buffer rejection.
+- **hsm / vhsm-ssd tests:** sign/verify/encrypt/decrypt/mac/derive roundtrips, handle allocator, policy ACL, SUIT-based key provisioning.
+- **hypervisor-mgr tests:** DID resolution priority, OTA install/commit/rollback lifecycle, anti-rollback enforcement, SUIT validation (good + tampered envelopes), CRL manifests, streaming pipeline decrypt+decompress.
+- **SOVD integration tests:** HTTP handler tests using `tower::ServiceExt::oneshot()` (no real server), covering all endpoints, error cases (404, 403, 409), full session/security/upload/verify/transfer/commit flow, and the `ComponentDiagBackend` wrapper.
+- **No external test dependencies** (no Docker, no network, no filesystem for unit tests — integration tests use `tempfile`).
+- **Total:** 425+ tests across the workspace (`cargo test`).

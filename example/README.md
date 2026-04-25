@@ -6,14 +6,16 @@ Generate demo artifacts (signing keys + signed SUIT envelopes with 1MB dummy fir
 cargo run --example build
 ```
 
-This creates:
+This creates (names reflect the current `cargo run --example build` output —
+check `output/` if the versioning scheme drifts):
 
-| File | Component | Sequence | Use case |
-|------|-----------|----------|----------|
-| `output/vm1-v1.suit` | vm1 | 1 | Initial flash |
-| `output/vm1-v2.suit` | vm1 | 2 | Upgrade |
-| `output/vm2-v1.suit` | vm2 | 1 | Initial flash |
-| `output/vm2-v2.suit` | vm2 | 2 | Upgrade |
+| File | Component | Use case |
+|------|-----------|----------|
+| `output/vm1-v1.0.0.suit` | vm1 | Initial flash |
+| `output/vm1-v1.1.0.suit` | vm1 | Upgrade (same secver, fleet test) |
+| `output/vm1-v1.2.0.suit` | vm1 | Upgrade with secver=2 |
+| `output/vm1-crl-secver2.suit` | vm1 | CRL (raises anti-rollback floor) |
+| `output/vm2-v1.0.0.suit` | vm2 (QNX) | Initial flash |
 
 ## Quick start
 

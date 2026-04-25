@@ -6,7 +6,7 @@ Platform-agnostic VM lifecycle manager for automotive ECUs. Handles A/B bank swi
 
 ```bash
 cargo build
-cargo test                      # 105+ tests
+cargo test                      # 425+ tests
 
 # Generate SUIT signing keys + encrypted firmware + CRL manifests
 cargo run --example build
@@ -25,26 +25,41 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────┐
-│ vm-mgr                                        │
-│                                               │
-│  nv-store        NV data: boot state, FW meta,│
-│  (lib)           factory, runtime DIDs, DTCs   │
-│                                               │
-│  vm-boot         Boot decisions, trial count,  │
-│  (lib)           hash verify, auto-rollback    │
-│                                               │
-│  vm-service      QEMU lifecycle, per-bank     │
-│  (lib+bin)       VM config, restart via IPC    │
-│                                               │
-│  vm-diagserver   SUIT validation, OTA engine,  │
-│  (lib+bins)      DID resolution, VmBackend     │
-│       │                                        │
-│       ├── sovd-core (DiagnosticBackend trait)  │
-│       ├── sovd-api  (HTTP routing)            │
-│       ├── sumo-onboard (SUIT validation)      │
-│       └── sumo-processor (command sequences)  │
-└──────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│ sumo-vm-mgr (cargo workspace)                              │
+│                                                            │
+│  nv-store        NV data: boot state, FW meta, factory,    │
+│  (lib)           runtime DIDs, DTCs — pluggable block dev  │
+│                                                            │
+│  secstore        Encrypted key-metadata persistence        │
+│  (lib)           (pluggable encryptor + backend)           │
+│                                                            │
+│  vm-boot         Boot decisions, trial count, hash verify, │
+│  (lib+bin)       auto-rollback                             │
+│                                                            │
+│  hsm             HSM management: SimHsm (dev) / QnxHsm     │
+│  (lib)           (stub); HsmCryptoProvider trait           │
+│                                                            │
+│  vhsm-ssd        vHSM v2 daemon (handle-based protocol)    │
+│  (lib+bin)       terminating guest /dev/vhsm               │
+│                                                            │
+│  vm-devices      Virtual CAN/health/time device simulators │
+│  (lib)           on shared memory (ivshmem/QNX shm)        │
+│                                                            │
+│  vm-service      QEMU/qvm lifecycle, per-bank VM config,   │
+│  (lib+bin)       ivshmem server, IPC to diagnostics daemon │
+│                                                            │
+│  machine-mgr     Platform-agnostic Machine/Component       │
+│  (lib)           trait — hypervisor / vm1 / vm2 / hsm      │
+│                                                            │
+│  hypervisor-mgr  SUIT validation, OTA engine, DID          │
+│  (lib+bins)      resolution, SOVD wire adapter             │
+│       │                                                    │
+│       ├── sovd-core     (DiagnosticBackend trait)          │
+│       ├── sovd-api      (HTTP routing)                     │
+│       ├── sumo-onboard  (SUIT validation)                  │
+│       └── sumo-processor (command sequences)               │
+└───────────────────────────────────────────────────────────┘
 ```
 
 ### Crates
@@ -52,9 +67,14 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | Crate | Binaries | Purpose |
 |-------|----------|---------|
 | `nv-store` | — | Sector-rotated NV storage with CRC-32 integrity |
+| `secstore` | — | Encrypted key-metadata persistence, pluggable encryptor + backend |
 | `vm-boot` | `vm-boot` | Boot decisions, trial counting, auto-rollback |
-| `vm-service` | `vm-service` | QEMU lifecycle management, per-bank VM config, restart via IPC |
-| `vm-diagserver` | `vm-sovd` | SUIT+SOVD: manifest validation, OTA engine, DID resolution, REST server |
+| `hsm` | — | HSM management trait (`HsmProvider` / `HsmCryptoProvider`) |
+| `vhsm-ssd` | `vhsm-ssd` | host-side vHSM v2 daemon, vsock/QNX-shm transports |
+| `vm-devices` | — | CAN / health / time simulators (host-side) |
+| `vm-service` | `vm-service` | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config |
+| `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic) |
+| `hypervisor-mgr` | `vm-sovd` | SUIT + SOVD: validation, OTA engine, DID resolution |
 
 ## SUIT Manifest Integration
 
@@ -141,12 +161,23 @@ Flash operations require programming session + security unlock:
 ## Key Concepts
 
 - **Four components**: hypervisor, vm1, vm2 (A/B banked), hsm (single-bank, no rollback)
-- **Two-process architecture**: vm-service (QEMU lifecycle) + vm-sovd (diagnostics/OTA via SOVD)
+- **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA via SOVD)
 - **Per-bank VM config**: vm-config.yaml in bank directories, delivered alongside firmware via OTA
 - **Multi-component SUIT**: kernel + rootfs + vm-config as separate payloads (#kernel, #firmware, #config)
 - **Trial boot**: Up to 10 reboots before auto-rollback to previous bank
 - **Copy-on-update**: Runtime DIDs/DTCs cloned to target bank before OTA write
 - **NV persistence**: Boot state, security floor survive power cycles (sector-rotated, CRC-protected)
+
+## Target platforms
+
+| Target | Maturity | Notes |
+|--------|----------|-------|
+| Linux dev (QEMU + file-backed NV) | full | OTA + commit + rollback end-to-end, all tests pass |
+| QNX-emulated (QNX host, sim peripherals) | partial | `QnxRunner` wired; needs QNX `SharedMemory`/`Doorbell` + `BlockDevice` + `NullCanBackend` stubs |
+| QNX + real HSE / CAN | trait-only | `QnxHsm`, `HseEncryptor`, QNX CAN adapter still to write |
+
+Business logic (OTA engine, NV store, SUIT validation, DID resolution) is
+platform-independent — only the trait implementations change per target.
 
 ## NV Store Layout
 
