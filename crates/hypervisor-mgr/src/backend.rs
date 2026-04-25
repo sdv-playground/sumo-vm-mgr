@@ -1602,21 +1602,27 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn validate(&self) -> BackendResult<()> {
-        // Idempotent re-validation. Today this is a state-only transition;
-        // a future commit will re-read the inactive bank and re-verify the
-        // SUIT signature + image hash so the orchestrator can force a
-        // re-check across power cycles in long-running fleet campaigns.
+        // Idempotent re-validation. Accepts either pre-finalize
+        // (AwaitingActivation) or post-finalize (AwaitingReboot, dual-bank)
+        // — the latter lets the orchestrator down-shift to Validated for
+        // re-verification across power cycles before committing to reset.
+        // Already in Validated is a no-op.
+        //
+        // Today this is a state-only transition; a follow-up will re-read
+        // the inactive bank and re-verify the SUIT signature + image hash.
         let mut ft = self.flash_transfer.lock().unwrap();
         let transfer = ft
             .as_mut()
             .ok_or_else(|| BackendError::EntityNotFound("No flash transfer in progress".into()))?;
         match transfer.state {
-            FlashState::AwaitingActivation | FlashState::Validated => {
+            FlashState::AwaitingActivation
+            | FlashState::Validated
+            | FlashState::AwaitingReboot => {
                 transfer.state = FlashState::Validated;
                 Ok(())
             }
             other => Err(BackendError::InvalidRequest(format!(
-                "validate() requires AwaitingActivation or Validated, got {:?}",
+                "validate() requires AwaitingActivation, Validated, or AwaitingReboot, got {:?}",
                 other
             ))),
         }
