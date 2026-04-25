@@ -1,10 +1,18 @@
-/// Boot manager core logic.
-///
-/// On every boot:
-/// 1. Read NV Boot State
-/// 2. For each bank set, handle trial mode (increment count, auto-rollback)
-/// 3. Verify image hashes (SHA-256 from FW Meta)
-/// 4. Return boot decisions for the caller to act on
+//! Boot manager core logic — runs before launching the hypervisor or
+//! guest VMs and decides, for each bank set, whether to boot the active
+//! bank, count a trial boot, or auto-rollback.
+//!
+//! On every boot:
+//! 1. Read NV Boot State
+//! 2. For each bank set, handle trial mode (increment `boot_count`;
+//!    auto-rollback once `boot_count > MAX_TRIAL_BOOTS`)
+//! 3. Verify image hashes (SHA-256 recorded in FW Meta) against the
+//!    real image bytes
+//! 4. Return one `BootAction` per bank set for the caller to execute
+//!
+//! Platform-independent — runs against any [`nv_store::block::BlockDevice`]
+//! plus a byte slice for image verification. Actual VM launch is the
+//! caller's job (QEMU on Linux dev, `qvm` on QNX).
 
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
