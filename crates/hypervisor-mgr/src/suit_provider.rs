@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
 
 use nv_store::types::BankSet;
-use sumo_crypto::RustCryptoBackend;
+use sumo_crypto::{CryptoBackend, RustCryptoBackend};
 use sumo_onboard::error::Sum2Error;
 use sumo_onboard::platform::PlatformOps;
 use sumo_onboard::Validator;
@@ -23,6 +23,41 @@ use sumo_onboard::orchestrator;
 
 use crate::manifest_provider::{ManifestError, ManifestProvider, ManifestType, ValidatedFirmware};
 use crate::ota::ImageMeta;
+
+/// Translate a `Sum2Error` into a `ManifestError` with an accurate cause.
+///
+/// `Sum2Error::AuthFailed` is overloaded — it's returned both when the
+/// manifest digest doesn't match the authentication wrapper AND when the
+/// COSE_Sign1 signature doesn't verify against any trust anchor. To pick
+/// the right user-facing message, we decode the envelope and re-check the
+/// digest manually: if the digest fails, the error is digest-mismatch;
+/// otherwise the signature is the cause.
+fn map_sum2_error(err: Sum2Error, envelope_bytes: &[u8], crypto: &RustCryptoBackend) -> ManifestError {
+    match err {
+        Sum2Error::AuthFailed => {
+            // Decompose AuthFailed into digest-mismatch vs signature-invalid
+            // by re-running the digest check. If decode itself fails we fall
+            // back to the generic message.
+            if let Ok(envelope) = sumo_codec::decode::decode_envelope(envelope_bytes) {
+                let expected = &envelope.authentication.digest.bytes;
+                let actual = crypto.sha256(&envelope.manifest_bytes);
+                if actual.as_slice() != expected.as_slice() {
+                    return ManifestError::SignatureInvalid(format!(
+                        "manifest digest mismatch: authentication wrapper expects {} but manifest hashes to {}",
+                        hex::encode(expected),
+                        hex::encode(actual)
+                    ));
+                }
+            }
+            ManifestError::SignatureInvalid("COSE_Sign1 signature verification failed".into())
+        }
+        Sum2Error::RollbackRejected => {
+            ManifestError::ParseError("anti-rollback check failed".into())
+        }
+        Sum2Error::Revoked => ManifestError::ParseError("trust anchor revoked".into()),
+        other => ManifestError::ParseError(format!("{other:?}")),
+    }
+}
 
 /// URI key for the integrated firmware payload inside the SUIT envelope.
 const INTEGRATED_PAYLOAD_KEY: &str = "#firmware";
@@ -99,13 +134,9 @@ impl SuitProvider {
         let manifest_type = peek_manifest_type(data)?;
         let trust_anchor = self.trust_anchor_for(manifest_type)?;
 
-        // Diagnostic: log the trust anchor bytes so we can verify the loaded
-        // key matches what the manifest is signed with. Hex-encoded so it's
-        // easy to byte-compare against signing.pub on disk.
-        tracing::info!(
+        tracing::debug!(
             manifest_type = ?manifest_type,
             trust_anchor_len = trust_anchor.len(),
-            trust_anchor_hex = %hex::encode(&trust_anchor),
             "validating envelope"
         );
 
@@ -120,12 +151,7 @@ impl SuitProvider {
 
         let manifest = validator
             .validate_envelope(data, &crypto, 0)
-            .map_err(|e| match e {
-                Sum2Error::AuthFailed => {
-                    ManifestError::SignatureInvalid("COSE_Sign1 verification failed".into())
-                }
-                other => ManifestError::ParseError(format!("{other:?}")),
-            })?;
+            .map_err(|e| map_sum2_error(e, data, &crypto))?;
 
         let secver = manifest.security_version(0).unwrap_or(0);
         if secver < min_security_ver as u64 {
@@ -243,12 +269,7 @@ impl ManifestProvider for SuitProvider {
         // Validate envelope: signature, digest
         let manifest = validator
             .validate_envelope(data, &crypto, 0)
-            .map_err(|e| match e {
-                Sum2Error::AuthFailed => {
-                    ManifestError::SignatureInvalid("COSE_Sign1 verification failed".into())
-                }
-                other => ManifestError::ParseError(format!("{other:?}")),
-            })?;
+            .map_err(|e| map_sum2_error(e, data, &crypto))?;
 
         // Check security_version against floor
         let secver = manifest.security_version(0).unwrap_or(0);
