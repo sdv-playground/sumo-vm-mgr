@@ -99,6 +99,16 @@ impl SuitProvider {
         let manifest_type = peek_manifest_type(data)?;
         let trust_anchor = self.trust_anchor_for(manifest_type)?;
 
+        // Diagnostic: log the trust anchor bytes so we can verify the loaded
+        // key matches what the manifest is signed with. Hex-encoded so it's
+        // easy to byte-compare against signing.pub on disk.
+        tracing::info!(
+            manifest_type = ?manifest_type,
+            trust_anchor_len = trust_anchor.len(),
+            trust_anchor_hex = %hex::encode(&trust_anchor),
+            "validating envelope"
+        );
+
         let mut validator = Validator::new(&trust_anchor, None);
         if manifest_type == ManifestType::Firmware {
             if let Some(dk) = self.current_device_key() {

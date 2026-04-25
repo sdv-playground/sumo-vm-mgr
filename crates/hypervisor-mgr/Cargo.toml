@@ -30,6 +30,7 @@ sumo-processor = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", bran
 sumo-crypto = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 sumo-codec = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 hsm = { path = "../hsm", features = ["crypto"] }
+hex = "0.4.3"
 
 [dev-dependencies]
 http-body-util = "0.1"
