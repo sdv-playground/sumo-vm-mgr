@@ -1,6 +1,6 @@
 /// Health monitoring via ivshmem shared memory.
 ///
-/// Protocol from cvc-vm-spec vhealth_regs.h:
+/// Protocol from guest-vm-spec vhealth_regs.h:
 ///   [0x800..0x83F]  Guest→Host heartbeat (magic, state, seq, flags)
 ///   [0x840..0x85F]  Host→Guest power commands (shutdown)
 ///

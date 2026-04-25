@@ -78,8 +78,8 @@ cargo test -p hypervisor-mgr wrapper_http
 
 ## 7. Sibling-repo build (skip — siblings consume binaries, not Cargo deps)
 
-`grep -rl "hypervisor-mgr\|machine-mgr"` across `cvc-vm-linux`,
-`cvc-vm-qnx`, `qemu-qnx-host` shows only `qemu-qnx-host/scripts/build.sh`
+`grep -rl "hypervisor-mgr\|machine-mgr"` across `guest-vm-debian`,
+`guest-vm-qnx`, `qemu-qnx-host` shows only `qemu-qnx-host/scripts/build.sh`
 references our crate names. No sibling imports our types via Cargo, so
 cross-repo `cargo check` adds no signal. Re-evaluate if a sibling starts
 depending on `machine-mgr` directly.

@@ -70,7 +70,7 @@ On every boot, the boot manager executes:
 6. Start VMs from vm1/vm2 active banks
 ```
 
-## OTA Update Flow (vm-diagserver)
+## OTA Update Flow (hypervisor-mgr)
 
 ```
 1. Receive OTA image for a bank set (e.g., vm1)

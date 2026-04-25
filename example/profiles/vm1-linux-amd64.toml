@@ -13,7 +13,7 @@ arch = "x86_64"
 ram_mb = 2048
 cpus = 4
 kernel = "bzImage"
-# net.ifnames=0 keeps eth0 naming consistent with cvc-vm-linux.
+# net.ifnames=0 keeps eth0 naming consistent with guest-vm-debian.
 extra_cmdline = "net.ifnames=0 vcan_shm.backend=ivshmem vcan_shm.num_devices=1"
 
 # Disk order matters — on x86_64 (forward PCI enumeration):
