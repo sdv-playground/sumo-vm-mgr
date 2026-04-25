@@ -1601,6 +1601,76 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         Ok(())
     }
 
+    async fn validate(&self) -> BackendResult<()> {
+        // Idempotent re-validation. Today this is a state-only transition;
+        // a future commit will re-read the inactive bank and re-verify the
+        // SUIT signature + image hash so the orchestrator can force a
+        // re-check across power cycles in long-running fleet campaigns.
+        let mut ft = self.flash_transfer.lock().unwrap();
+        let transfer = ft
+            .as_mut()
+            .ok_or_else(|| BackendError::EntityNotFound("No flash transfer in progress".into()))?;
+        match transfer.state {
+            FlashState::AwaitingActivation | FlashState::Validated => {
+                transfer.state = FlashState::Validated;
+                Ok(())
+            }
+            other => Err(BackendError::InvalidRequest(format!(
+                "validate() requires AwaitingActivation or Validated, got {:?}",
+                other
+            ))),
+        }
+    }
+
+    async fn invalidate(&self) -> BackendResult<()> {
+        // Demote a previously-validated transfer back to AwaitingActivation —
+        // the orchestrator should re-call validate() before proceeding. Used
+        // when the bank can't be hardware-sealed and a power cycle could
+        // have introduced drift.
+        let mut ft = self.flash_transfer.lock().unwrap();
+        let transfer = ft
+            .as_mut()
+            .ok_or_else(|| BackendError::EntityNotFound("No flash transfer in progress".into()))?;
+        match transfer.state {
+            FlashState::Validated => {
+                transfer.state = FlashState::AwaitingActivation;
+                Ok(())
+            }
+            other => Err(BackendError::InvalidRequest(format!(
+                "invalidate() requires Validated, got {:?}",
+                other
+            ))),
+        }
+    }
+
+    async fn activate(&self) -> BackendResult<()> {
+        // Schedule activation. For dual-bank components the activation
+        // event is the reboot — we move to AwaitingReboot and the
+        // orchestrator must call ecu_reset() to complete. For single-bank
+        // components (HSM, config) the artifact write itself was the
+        // activation event during finalize, so we go straight to
+        // Activated; the orchestrator should then commit_flash() to
+        // reach the Complete terminal.
+        let mut ft = self.flash_transfer.lock().unwrap();
+        let transfer = ft
+            .as_mut()
+            .ok_or_else(|| BackendError::EntityNotFound("No flash transfer in progress".into()))?;
+        match transfer.state {
+            FlashState::Validated => {
+                transfer.state = if self.config.single_bank {
+                    FlashState::Activated
+                } else {
+                    FlashState::AwaitingReboot
+                };
+                Ok(())
+            }
+            other => Err(BackendError::InvalidRequest(format!(
+                "activate() requires Validated, got {:?}",
+                other
+            ))),
+        }
+    }
+
     async fn ecu_reset(&self, _reset_type: u8) -> BackendResult<Option<u8>> {
         // VM "reset" — simulate reboot:
         // 1. Switch running_bank to NV active_bank (the bank install() staged)

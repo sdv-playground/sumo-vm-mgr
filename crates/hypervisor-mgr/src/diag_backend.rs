@@ -271,6 +271,21 @@ impl DiagnosticBackend for ComponentDiagBackend {
         }
     }
 
+    // validate / invalidate / activate are not (yet) routed through the
+    // Component trait — machine-mgr has no equivalent ops. Delegate
+    // directly to the legacy VmBackend implementation.
+    async fn validate(&self) -> BackendResult<()> {
+        self.fallback.validate().await
+    }
+
+    async fn invalidate(&self) -> BackendResult<()> {
+        self.fallback.invalidate().await
+    }
+
+    async fn activate(&self) -> BackendResult<()> {
+        self.fallback.activate().await
+    }
+
     async fn list_flash_transfers(&self) -> BackendResult<Vec<FlashStatus>> {
         self.fallback.list_flash_transfers().await
     }
