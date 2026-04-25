@@ -115,6 +115,11 @@ struct FlashTransferState {
     package_id: String,
     state: FlashState,
     image_size: u64,
+    /// Heartbeat sequence number captured just before reset.
+    /// `Verifying → Activated` promotes once the live `hb_seq` drops
+    /// below this baseline (i.e. the guest restarted and started
+    /// counting from zero).
+    verify_baseline_hb_seq: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +810,41 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             Err(format!("vm-service returned: {}", response.lines().next().unwrap_or("empty")))
         }
     }
+
+    /// Whether the guest backing this component has finished its
+    /// post-update boot. Used by `get_activation_state` to lazily
+    /// promote `Verifying → Activated`.
+    ///
+    /// True when:
+    /// - there is no guest concept (no vm-service socket configured), or
+    /// - vm-service reports `guest_state == 1` (running), AND
+    ///   - we have a pre-reset baseline (the VM was running before the
+    ///     reset): the live `hb_seq` must be below that baseline,
+    ///     proving the heartbeat counter rolled and the new firmware
+    ///     is the one reporting (not the still-draining old instance);
+    ///   - we have no baseline (VM was offline pre-reset, e.g. factory
+    ///     provision): `state == 1` is sufficient since there's no
+    ///     stale heartbeat to confuse with.
+    fn guest_is_running(&self) -> bool {
+        let socket = match &self.vm_service_socket {
+            Some(s) => s,
+            None => return true,
+        };
+        let baseline = self
+            .flash_transfer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|t| t.verify_baseline_hb_seq);
+        match query_vm_health(socket, &self.entity_info.id) {
+            Some(h) if h.guest_state != 1 => false,
+            Some(h) => match baseline {
+                Some(b) => h.hb_seq < b,
+                None => true,
+            },
+            None => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,6 +1159,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 package_id: String::new(),
                 state: FlashState::Transferring,
                 image_size: content_length.unwrap_or(0),
+                verify_baseline_hb_seq: None,
             });
         }
 
@@ -1259,6 +1300,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 package_id: String::new(),
                 state: FlashState::Transferring,
                 image_size: 0,
+                verify_baseline_hb_seq: None,
             });
             return Ok(transfer_id);
         };
@@ -1325,6 +1367,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 package_id: package_id.to_string(),
                 state: FlashState::AwaitingActivation,
                 image_size: 0,
+                verify_baseline_hb_seq: None,
             });
             return Ok(transfer_id);
         }
@@ -1441,6 +1484,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 package_id: package_id.to_string(),
                 state: FlashState::AwaitingActivation,
                 image_size,
+                verify_baseline_hb_seq: None,
             });
             return Ok(transfer_id);
         }
@@ -1700,11 +1744,45 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         }
         // Single-bank components: no bank switch, always bank A, always committed
 
-        // Advance flash state
+        // For dual-bank components, snapshot the live hb_seq before the
+        // VM restarts. Promotion out of Verifying needs a baseline to
+        // distinguish "the previous fw is still draining" from "the new
+        // fw is now reporting" — the new fw boots with hb_seq starting
+        // from zero, so a value below the baseline proves the counter
+        // rolled.
+        //
+        // Only meaningful if the VM was actually running pre-reset.
+        // For the factory-provision case (VM was offline) we leave the
+        // baseline as `None`; `guest_is_running` then just waits for
+        // `state == 1` since there's no stale heartbeat to confuse with.
+        let baseline_hb_seq = if self.config.single_bank {
+            None
+        } else {
+            self.vm_service_socket
+                .as_ref()
+                .and_then(|sock| query_vm_health(sock, &self.entity_info.id))
+                .filter(|h| h.guest_state == 1)
+                .map(|h| h.hb_seq)
+        };
+
+        // Advance flash state.
+        //
+        // Single-bank (HSM): no reboot, no trial — already Activated since
+        // finalize_flash, leave it.
+        //
+        // Dual-bank (VM, hypervisor): the bank flip starts the new
+        // firmware coming up. Move to Verifying; get_activation_state
+        // will lazily promote to Activated once the component-specific
+        // health check (vm-service guest health for VMs) reports ready.
         {
             let mut ft = self.flash_transfer.lock().unwrap();
             if let Some(ref mut t) = *ft {
-                t.state = FlashState::Activated;
+                if self.config.single_bank {
+                    t.state = FlashState::Activated;
+                } else {
+                    t.state = FlashState::Verifying;
+                    t.verify_baseline_hb_seq = baseline_hb_seq;
+                }
             }
         }
 
@@ -1799,6 +1877,27 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     async fn get_activation_state(&self) -> BackendResult<ActivationState> {
         // Check upload phase first (streaming firmware download in progress)
         let upload_state = self.upload_phase.lock().unwrap().clone();
+
+        // If we're in Verifying, ask the component's health source whether
+        // it's now ready. Promote to Activated lazily on poll so the
+        // orchestrator just sees the state advance — no background task,
+        // no out-of-band signal.
+        if matches!(*self.flash_transfer.lock().unwrap(),
+            Some(ref t) if t.state == FlashState::Verifying)
+        {
+            if self.guest_is_running() {
+                let mut ft = self.flash_transfer.lock().unwrap();
+                if let Some(ref mut t) = *ft {
+                    if t.state == FlashState::Verifying {
+                        t.state = FlashState::Activated;
+                        tracing::info!(
+                            component = %self.entity_info.id,
+                            "verifying → activated (guest health ok)"
+                        );
+                    }
+                }
+            }
+        }
 
         let flash_state = {
             let ft = self.flash_transfer.lock().unwrap();
