@@ -479,7 +479,7 @@ fn build_encrypted_envelope(
     let recipient_pub = CoseKey::from_cose_key_bytes(recipient_pub_cbor).unwrap();
 
     // Compress
-    let compressed = encryptor::compress_firmware(cbor_payload, 3).unwrap();
+    let compressed = encryptor::compress_firmware(cbor_payload, 3, None).unwrap();
 
     // Encrypt (ECDH-ES+A128KW + AES-128-GCM)
     // Use a fresh ephemeral sender key for each envelope
