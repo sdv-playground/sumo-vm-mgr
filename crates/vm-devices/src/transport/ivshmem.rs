@@ -277,7 +277,7 @@ pub fn connect_ivshmem_server(
         )));
     }
     for (i, b) in path_bytes.iter().enumerate() {
-        addr.sun_path[i] = *b as i8;
+        addr.sun_path[i] = *b as libc::c_char;
     }
 
     let ret = unsafe {
@@ -419,4 +419,3 @@ fn recv_ivshmem_msg(sock_fd: i32) -> Result<(i64, Option<i32>), TransportError> 
 
     Ok((val, recv_fd))
 }
-
