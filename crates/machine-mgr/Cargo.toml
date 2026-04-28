@@ -10,7 +10,7 @@ bytes = "1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sovd-core = { git = "ssh://git@github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

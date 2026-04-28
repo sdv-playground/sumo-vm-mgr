@@ -12,9 +12,9 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 coset = { version = "0.3", default-features = false }
 
-sumo-onboard = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main", optional = true }
-sumo-crypto = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main", optional = true }
-sumo-codec = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main", optional = true }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main", optional = true }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main", optional = true }
+sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main", optional = true }
 
 # RustCrypto — used by HsmCryptoProvider for software crypto (simulation)
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }

@@ -15,7 +15,7 @@ members = [
 # Temporary: point sovd-* deps at the local SOVDd checkout while iterating
 # on the FlashState rename (AwaitingExit→AwaitingActivation, AwaitingReset→
 # AwaitingReboot). Remove once SOVDd is committed + pushed.
-[patch."ssh://git@github.com/sdv-playground/SOVDd.git"]
+[patch."https://github.com/sdv-playground/SOVDd.git"]
 sovd-core = { path = "../SOVDd/crates/sovd-core" }
 sovd-api = { path = "../SOVDd/crates/sovd-api" }
 
@@ -25,10 +25,9 @@ sovd-api = { path = "../SOVDd/crates/sovd-api" }
 # what local development has, which made debugging signature mismatches
 # hard. Drop this only if you've fully released sumo-rs and want to pin
 # vm-sovd to a published revision.
-[patch."ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git"]
+[patch."https://github.com/tr-sdv-sandbox/sumo-rs.git"]
 sumo-codec = { path = "../sumo-rs/sumo-codec" }
 sumo-crypto = { path = "../sumo-rs/sumo-crypto" }
 sumo-onboard = { path = "../sumo-rs/sumo-onboard" }
 sumo-offboard = { path = "../sumo-rs/sumo-offboard" }
 sumo-processor = { path = "../sumo-rs/sumo-processor" }
-
