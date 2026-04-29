@@ -11,23 +11,3 @@ members = [
     "crates/vm-devices",
     "crates/secstore",
 ]
-
-# Temporary: point sovd-* deps at the local SOVDd checkout while iterating
-# on the FlashState rename (AwaitingExit→AwaitingActivation, AwaitingReset→
-# AwaitingReboot). Remove once SOVDd is committed + pushed.
-[patch."https://github.com/sdv-playground/SOVDd.git"]
-sovd-core = { path = "../SOVDd/crates/sovd-core" }
-sovd-api = { path = "../SOVDd/crates/sovd-api" }
-
-# Point sumo-* deps at the local sumo-rs checkout so vm-sovd links the
-# same source tree as sumo-tool (built in components/sumo-rs). Without
-# this the git+ssh dep gives cargo's git cache a chance to diverge from
-# what local development has, which made debugging signature mismatches
-# hard. Drop this only if you've fully released sumo-rs and want to pin
-# vm-sovd to a published revision.
-[patch."https://github.com/tr-sdv-sandbox/sumo-rs.git"]
-sumo-codec = { path = "../sumo-rs/sumo-codec" }
-sumo-crypto = { path = "../sumo-rs/sumo-crypto" }
-sumo-onboard = { path = "../sumo-rs/sumo-onboard" }
-sumo-offboard = { path = "../sumo-rs/sumo-offboard" }
-sumo-processor = { path = "../sumo-rs/sumo-processor" }
