@@ -1,6 +1,6 @@
-# vm-mgr
+# sumo-vm-mgr
 
-Platform-agnostic VM lifecycle manager for automotive ECUs. Handles A/B bank switching, boot decisions, OTA software updates with SUIT manifest validation, encrypted firmware, and SOVD-compatible diagnostics.
+Platform-agnostic machine manager for automotive ECUs. Handles A/B bank switching, boot decisions, OTA software updates with SUIT manifest validation, encrypted firmware, and SOVD-compatible diagnostics.
 
 ## Quick Start
 
@@ -35,7 +35,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  (lib)           (pluggable encryptor + backend)           │
 │                                                            │
 │  vm-boot         Boot decisions, trial count, hash verify, │
-│  (lib+bin)       auto-rollback                             │
+│  (lib+bin)       auto-rollback (all bank sets)             │
 │                                                            │
 │  hsm             HSM management: SimHsm (dev) / QnxHsm     │
 │  (lib)           (stub); HsmCryptoProvider trait           │
@@ -50,9 +50,12 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  (lib+bin)       ivshmem server, IPC to diagnostics daemon │
 │                                                            │
 │  machine-mgr     Platform-agnostic Machine/Component       │
-│  (lib)           trait — hypervisor / vm1 / vm2 / hsm      │
+│  (lib)           trait — host-os / vm1 / vm2 / hsm         │
 │                                                            │
-│  hypervisor-mgr  SUIT validation, OTA engine, DID          │
+│  host-os-mgr     Host OS update: IFS activation, A/B boot  │
+│  (lib)           partition, reboot coordination             │
+│                                                            │
+│  vm-mgr          SUIT validation, OTA engine, DID          │
 │  (lib+bins)      resolution, SOVD wire adapter             │
 │       │                                                    │
 │       ├── sovd-core     (DiagnosticBackend trait)          │
@@ -68,13 +71,24 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 |-------|----------|---------|
 | `nv-store` | — | Sector-rotated NV storage with CRC-32 integrity |
 | `secstore` | — | Encrypted key-metadata persistence, pluggable encryptor + backend |
-| `vm-boot` | `vm-boot` | Boot decisions, trial counting, auto-rollback |
+| `vm-boot` | `vm-boot` | Boot decisions, trial counting, auto-rollback (all bank sets) |
 | `hsm` | — | HSM management trait (`HsmProvider` / `HsmCryptoProvider`) |
-| `vhsm-ssd` | `vhsm-ssd` | host-side vHSM v2 daemon, vsock/QNX-shm transports |
+| `vhsm-ssd` | `vhsm-ssd` | Host-side vHSM v2 daemon, vsock/QNX-shm transports |
 | `vm-devices` | — | CAN / health / time simulators (host-side) |
-| `vm-service` | `vm-service` | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config |
+| `vm-service` | `vm-service` | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config, ivshmem |
 | `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic) |
-| `hypervisor-mgr` | `vm-sovd` | SUIT + SOVD: validation, OTA engine, DID resolution |
+| `host-os-mgr` | — | Host OS Component: IFS activation, A/B partition, reboot |
+| `vm-mgr` | `vm-sovd` | SUIT + SOVD: validation, OTA engine, DID resolution |
+
+### Separation of concerns
+
+```
+vm-boot        — WHEN to boot which bank (runs once at startup)
+vm-service     — HOW to start/stop VMs (QEMU QMP, qvm lifecycle)
+vm-mgr         — WHAT to flash and verify (OTA engine, SUIT, SOVD wire)
+host-os-mgr    — Host-specific: IFS write, partition swap, reboot
+machine-mgr    — Abstract trait layer connecting them all
+```
 
 ## SUIT Manifest Integration
 
@@ -85,8 +99,8 @@ Firmware updates use [RFC 9124 SUIT](https://datatracker.ietf.org/doc/draft-ietf
 - **Compressed payloads** — zstd compression before encryption
 - **Security version** — custom parameter (-257), separate from sequence_number
 - **CRL manifests** — policy-only (no firmware), raises anti-rollback floor
-- **SUIT command sequences** — manifests declare the update flow (install, validate, invoke)
-- **Content-addressable firmware** — manifests ~500 bytes, firmware stored by SHA-256
+- **Multi-payload** — host-os carries `#ifs` + `#rootfs` in one envelope
+- **SUIT command sequences** — manifests declare the update flow
 
 ### Security Version Model
 
@@ -98,24 +112,6 @@ v1.2.0 (seq=3, secver=2)                                   # security-critical f
 CRL manifest (secver=2, no payload, 228 bytes)              # blocks secver < 2
 ```
 
-### Example Firmware
-
-```bash
-cargo run --example build
-```
-
-Generates in `example/output/`:
-
-| File | Description |
-|------|-------------|
-| `vm1-v1.0.0.suit` | Encrypted firmware (secver=1) |
-| `vm1-v1.1.0.suit` | Encrypted firmware (secver=1) |
-| `vm1-v1.2.0.suit` | Encrypted firmware (secver=1) |
-| `vm1-v1.3.0.suit` | Encrypted firmware (secver=1) |
-| `vm1-v1.2.0-secver2-full.suit` | Re-signed with secver=2 |
-| `vm1-crl-secver2.suit` | CRL: blocks secver < 2 (228 bytes) |
-| `firmware/*.bin` | Content-addressable binaries (by SHA-256) |
-
 ## SOVD Server
 
 Uses [sovd-core](https://github.com/sdv-playground/SOVDd) `DiagnosticBackend` trait — wire-format compatible with [sovd-client](https://github.com/sdv-playground/SOVDd) and [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer).
@@ -124,7 +120,7 @@ Uses [sovd-core](https://github.com/sdv-playground/SOVDd) `DiagnosticBackend` tr
 
 | Component | Bank Set | Description |
 |-----------|----------|-------------|
-| `hypervisor` | Hypervisor | Hypervisor A/B bank set |
+| `host-os` | HostOs | Host OS (IFS + rootfs), updated atomically |
 | `vm1` | Vm1 | Primary OS VM (Linux) |
 | `vm2` | Vm2 | Secondary OS VM (QNX) |
 | `hsm` | Hsm | HSM firmware (single-bank, no rollback) |
@@ -145,8 +141,6 @@ POST     /vehicle/v1/components/{id}/flash/rollback    # Rollback trial
 POST     /vehicle/v1/components/{id}/reset             # ECU reset
 ```
 
-Plus data (DIDs), faults (DTCs), and all standard SOVD resource types.
-
 ### Session & Security
 
 Flash operations require programming session + security unlock:
@@ -156,14 +150,14 @@ Flash operations require programming session + security unlock:
 3. `PUT /modes/security {"value": "level1", "key": "..."}` → unlocked
 4. Upload + flash + commit
 
-`SecurityProvider` trait is pluggable — `TestSecurityProvider` (XOR 0xFF) for development, production HSM for deployment. Uses [SOVD Security Helper](https://github.com/skarlsson/SOVD-security-helper) for key derivation.
+`SecurityProvider` trait is pluggable — `TestSecurityProvider` (XOR 0xFF) for development, production HSM for deployment. Uses [SOVD Security Helper](https://github.com/sdv-playground/SOVD-security-helper) for key derivation.
 
 ## Key Concepts
 
-- **Four components**: hypervisor, vm1, vm2 (A/B banked), hsm (single-bank, no rollback)
+- **Four bank sets**: host-os (A/B, IFS+rootfs atomic), vm1, vm2 (A/B), hsm (single-bank)
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA via SOVD)
 - **Per-bank VM config**: vm-config.yaml in bank directories, delivered alongside firmware via OTA
-- **Multi-component SUIT**: kernel + rootfs + vm-config as separate payloads (#kernel, #firmware, #config)
+- **Multi-payload SUIT**: host-os carries IFS + rootfs; VMs carry kernel + rootfs + config
 - **Trial boot**: Up to 10 reboots before auto-rollback to previous bank
 - **Copy-on-update**: Runtime DIDs/DTCs cloned to target bank before OTA write
 - **NV persistence**: Boot state, security floor survive power cycles (sector-rotated, CRC-protected)
@@ -173,13 +167,15 @@ Flash operations require programming session + security unlock:
 | Target | Maturity | Notes |
 |--------|----------|-------|
 | Linux dev (QEMU + file-backed NV) | full | OTA + commit + rollback end-to-end, all tests pass |
-| QNX-emulated (QNX host, sim peripherals) | partial | `QnxRunner` wired; needs QNX `SharedMemory`/`Doorbell` + `BlockDevice` + `NullCanBackend` stubs |
-| QNX + real HSE / CAN | trait-only | `QnxHsm`, `HseEncryptor`, QNX CAN adapter still to write |
+| QNX host (supernova-machine-manager) | working | Collapses vm-service + vm-mgr into single binary |
+| QNX + real HSE / CAN | trait-only | Needs platform `BlockDevice`, HSE backend, CAN adapter |
 
 Business logic (OTA engine, NV store, SUIT validation, DID resolution) is
 platform-independent — only the trait implementations change per target.
 
 ## NV Store Layout
+
+Four bank sets (NUM_BANK_SETS=4):
 
 ```
 Boot State     — active bank, committed flag, boot count (per bank set)
@@ -206,7 +202,6 @@ For CRL manifests: Upload → Apply floor → Done (no flash/reset/commit).
 |---------|-------------|
 | [sumo-rs](https://github.com/tr-sdv-sandbox/sumo-rs) | SUIT manifest library (Rust) |
 | [sumo-sovd](https://github.com/sdv-playground/sumo-sovd) | Campaign orchestrator over SOVD |
-| [sumo-campaign-viewer](https://github.com/sdv-playground/sumo-campaign-viewer) | Campaign visualization tool |
 | [SOVDd](https://github.com/sdv-playground/SOVDd) | SOVD diagnostic server |
 | [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) | Diagnostic GUI |
-| [SUMO specs](https://github.com/tr-sdv-sandbox/sumo) | Specifications and feature mapping |
+| [SOVD Security Helper](https://github.com/sdv-playground/SOVD-security-helper) | Seed/key challenge service |
