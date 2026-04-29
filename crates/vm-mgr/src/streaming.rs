@@ -98,11 +98,10 @@ pub async fn process_envelope_stream(
     let suit_device_key = manifest_provider.device_decryption_key();
 
     let set_name = match bank_set {
-        BankSet::Hypervisor => "hypervisor",
+        BankSet::HostOs => "host-os",
         BankSet::Vm1 => "vm1",
         BankSet::Vm2 => "vm2",
         BankSet::Hsm => "hsm",
-        BankSet::Boot => "boot",
     };
 
     // Map payload keys to component indices by matching URIs in the manifest

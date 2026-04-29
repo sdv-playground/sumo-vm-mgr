@@ -18,7 +18,6 @@ fn boot_state_roundtrip() {
             BankBootState { active_bank: Bank::B, committed: false, boot_count: 7 },
             BankBootState { active_bank: Bank::A, committed: true, boot_count: 0 },
             BankBootState::default(),
-            BankBootState::default(),
         ],
     };
 
@@ -171,10 +170,10 @@ fn fw_meta_rotation_with_4_sectors() {
     for i in 0..10u32 {
         let mut meta = NvFwMeta::default();
         meta.fw_seq = i;
-        store.write_fw_meta(BankSet::Hypervisor, Bank::A, &mut meta).unwrap();
+        store.write_fw_meta(BankSet::HostOs, Bank::A, &mut meta).unwrap();
     }
 
-    let read = store.read_fw_meta(BankSet::Hypervisor, Bank::A).unwrap();
+    let read = store.read_fw_meta(BankSet::HostOs, Bank::A).unwrap();
     assert_eq!(read.write_seq, 10);
     assert_eq!(read.fw_seq, 9);
 }
@@ -272,8 +271,8 @@ fn bank_sets_are_isolated() {
     assert_eq!(&r1b.fw_version[..3], b"1.1");
 
     // Hyp should be untouched
-    assert!(store.read_fw_meta(BankSet::Hypervisor, Bank::A).is_none());
-    assert!(store.read_fw_meta(BankSet::Hypervisor, Bank::B).is_none());
+    assert!(store.read_fw_meta(BankSet::HostOs, Bank::A).is_none());
+    assert!(store.read_fw_meta(BankSet::HostOs, Bank::B).is_none());
 }
 
 // --- Copy-on-update ---

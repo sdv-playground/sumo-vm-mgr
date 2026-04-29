@@ -325,7 +325,7 @@ fn active_bank_query() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    assert_eq!(mgr.active_bank(BankSet::Hypervisor), Some(Bank::A));
+    assert_eq!(mgr.active_bank(BankSet::HostOs), Some(Bank::A));
     assert_eq!(mgr.active_bank(BankSet::Vm1), Some(Bank::A));
     assert_eq!(mgr.active_bank(BankSet::Vm2), Some(Bank::A));
 }

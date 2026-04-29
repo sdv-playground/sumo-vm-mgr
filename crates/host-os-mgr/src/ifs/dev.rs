@@ -8,16 +8,9 @@ use std::path::{Path, PathBuf};
 
 use super::{IfsActivator, IfsError};
 
-/// IFS activator for development (QEMU with QNX6 boot partition).
-///
-/// Activates by mounting the boot partition and copying the IFS
-/// to `{mount_point}/.boot/primary_boot_image.bin`.
 pub struct DevIfsActivator {
-    /// Block device for the boot partition (e.g. `/dev/hd0t177`).
     boot_device: String,
-    /// Where to mount the boot partition (e.g. `/mnt/boot`).
     mount_point: PathBuf,
-    /// Relative path within the boot partition (e.g. `.boot/primary_boot_image.bin`).
     boot_image_rel: String,
 }
 
@@ -33,10 +26,8 @@ impl DevIfsActivator {
 
 impl IfsActivator for DevIfsActivator {
     fn activate(&self, ifs_source: &Path) -> Result<(), IfsError> {
-        // Ensure mount point exists
         std::fs::create_dir_all(&self.mount_point)?;
 
-        // Mount the boot partition read-write if not already mounted
         let mount_check = std::process::Command::new("mount")
             .output()
             .map_err(IfsError::Io)?;
@@ -61,10 +52,8 @@ impl IfsActivator for DevIfsActivator {
         let target = self.mount_point.join(&self.boot_image_rel);
         let target_dir = target.parent().unwrap();
 
-        // Ensure target directory exists
         std::fs::create_dir_all(target_dir)?;
 
-        // Copy to temp file on same filesystem, then rename for atomicity
         let tmp_path = target_dir.join("primary_boot_image.bin.tmp");
         tracing::info!(
             "activating IFS: {} -> {}",
@@ -74,7 +63,6 @@ impl IfsActivator for DevIfsActivator {
         std::fs::copy(ifs_source, &tmp_path)?;
         std::fs::rename(&tmp_path, &target)?;
 
-        // Sync to ensure data hits disk before reboot
         let _ = std::process::Command::new("sync").status();
 
         tracing::info!("IFS activated — reboot required");

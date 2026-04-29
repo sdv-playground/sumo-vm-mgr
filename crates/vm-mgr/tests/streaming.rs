@@ -21,8 +21,8 @@ use sumo_offboard::image_builder::{ImageManifestBuilder, MultiComponentBuilder, 
 use sumo_offboard::keygen;
 use sumo_offboard::recipient::Recipient;
 
-use hypervisor_mgr::streaming::process_envelope_stream;
-use hypervisor_mgr::suit_provider::SuitProvider;
+use vm_mgr::streaming::process_envelope_stream;
+use vm_mgr::suit_provider::SuitProvider;
 
 type PackageStream = Pin<
     Box<dyn futures::Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>,
@@ -164,7 +164,7 @@ async fn single_component_encrypted() {
 /// each payload using the manifest's component info.
 #[test]
 fn multi_component_separate_uploads() {
-    use hypervisor_mgr::streaming::{process_raw_payload, validate_manifest};
+    use vm_mgr::streaming::{process_raw_payload, validate_manifest};
 
     let (signing_key, _) = test_keys();
     let provider = test_provider(&signing_key, None);
@@ -232,7 +232,7 @@ fn multi_component_separate_uploads() {
 /// Multi-component with encryption: separate manifest + encrypted raw payloads.
 #[test]
 fn multi_component_encrypted_separate() {
-    use hypervisor_mgr::streaming::process_raw_payload;
+    use vm_mgr::streaming::process_raw_payload;
 
     let (signing_key, device_key) = test_keys();
     let crypto = RustCryptoBackend::new();
@@ -293,7 +293,7 @@ fn multi_component_encrypted_separate() {
 /// Corrupt payload fails digest verification.
 #[test]
 fn raw_payload_corrupt_fails() {
-    use hypervisor_mgr::streaming::process_raw_payload;
+    use vm_mgr::streaming::process_raw_payload;
 
     let (signing_key, _) = test_keys();
     let crypto = RustCryptoBackend::new();
