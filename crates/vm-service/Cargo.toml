@@ -16,8 +16,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 vm-devices = { path = "../vm-devices" }
 
+[features]
+qnx = ["vm-devices/qnx"]
+
 [dev-dependencies]
 tempfile = "3"
+
+[lib]
+name = "vm_service"
+path = "src/lib.rs"
 
 [[bin]]
 name = "vm-service"

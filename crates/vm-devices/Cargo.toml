@@ -13,5 +13,6 @@ default = ["health", "time", "can"]
 health = []
 time = []
 can = []
+qnx = []
 
 [dev-dependencies]

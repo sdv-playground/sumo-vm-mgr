@@ -3,6 +3,8 @@
 pub mod mem;
 #[cfg(target_os = "linux")]
 pub mod ivshmem;
+#[cfg(feature = "qnx")]
+pub mod qnx;
 
 use std::sync::atomic::Ordering;
 

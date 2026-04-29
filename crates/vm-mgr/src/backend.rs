@@ -776,7 +776,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
     /// Send a restart request to vm-service over its Unix socket.
     async fn notify_vm_service(socket_path: &std::path::Path, vm_name: &str) -> Result<(), String> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let mut stream = tokio::net::UnixStream::connect(socket_path)
             .await
@@ -794,18 +794,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             .await
             .map_err(|e| format!("write to vm-service: {e}"))?;
 
-        // Read response (just check status line)
-        let mut buf = vec![0u8; 256];
-        let n = stream.read(&mut buf)
-            .await
-            .map_err(|e| format!("read from vm-service: {e}"))?;
-
-        let response = String::from_utf8_lossy(&buf[..n]);
-        if response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200") {
-            Ok(())
-        } else {
-            Err(format!("vm-service returned: {}", response.lines().next().unwrap_or("empty")))
-        }
+        // Fire-and-forget: don't wait for response. The restart may take
+        // a long time (devb-loopback + qvm spawn) and the orchestrator
+        // will poll activation state to detect when it's done.
+        Ok(())
     }
 
     /// Whether the guest backing this component has finished its
@@ -1397,7 +1389,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             )
             .map_err(map_ota_error)?;
 
-            // Rename staged file to target bank image
+            // Move staged files into the target bank directory
             if let Some(ref images_dir) = self.images_dir {
                 let set_name = match self.bank_set {
                     BankSet::HostOs => "host-os",
@@ -1405,16 +1397,23 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
                 };
-                let bank_name = match result.target_bank {
-                    Bank::A => "a",
-                    Bank::B => "b",
+                let bank_dir_name = match result.target_bank {
+                    Bank::A => "bank_a",
+                    Bank::B => "bank_b",
                 };
-                // Rename staged files to target bank (rootfs + kernel if present)
-                for suffix in ["staged.img", "kernel-staged.img"] {
-                    let staged_path = images_dir.join(format!("{set_name}-{suffix}"));
+                let bank_dir = images_dir.join(set_name).join(bank_dir_name);
+                let _ = std::fs::create_dir_all(&bank_dir);
+
+                // staged.img → bank_X/rootfs.img, kernel-staged.img → bank_X/boot.ifs
+                let moves: &[(&str, &str)] = &[
+                    ("staged.img", "rootfs.img"),
+                    ("kernel-staged.img", "boot.ifs"),
+                    ("config-staged.yaml", "vm-config.yaml"),
+                ];
+                for (staged_suffix, target_name) in moves {
+                    let staged_path = images_dir.join(format!("{set_name}-{staged_suffix}"));
                     if staged_path.exists() {
-                        let target_name = suffix.replace("staged", bank_name);
-                        let target_path = images_dir.join(format!("{set_name}-{target_name}"));
+                        let target_path = bank_dir.join(target_name);
                         std::fs::rename(&staged_path, &target_path).map_err(|e| {
                             BackendError::Internal(format!(
                                 "failed to rename {} → {}: {e}",
@@ -1423,7 +1422,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                             ))
                         })?;
                         tracing::info!(
-                            "renamed {} → {}",
+                            "installed {} → {}",
                             staged_path.display(),
                             target_path.display()
                         );
@@ -1436,7 +1435,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             let result = ota::install(&mut *nv, self.bank_set, &image_data, &meta, self.config.single_bank)
                 .map_err(map_ota_error)?;
 
-            // Write firmware payload to bank image file (real rootfs OTA)
+            // Write firmware payload to bank directory
             if let Some(ref images_dir) = self.images_dir {
                 let set_name = match self.bank_set {
                     BankSet::HostOs => "host-os",
@@ -1444,11 +1443,13 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
                 };
-                let bank_name = match result.target_bank {
-                    Bank::A => "a",
-                    Bank::B => "b",
+                let bank_dir_name = match result.target_bank {
+                    Bank::A => "bank_a",
+                    Bank::B => "bank_b",
                 };
-                let image_path = images_dir.join(format!("{set_name}-{bank_name}.img"));
+                let bank_dir = images_dir.join(set_name).join(bank_dir_name);
+                let _ = std::fs::create_dir_all(&bank_dir);
+                let image_path = bank_dir.join("rootfs.img");
                 tracing::info!(
                     "writing {} bytes to {}",
                     image_data.len(),
@@ -1587,30 +1588,24 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                             let rb = *self.running_bank.lock().unwrap();
                             let target_bank = if rb == nv_store::types::Bank::A { "b" } else { "a" };
 
-                            for suffix in ["staged.img", "kernel-staged.img"] {
-                                let staged = images_dir.join(format!("{set_name}-{suffix}"));
+                            let bank_dir = images_dir.join(set_name).join(format!("bank_{target_bank}"));
+                            let _ = std::fs::create_dir_all(&bank_dir);
+
+                            let moves: &[(&str, &str)] = &[
+                                ("staged.img", "rootfs.img"),
+                                ("kernel-staged.img", "boot.ifs"),
+                                ("config-staged.yaml", "vm-config.yaml"),
+                                ("config-staged.img", "vm-config.yaml"),
+                            ];
+                            for (staged_suffix, target_name) in moves {
+                                let staged = images_dir.join(format!("{set_name}-{staged_suffix}"));
                                 if staged.exists() {
-                                    let target_name = suffix.replace("staged", target_bank);
-                                    let target = images_dir.join(format!("{set_name}-{target_name}"));
+                                    let target = bank_dir.join(target_name);
                                     if let Err(e) = std::fs::rename(&staged, &target) {
                                         tracing::warn!("rename {} → {}: {e}", staged.display(), target.display());
                                     } else {
-                                        tracing::info!("renamed {} → {}", staged.display(), target.display());
+                                        tracing::info!("installed {} → {}", staged.display(), target.display());
                                     }
-                                }
-                            }
-
-                            // Per-bank VM config → target bank directory
-                            let config_staged = images_dir.join(format!("{set_name}-config-staged.yaml"));
-                            if config_staged.exists() {
-                                let bank_dir = images_dir.join(set_name).join(format!("bank_{target_bank}"));
-                                let config_target = bank_dir.join("vm-config.yaml");
-                                if let Err(e) = std::fs::rename(&config_staged, &config_target) {
-                                    tracing::warn!("rename config {} → {}: {e}",
-                                        config_staged.display(), config_target.display());
-                                } else {
-                                    tracing::info!("installed vm-config.yaml → {}",
-                                        config_target.display());
                                 }
                             }
                         }
@@ -1771,7 +1766,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         {
             let mut ft = self.flash_transfer.lock().unwrap();
             if let Some(ref mut t) = *ft {
-                if self.config.single_bank {
+                if self.config.single_bank || self.bank_set == BankSet::HostOs {
+                    // Single-bank (HSM) and host-os: no guest health to verify
                     t.state = FlashState::Activated;
                 } else {
                     t.state = FlashState::Verifying;
@@ -1784,7 +1780,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         *self.session.lock().unwrap() = SessionState::Default;
         *self.security.lock().unwrap() = SecurityAccessState::default();
 
-        // IFS boot image: copy to boot partition via IfsActivator (no symlink, no vm-service)
+        // IFS boot image: copy to boot partition via IfsActivator, then reboot
         if self.bank_set == BankSet::HostOs {
             if let (Some(ref activator), Some(ref images_dir)) = (&self.ifs_activator, &self.images_dir) {
                 let target_bank = *self.running_bank.lock().unwrap();
@@ -1794,7 +1790,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 };
                 let ifs_source = images_dir.join("boot").join(bank_dir_name).join("primary_boot_image.bin");
                 match activator.activate(&ifs_source) {
-                    Ok(()) => tracing::info!("IFS activated from {}", ifs_source.display()),
+                    Ok(()) => {
+                        tracing::info!("IFS activated from {}, triggering reboot", ifs_source.display());
+                        let _ = std::process::Command::new("shutdown")
+                            .args(["-r", "now"])
+                            .status();
+                    }
                     Err(e) => tracing::warn!("IFS activation failed: {e}"),
                 }
             } else {
