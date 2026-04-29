@@ -1,18 +1,17 @@
 //! IFS (Initial Filesystem) activation backends.
 //!
-//! QNX IPL loads the IFS from a fixed path on the boot partition
-//! (`/.boot/primary_boot_image.bin`). Unlike rootfs images, IFS cannot
-//! use symlink-based A/B switching because IPL does not follow symlinks.
+//! QNX IPL loads the IFS from a fixed path on the boot partition.
+//! Unlike rootfs images, IFS cannot use symlink-based A/B switching
+//! because IPL does not follow symlinks.
 //!
 //! Each backend implements `IfsActivator` — the trait that copies a new
 //! IFS bank image to the active boot location.
 
 pub mod dev;
-pub mod hardware;
+pub mod partition;
 
 use std::path::Path;
 
-/// Errors from IFS activation.
 #[derive(Debug)]
 pub enum IfsError {
     Io(std::io::Error),
@@ -42,6 +41,5 @@ impl From<std::io::Error> for IfsError {
 /// platform-specific boot path. After activation, a reboot will load
 /// the new IFS.
 pub trait IfsActivator: Send + Sync {
-    /// Copy the IFS from `ifs_source` to the active boot location.
     fn activate(&self, ifs_source: &Path) -> Result<(), IfsError>;
 }

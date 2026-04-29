@@ -482,7 +482,7 @@ fn full_ota_multiple_bank_sets() {
     // Both on B, independent
     assert_eq!(status(&nv, BankSet::Vm1).unwrap().active_bank, Bank::B);
     assert_eq!(status(&nv, BankSet::Vm2).unwrap().active_bank, Bank::B);
-    assert_eq!(status(&nv, BankSet::Hypervisor).unwrap().active_bank, Bank::A); // untouched
+    assert_eq!(status(&nv, BankSet::HostOs).unwrap().active_bank, Bank::A); // untouched
 }
 
 #[test]
@@ -578,30 +578,30 @@ fn boot_flash_trial_mode() {
     let mut nv = make_nv();
 
     // Standard A/B install
-    let result = install(&mut nv, BankSet::Boot, b"boot-v2", &make_image_meta("2.0", 1), false).unwrap();
+    let result = install(&mut nv, BankSet::HostOs, b"boot-v2", &make_image_meta("2.0", 1), false).unwrap();
     assert_eq!(result.target_bank, Bank::B);
 
     // Should be in trial mode
     let state = nv.read_boot_state().unwrap();
-    let boot = &state.banks[BankSet::Boot as usize];
+    let boot = &state.banks[BankSet::HostOs as usize];
     assert!(!boot.committed);
     assert_eq!(boot.active_bank, Bank::B);
 
     // Commit works
-    commit(&mut nv, BankSet::Boot).unwrap();
+    commit(&mut nv, BankSet::HostOs).unwrap();
     let state = nv.read_boot_state().unwrap();
-    assert!(state.banks[BankSet::Boot as usize].committed);
+    assert!(state.banks[BankSet::HostOs as usize].committed);
 }
 
 #[test]
 fn boot_rollback_works() {
     let mut nv = make_nv();
 
-    install(&mut nv, BankSet::Boot, b"boot-v2", &make_image_meta("2.0", 1), false).unwrap();
-    let prev = rollback(&mut nv, BankSet::Boot).unwrap();
+    install(&mut nv, BankSet::HostOs, b"boot-v2", &make_image_meta("2.0", 1), false).unwrap();
+    let prev = rollback(&mut nv, BankSet::HostOs).unwrap();
     assert_eq!(prev, Bank::A);
 
     let state = nv.read_boot_state().unwrap();
-    assert!(state.banks[BankSet::Boot as usize].committed);
-    assert_eq!(state.banks[BankSet::Boot as usize].active_bank, Bank::A);
+    assert!(state.banks[BankSet::HostOs as usize].committed);
+    assert_eq!(state.banks[BankSet::HostOs as usize].active_bank, Bank::A);
 }

@@ -1,4 +1,4 @@
-//! Hypervisor-level update + diagnostics service.
+//! VM update + diagnostics service.
 //!
 //! Owns the top-level `Machine` (from `machine-mgr`) and translates between
 //! SOVD REST / UDS wire semantics and per-component operations. Hosts the
@@ -35,13 +35,11 @@
 //! - [`did`]      — runtime → FW meta → factory → dynamic DID resolution
 //! - [`suit_provider`] + [`manifest_provider`] — SUIT envelope validation
 //! - [`streaming`] — upload pipeline (decompress + decrypt + hash streaming)
-//! - [`ifs`]      — boot-image activation (mount + copy on Linux / QNX)
 
 pub mod backend;
 pub mod component_adapter;
 pub mod diag_backend;
 pub mod did;
-pub mod ifs;
 pub mod manifest;
 pub mod manifest_provider;
 pub mod ota;

@@ -2,9 +2,9 @@ use nv_store::block::FileBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
-use hypervisor_mgr::did;
-use hypervisor_mgr::manifest::{FirmwareManifest, FactoryManifest};
-use hypervisor_mgr::ota;
+use vm_mgr::did;
+use vm_mgr::manifest::{FirmwareManifest, FactoryManifest};
+use vm_mgr::ota;
 
 use std::path::PathBuf;
 

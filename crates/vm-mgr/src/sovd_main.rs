@@ -8,11 +8,11 @@ use nv_store::types::{BankSet, NvBootState};
 
 use sovd_core::DiagnosticBackend;
 
-use hypervisor_mgr::backend::{ComponentConfig, VmBackend};
-use hypervisor_mgr::component_adapter::VmBackendComponent;
-use hypervisor_mgr::diag_backend::ComponentDiagBackend;
-use hypervisor_mgr::sovd::security::TestSecurityProvider;
-use hypervisor_mgr::suit_provider::SuitProvider;
+use vm_mgr::backend::{ComponentConfig, VmBackend};
+use vm_mgr::component_adapter::VmBackendComponent;
+use vm_mgr::diag_backend::ComponentDiagBackend;
+use vm_mgr::sovd::security::TestSecurityProvider;
+use vm_mgr::suit_provider::SuitProvider;
 
 use machine_mgr::{Machine, MachineRegistry};
 use sovd_core::EntityInfo;
@@ -198,10 +198,10 @@ async fn main() {
     // Create one backend per bank set
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
         (
-            "hypervisor",
-            BankSet::Hypervisor,
+            "host-os",
+            BankSet::HostOs,
             ComponentConfig {
-                entity_type: "hpc".into(),
+                entity_type: "host_os".into(),
                 ..ComponentConfig::default()
             },
         ),
@@ -214,14 +214,6 @@ async fn main() {
                 supports_rollback: false,
                 single_bank: true,
                 entity_type: "hsm".into(),
-                ..ComponentConfig::default()
-            },
-        ),
-        (
-            "boot",
-            BankSet::Boot,
-            ComponentConfig {
-                entity_type: "boot_image".into(),
                 ..ComponentConfig::default()
             },
         ),
@@ -265,10 +257,10 @@ async fn main() {
             }
         }
         // Wire IFS activator into the boot backend
-        if set == BankSet::Boot {
+        if set == BankSet::HostOs {
             if let Some(ref dev) = boot_device {
                 let activator =
-                    hypervisor_mgr::ifs::dev::DevIfsActivator::new(dev.clone(), boot_mount.clone());
+                    host_os_mgr::ifs::dev::DevIfsActivator::new(dev.clone(), boot_mount.clone());
                 backend = backend.with_ifs_activator(Arc::new(activator));
             }
         }

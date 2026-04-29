@@ -46,10 +46,9 @@ fn main() {
     };
 
     let output_sets: &[(&str, usize, BankSet)] = &[
-        ("hypervisor", 0, BankSet::Hypervisor),
+        ("host-os", 0, BankSet::HostOs),
         ("vm1", 1, BankSet::Vm1),
         ("vm2", 2, BankSet::Vm2),
-        ("boot", 4, BankSet::Boot),
     ];
 
     for &(name, idx, set) in output_sets {

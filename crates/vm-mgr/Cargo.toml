@@ -1,5 +1,5 @@
 [package]
-name = "hypervisor-mgr"
+name = "vm-mgr"
 version = "0.1.0"
 edition = "2021"
 
@@ -30,6 +30,7 @@ sumo-processor = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch
 sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 hsm = { path = "../hsm", features = ["crypto"] }
+host-os-mgr = { path = "../host-os-mgr" }
 hex = "0.4.3"
 
 [dev-dependencies]

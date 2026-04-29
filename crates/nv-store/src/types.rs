@@ -1,11 +1,10 @@
 /// Core types for the NV store bank management system.
 ///
-/// Five independent A/B bank sets (NUM_BANK_SETS=5 for wire compat):
-///   - Hypervisor (host platform)
+/// Four independent A/B bank sets:
+///   - HostOs (IFS + rootfs, updated atomically)
 ///   - VM1 (Linux or QNX VM)
 ///   - VM2 (Linux or QNX VM)
 ///   - HSM (Hardware Security Module — single-banked, non-rollbackable)
-///   - Boot (IFS boot image — A/B banked, reuses NV slot 4)
 
 /// Identifies which bank is active within a bank set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,32 +35,29 @@ impl Bank {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum BankSet {
-    Hypervisor = 0,
+    HostOs = 0,
     Vm1 = 1,
     Vm2 = 2,
     Hsm = 3,
-    /// IFS boot image (A/B banked). Reuses NV slot 4.
-    Boot = 4,
 }
 
 impl BankSet {
     pub fn all() -> [BankSet; NUM_BANK_SETS] {
-        [BankSet::Hypervisor, BankSet::Vm1, BankSet::Vm2, BankSet::Hsm, BankSet::Boot]
+        [BankSet::HostOs, BankSet::Vm1, BankSet::Vm2, BankSet::Hsm]
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "hyp" | "hypervisor" => Some(BankSet::Hypervisor),
+            "host-os" | "host_os" => Some(BankSet::HostOs),
             "os1" | "vm1" => Some(BankSet::Vm1),
             "os2" | "vm2" => Some(BankSet::Vm2),
             "hsm" => Some(BankSet::Hsm),
-            "boot" | "qtd" => Some(BankSet::Boot),
             _ => None,
         }
     }
 }
 
-pub const NUM_BANK_SETS: usize = 5;
+pub const NUM_BANK_SETS: usize = 4;
 pub const MAX_TRIAL_BOOTS: u8 = 10;
 
 // NV partition magic numbers (sector validation)
@@ -146,13 +142,13 @@ impl Default for BankBootState {
 
 /// Complete boot state for all bank sets.
 ///
-/// Wire format (28 bytes):
+/// Wire format (24 bytes):
 /// ```text
 /// [0..4]   magic (NVB1)
 /// [4..8]   write_seq
-/// [8]      hypervisor.active_bank
-/// [9]      hypervisor.committed
-/// [10]     hypervisor.boot_count
+/// [8]      host_os.active_bank
+/// [9]      host_os.committed
+/// [10]     host_os.boot_count
 /// [11]     vm1.active_bank
 /// [12]     vm1.committed
 /// [13]     vm1.boot_count
@@ -162,10 +158,7 @@ impl Default for BankBootState {
 /// [17]     hsm.active_bank
 /// [18]     hsm.committed
 /// [19]     hsm.boot_count
-/// [20]     boot.active_bank
-/// [21]     boot.committed
-/// [22]     boot.boot_count
-/// [23..28] padding
+/// [20..24] padding
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NvBootState {
@@ -186,7 +179,7 @@ impl NvRecord for NvBootState {
     const MAGIC: u32 = MAGIC_BOOT;
 
     fn size() -> usize {
-        28 // 4 magic + 4 seq + 5*3 banks + 5 padding
+        24 // 4 magic + 4 seq + 4*3 banks + 4 padding
     }
 
     fn write_seq(&self) -> u32 {

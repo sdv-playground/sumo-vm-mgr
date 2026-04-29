@@ -192,12 +192,12 @@ system_name: "OS1-Linux"
     #[test]
     fn manifest_parse_minimal() {
         let yaml = r#"
-component_id: ["hyp"]
+component_id: ["host-os"]
 sequence_number: 1
 version: "1.0.0"
 "#;
         let m = FirmwareManifest::from_yaml(yaml).unwrap();
-        assert_eq!(m.resolve_bank_set(), Some(BankSet::Hypervisor));
+        assert_eq!(m.resolve_bank_set(), Some(BankSet::HostOs));
         assert!(m.spare_part_number.is_none());
     }
 

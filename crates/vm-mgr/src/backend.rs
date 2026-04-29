@@ -184,9 +184,9 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// (component_id `["hsm", "keys"]`) are routed to this provider
     /// instead of being written as a disk image.
     hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
-    /// Optional IFS activator — when set (for BankSet::Boot), ecu_reset()
+    /// Optional IFS activator — when set (for BankSet::HostOs), ecu_reset()
     /// copies the IFS to the boot partition instead of symlink switching.
-    ifs_activator: Option<Arc<dyn crate::ifs::IfsActivator>>,
+    ifs_activator: Option<Arc<dyn host_os_mgr::ifs::IfsActivator>>,
 }
 
 impl<D: BlockDevice + Send + 'static> VmBackend<D> {
@@ -221,11 +221,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         images_dir: Option<PathBuf>,
     ) -> Self {
         let (id, name, desc) = match bank_set {
-            BankSet::Hypervisor => ("hypervisor", "Hypervisor", "Hypervisor A/B bank set"),
+            BankSet::HostOs => ("host-os", "Host OS", "Host OS (IFS + rootfs) A/B bank set"),
             BankSet::Vm1 => ("vm1", "VM1", "Virtual machine slot 1"),
             BankSet::Vm2 => ("vm2", "VM2", "Virtual machine slot 2"),
             BankSet::Hsm => ("hsm", "HSM Key Store", "Hardware Security Module"),
-            BankSet::Boot => ("boot", "Boot Image (IFS)", "IFS boot image A/B bank set"),
         };
 
         // Read the current active bank at startup — this is what we're running on.
@@ -295,8 +294,8 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         self
     }
 
-    /// Set an IFS activator for boot image activation (BankSet::Boot only).
-    pub fn with_ifs_activator(mut self, activator: Arc<dyn crate::ifs::IfsActivator>) -> Self {
+    /// Set an IFS activator for boot image activation (BankSet::HostOs only).
+    pub fn with_ifs_activator(mut self, activator: Arc<dyn host_os_mgr::ifs::IfsActivator>) -> Self {
         self.ifs_activator = Some(activator);
         self
     }
@@ -464,11 +463,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let device_key = self.manifest_provider.device_decryption_key();
 
         let set_name = match self.bank_set {
-            BankSet::Hypervisor => "hypervisor",
+            BankSet::HostOs => "host-os",
             BankSet::Vm1 => "vm1",
             BankSet::Vm2 => "vm2",
             BankSet::Hsm => "hsm",
-            BankSet::Boot => "boot",
         };
 
         let images_dir = self.images_dir.as_ref()
@@ -680,11 +678,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
         let uri = manifest.uri(comp_idx).unwrap_or("#firmware");
         let set_name = match self.bank_set {
-            BankSet::Hypervisor => "hypervisor",
+            BankSet::HostOs => "host-os",
             BankSet::Vm1 => "vm1",
             BankSet::Vm2 => "vm2",
             BankSet::Hsm => "hsm",
-            BankSet::Boot => "boot",
         };
 
         let output_suffix = match uri {
@@ -1403,11 +1400,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             // Rename staged file to target bank image
             if let Some(ref images_dir) = self.images_dir {
                 let set_name = match self.bank_set {
-                    BankSet::Hypervisor => "hypervisor",
+                    BankSet::HostOs => "host-os",
                     BankSet::Vm1 => "vm1",
                     BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
-                    BankSet::Boot => "boot",
                 };
                 let bank_name = match result.target_bank {
                     Bank::A => "a",
@@ -1443,11 +1439,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             // Write firmware payload to bank image file (real rootfs OTA)
             if let Some(ref images_dir) = self.images_dir {
                 let set_name = match self.bank_set {
-                    BankSet::Hypervisor => "hypervisor",
+                    BankSet::HostOs => "host-os",
                     BankSet::Vm1 => "vm1",
                     BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
-                    BankSet::Boot => "boot",
                 };
                 let bank_name = match result.target_bank {
                     Bank::A => "a",
@@ -1584,11 +1579,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                         // Rename staged files to target bank
                         if let Some(ref images_dir) = self.images_dir {
                             let set_name = match self.bank_set {
-                                BankSet::Hypervisor => "hypervisor",
+                                BankSet::HostOs => "host-os",
                                 BankSet::Vm1 => "vm1",
                                 BankSet::Vm2 => "vm2",
                                 BankSet::Hsm => "hsm",
-                                BankSet::Boot => "boot",
                             };
                             let rb = *self.running_bank.lock().unwrap();
                             let target_bank = if rb == nv_store::types::Bank::A { "b" } else { "a" };
@@ -1791,7 +1785,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         *self.security.lock().unwrap() = SecurityAccessState::default();
 
         // IFS boot image: copy to boot partition via IfsActivator (no symlink, no vm-service)
-        if self.bank_set == BankSet::Boot {
+        if self.bank_set == BankSet::HostOs {
             if let (Some(ref activator), Some(ref images_dir)) = (&self.ifs_activator, &self.images_dir) {
                 let target_bank = *self.running_bank.lock().unwrap();
                 let bank_dir_name = match target_bank {
@@ -1812,11 +1806,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // Flip the `current` symlink so vm-service boots the right bank
         if let (Some(ref images_dir), Some(ref socket_path)) = (&self.images_dir, &self.vm_service_socket) {
             let set_name = match self.bank_set {
-                BankSet::Hypervisor => "hypervisor",
+                BankSet::HostOs => "host-os",
                 BankSet::Vm1 => "vm1",
                 BankSet::Vm2 => "vm2",
                 BankSet::Hsm => "hsm",
-                BankSet::Boot => "boot",
             };
             let target_bank = *self.running_bank.lock().unwrap();
             let bank_dir_name = match target_bank {
