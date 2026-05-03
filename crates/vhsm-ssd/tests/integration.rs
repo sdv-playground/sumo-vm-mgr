@@ -4,6 +4,7 @@
 /// table + policy, call handle_request(), verify responses.
 /// No network transport needed — tests the full protocol logic in-process.
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -12,15 +13,25 @@ use hsm::sim::SimHsm;
 use hsm::HsmCryptoProvider;
 
 use vhsm_ssd::handle_table::HandleTable;
-use vhsm_ssd::handler;
+use vhsm_ssd::handler::{self, CallerId};
 use vhsm_ssd::policy::Policy;
 use vhsm_ssd::proto::*;
 
 static TEST_ID: AtomicU32 = AtomicU32::new(0);
 
-/// Simulated caller CID for tests.
-const TEST_CID: u32 = 3;
-const OTHER_CID: u32 = 4;
+/// Simulated callers for tests.
+const TEST_VM: &str = "vm1";
+const OTHER_VM: &str = "vm2";
+const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 10));
+const OTHER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 11));
+const UNKNOWN_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 99));
+
+fn caller(ip: IpAddr, vm_id: &str) -> CallerId {
+    CallerId {
+        peer_ip: ip,
+        vm_id: vm_id.to_string(),
+    }
+}
 
 // --- Keystore + fixture setup ---
 
@@ -62,25 +73,26 @@ impl TestFixture {
             ALG_AES_256,
             PERM_ENCRYPT | PERM_DECRYPT,
         );
-        // restricted-key: only accessible via handle owned by OTHER_CID
+        // restricted-key: only accessible via handle owned by OTHER_VM
         let label = [0u8; LABEL_LEN];
         handle_table.allocate(
             "restricted-key",
             ALG_AES_256,
             PERM_ENCRYPT | PERM_DECRYPT,
-            OTHER_CID,
+            OTHER_VM,
             false,
             &label,
         );
 
-        // Allow-all policy for TEST_CID, restricted for OTHER_CID
+        // Allow-all policy for TEST_VM, restricted for OTHER_VM
         let mut policy = Policy::empty();
         policy.add(
-            TEST_CID,
+            TEST_IP,
+            TEST_VM,
             PERM_SIGN | PERM_VERIFY | PERM_ENCRYPT | PERM_DECRYPT
                 | PERM_GET_PUBKEY | PERM_GET_CERT | PERM_KEY_GENERATE,
         );
-        policy.add(OTHER_CID, PERM_ENCRYPT | PERM_DECRYPT);
+        policy.add(OTHER_IP, OTHER_VM, PERM_ENCRYPT | PERM_DECRYPT);
 
         Self {
             crypto,
@@ -90,13 +102,13 @@ impl TestFixture {
         }
     }
 
-    fn request(&mut self, cid: u32, op: Op, payload: Vec<u8>) -> Response {
+    fn request(&mut self, caller: &CallerId, op: Op, payload: Vec<u8>) -> Response {
         let req = Request {
             op: op as u32,
             session_id: 1,
             payload,
         };
-        handler::handle_request(&req, cid, &mut self.handle_table, &self.policy, &*self.crypto)
+        handler::handle_request(&req, caller, &mut self.handle_table, &self.policy, &*self.crypto)
     }
 
     /// Helper: build payload with handle prefix + data.
@@ -191,7 +203,7 @@ fn random_bytes() {
     let mut fix = TestFixture::new();
 
     let count: u32 = 32;
-    let resp = fix.request(TEST_CID, Op::GetRandom, count.to_le_bytes().to_vec());
+    let resp = fix.request(&caller(TEST_IP, TEST_VM), Op::GetRandom, count.to_le_bytes().to_vec());
 
     assert_eq!(resp.status, StatusCode::Ok as u32, "random failed");
     assert_eq!(resp.payload.len(), 32);
@@ -205,7 +217,7 @@ fn sign_and_verify() {
     // SIGN
     let data = b"hello world";
     let resp = fix.request(
-        TEST_CID,
+        &caller(TEST_IP, TEST_VM),
         Op::Sign,
         TestFixture::with_handle(HANDLE_ECU_SIGNING, data),
     );
@@ -227,7 +239,7 @@ fn sign_and_verify() {
         payload: vp,
     };
     let resp = handler::handle_request(
-        &req, TEST_CID, &mut fix.handle_table, &fix.policy, &*fix.crypto,
+        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.policy, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::Ok as u32, "verify failed");
 }
@@ -255,7 +267,7 @@ fn verify_rejects_bad_signature() {
         payload: p,
     };
     let resp = handler::handle_request(
-        &req, TEST_CID, &mut fix.handle_table, &fix.policy, &*fix.crypto,
+        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.policy, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::CryptoError as u32);
 }
@@ -268,7 +280,7 @@ fn encrypt_decrypt_roundtrip() {
 
     // ENCRYPT
     let resp = fix.request(
-        TEST_CID,
+        &caller(TEST_IP, TEST_VM),
         Op::Encrypt,
         TestFixture::with_handle(HANDLE_STORAGE, plaintext),
     );
@@ -278,7 +290,7 @@ fn encrypt_decrypt_roundtrip() {
 
     // DECRYPT
     let resp = fix.request(
-        TEST_CID,
+        &caller(TEST_IP, TEST_VM),
         Op::Decrypt,
         TestFixture::with_handle(HANDLE_STORAGE, &ct),
     );
@@ -291,7 +303,7 @@ fn get_pubkey() {
     let mut fix = TestFixture::new();
 
     let resp = fix.request(
-        TEST_CID,
+        &caller(TEST_IP, TEST_VM),
         Op::GetPubkey,
         HANDLE_ECU_SIGNING.to_le_bytes().to_vec(),
     );
@@ -310,7 +322,7 @@ fn get_cert() {
     let mut fix = TestFixture::new();
 
     let resp = fix.request(
-        TEST_CID,
+        &caller(TEST_IP, TEST_VM),
         Op::GetCert,
         HANDLE_ECU_SIGNING.to_le_bytes().to_vec(),
     );
@@ -327,7 +339,7 @@ fn get_handle_info() {
     let mut fix = TestFixture::new();
 
     let resp = fix.request(
-        TEST_CID,
+        &caller(TEST_IP, TEST_VM),
         Op::GetHandleInfo,
         HANDLE_ECU_SIGNING.to_le_bytes().to_vec(),
     );
@@ -349,7 +361,7 @@ fn invalid_handle_rejected() {
 
     // Use a handle that doesn't exist
     let resp = fix.request(
-        TEST_CID,
+        &caller(TEST_IP, TEST_VM),
         Op::Sign,
         TestFixture::with_handle(0xDEAD, b"data"),
     );
@@ -360,40 +372,40 @@ fn invalid_handle_rejected() {
 fn dynamic_handle_ownership() {
     let mut fix = TestFixture::new();
 
-    // Dynamic handle created by OTHER_CID is not accessible by TEST_CID
+    // Dynamic handle created by OTHER_VM is not accessible by TEST_VM
     let dynamic_handle = HANDLE_DYNAMIC_BASE; // first dynamic handle allocated in fixture
     let resp = fix.request(
-        TEST_CID,
+        &caller(TEST_IP, TEST_VM),
         Op::Encrypt,
         TestFixture::with_handle(dynamic_handle, b"test"),
     );
     assert_eq!(resp.status, StatusCode::InvalidHandle as u32,
-        "TEST_CID should not access OTHER_CID's dynamic handle");
+        "TEST_VM should not access OTHER_VM's dynamic handle");
 
-    // OTHER_CID can access its own handle
+    // OTHER_VM can access its own handle
     let resp = fix.request(
-        OTHER_CID,
+        &caller(OTHER_IP, OTHER_VM),
         Op::Encrypt,
         TestFixture::with_handle(dynamic_handle, b"test"),
     );
     assert_eq!(resp.status, StatusCode::Ok as u32,
-        "OTHER_CID should access its own handle");
+        "OTHER_VM should access its own handle");
 }
 
 #[test]
 fn well_known_handles_shared() {
     let mut fix = TestFixture::new();
 
-    // Both CIDs can access well-known handles (if policy allows the op)
+    // Both VMs can access well-known handles (if policy allows the op)
     let resp = fix.request(
-        TEST_CID,
+        &caller(TEST_IP, TEST_VM),
         Op::Encrypt,
         TestFixture::with_handle(HANDLE_STORAGE, b"test"),
     );
     assert_eq!(resp.status, StatusCode::Ok as u32);
 
     let resp = fix.request(
-        OTHER_CID,
+        &caller(OTHER_IP, OTHER_VM),
         Op::Encrypt,
         TestFixture::with_handle(HANDLE_STORAGE, b"test"),
     );
@@ -401,12 +413,12 @@ fn well_known_handles_shared() {
 }
 
 #[test]
-fn policy_rejects_unknown_cid() {
+fn policy_rejects_unknown_ip() {
     let mut fix = TestFixture::new();
 
-    // CID 99 is not in policy
+    // UNKNOWN_IP is not in the policy
     let resp = fix.request(
-        99,
+        &caller(UNKNOWN_IP, "stranger"),
         Op::Sign,
         TestFixture::with_handle(HANDLE_ECU_SIGNING, b"data"),
     );
@@ -417,9 +429,9 @@ fn policy_rejects_unknown_cid() {
 fn policy_denies_unpermitted_op() {
     let mut fix = TestFixture::new();
 
-    // OTHER_CID only has ENCRYPT|DECRYPT — not SIGN
+    // OTHER_VM only has ENCRYPT|DECRYPT — not SIGN
     let resp = fix.request(
-        OTHER_CID,
+        &caller(OTHER_IP, OTHER_VM),
         Op::Sign,
         TestFixture::with_handle(HANDLE_ECU_SIGNING, b"data"),
     );
@@ -432,7 +444,7 @@ fn handle_permission_denies_wrong_op() {
 
     // HANDLE_ECU_SIGNING has SIGN|VERIFY|GET_PUBKEY|GET_CERT — not ENCRYPT
     let resp = fix.request(
-        TEST_CID,
+        &caller(TEST_IP, TEST_VM),
         Op::Encrypt,
         TestFixture::with_handle(HANDLE_ECU_SIGNING, b"test"),
     );
@@ -449,7 +461,7 @@ fn host_only_ops_rejected() {
         payload: vec![],
     };
     let resp = handler::handle_request(
-        &req, TEST_CID, &mut fix.handle_table, &fix.policy, &*fix.crypto,
+        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.policy, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::PolicyReject as u32);
 }
@@ -464,7 +476,7 @@ fn unknown_op_rejected() {
         payload: vec![],
     };
     let resp = handler::handle_request(
-        &req, TEST_CID, &mut fix.handle_table, &fix.policy, &*fix.crypto,
+        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.policy, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::InvalidParam as u32);
 }

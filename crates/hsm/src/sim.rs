@@ -1,6 +1,6 @@
 /// Simulation HSM provider (portable: Linux + QNX).
 ///
-/// Wraps `vhsm-ssd` / `vhsm-test-ssd` (file-based keystore + vsock service)
+/// Wraps `vhsm-ssd` / `vhsm-test-ssd` (file-based keystore + TCP service)
 /// for dev/test and QNX hypervisor host deployments.
 ///
 /// # Provisioning
@@ -39,8 +39,8 @@ pub struct SimHsm {
     daemon_bin: PathBuf,
     /// Keystore directory (e.g. /tmp/vhsm-keys).
     keystore_path: PathBuf,
-    /// vsock port the daemon listens on.
-    vsock_port: u16,
+    /// TCP port the daemon listens on (always bound to 127.0.0.1 in test mode).
+    tcp_port: u16,
     /// SUIT trust anchor (signing public key, COSE_Key CBOR).
     provisioning_authority: Vec<u8>,
     /// Running daemon process handle.
@@ -51,13 +51,13 @@ impl SimHsm {
     pub fn new(
         daemon_bin: PathBuf,
         keystore_path: PathBuf,
-        vsock_port: u16,
+        tcp_port: u16,
         provisioning_authority: Vec<u8>,
     ) -> Self {
         Self {
             daemon_bin,
             keystore_path,
-            vsock_port,
+            tcp_port,
             provisioning_authority,
             child: None,
         }
@@ -587,15 +587,20 @@ impl HsmProvider for SimHsm {
         tracing::info!(
             bin = %self.daemon_bin.display(),
             keystore = %self.keystore_path.display(),
-            port = self.vsock_port,
+            port = self.tcp_port,
             "starting vhsm-test-ssd"
         );
 
+        // Test mode: bind 127.0.0.1, allow that source IP as a generic
+        // test VM identity. Production uses a policy file via --policy.
+        let listen = format!("127.0.0.1:{}", self.tcp_port);
         let child = Command::new(&self.daemon_bin)
             .arg("--keystore")
             .arg(&self.keystore_path)
-            .arg("--port")
-            .arg(self.vsock_port.to_string())
+            .arg("--listen")
+            .arg(&listen)
+            .arg("--allow-ip")
+            .arg("127.0.0.1=test-vm")
             .spawn()
             .map_err(|e| HsmError::ProcessError(format!("spawn vhsm-test-ssd: {e}")))?;
 
@@ -610,8 +615,8 @@ impl HsmProvider for SimHsm {
             ));
         }
 
-        tracing::info!(pid, port = self.vsock_port, "vhsm-test-ssd started");
-        Ok(self.vsock_port)
+        tracing::info!(pid, port = self.tcp_port, "vhsm-test-ssd started");
+        Ok(self.tcp_port)
     }
 
     fn stop_service(&mut self) -> Result<(), HsmError> {
@@ -665,7 +670,7 @@ impl HsmProvider for SimHsm {
             service_running,
             service_pid,
             keystore_path: self.keystore_path.clone(),
-            vsock_port: self.vsock_port,
+            tcp_port: self.tcp_port,
         })
     }
 

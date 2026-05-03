@@ -122,7 +122,7 @@ pub struct HsmStatus {
     pub service_running: bool,
     pub service_pid: Option<u32>,
     pub keystore_path: std::path::PathBuf,
-    pub vsock_port: u16,
+    pub tcp_port: u16,
 }
 
 #[cfg(test)]

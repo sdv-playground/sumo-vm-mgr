@@ -64,9 +64,9 @@ sumo-vm-mgr/
     |       +-- lib.rs           # Module exports
     |       +-- proto.rs + codec.rs   # Wire format
     |       +-- handle_table.rs  # Dynamic handle allocator (0x0100+)
-    |       +-- policy.rs        # Per-CID ACL
+    |       +-- policy.rs        # IP allow-list (source IP → vm_id, perms)
     |       +-- handler.rs       # Op dispatch → HsmCryptoProvider
-    |       +-- transport.rs     # vsock (Linux/QEMU) + QNX shm/IPC
+    |       +-- transport.rs     # TCP on the private `vbr-vhsm` bridge
     +-- vm-devices/             # Host-side virtual CAN / health / time simulators
     |   +-- src/
     |       +-- lib.rs           # Module exports
@@ -276,9 +276,9 @@ Launching / stopping VMs is no longer a `BootBackend` trait in this crate; it's 
 |--------|---------|-------------|
 | `proto` + `codec` | v2 handle-based vHSM wire format | Frame parser / serializer |
 | `handle_table` | Dynamic handle allocator | Well-known (`0x0001..=0x00FF`) + dynamic (`0x0100+`) handles |
-| `policy` | Per-CID ACL | Enforced before every op dispatch |
+| `policy` | IP allow-list | Source IP → `vm_id` + permission bitmask |
 | `handler` | Op dispatch | Delegates crypto to `HsmCryptoProvider` |
-| `transport` | Wire transports | vsock (Linux/QEMU), QNX-native shm/IPC |
+| `transport` | Wire transport | TCP on the private `vbr-vhsm` bridge |
 
 **Dependencies:** `hsm` (with `crypto` feature), `secstore`, `tokio`, `bytes`
 

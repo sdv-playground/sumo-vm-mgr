@@ -356,6 +356,18 @@ pub enum DeviceConfig {
         #[serde(default)]
         ssh_port: Option<u16>,
     },
+    /// TAP NIC attached to a host Linux bridge. Used for the private
+    /// vHSM network (typically `vbr-vhsm`, 192.168.99.0/24). The MAC
+    /// is fixed at QEMU launch so dnsmasq can pin a deterministic IP
+    /// to it via static lease — that IP becomes the guest's identity
+    /// to the host vHSM daemon.
+    #[serde(rename = "bridge")]
+    Bridge {
+        /// Host bridge name (e.g. `vbr-vhsm`).
+        bridge: String,
+        /// QEMU-assigned MAC address.
+        mac: String,
+    },
     #[serde(rename = "console")]
     Console,
 }

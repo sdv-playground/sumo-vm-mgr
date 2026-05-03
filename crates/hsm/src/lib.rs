@@ -25,8 +25,9 @@ pub use types::*;
 /// HSM management provider.
 ///
 /// Implementors manage the HSM keystore and service lifecycle.
-/// The crypto wire protocol (vsock) is handled by the underlying
-/// service — this trait only covers provisioning and process management.
+/// The crypto wire protocol (TCP on the private `vbr-vhsm` bridge) is
+/// handled by the underlying service — this trait only covers
+/// provisioning and process management.
 ///
 /// # Provisioning model
 ///
@@ -60,8 +61,8 @@ pub trait HsmProvider: Send {
     /// List keys currently in the keystore.
     fn list_keys(&self) -> Result<Vec<KeyInfo>, HsmError>;
 
-    /// Start the HSM service so guests can connect via vsock.
-    /// Returns the vsock port the service is listening on.
+    /// Start the HSM service so guests can connect via TCP.
+    /// Returns the TCP port the service is listening on.
     fn start_service(&mut self) -> Result<u16, HsmError>;
 
     /// Stop the HSM service.

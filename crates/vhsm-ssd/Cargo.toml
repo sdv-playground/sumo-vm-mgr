@@ -9,7 +9,6 @@ hsm = { path = "../hsm", features = ["crypto"] }
 secstore = { path = "../secstore" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-libc = "0.2"
 p256 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["verifying", "der"] }
 rand = "0.8"

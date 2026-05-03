@@ -1,10 +1,10 @@
 /// Handle table — maps opaque uint32 handles to internal key state.
 ///
 /// Well-known handles (0x0001..0x00FF) are pre-populated from the keystore
-/// and are not owned by any specific CID (owner_cid = 0).
+/// and are not owned by any specific guest (`owner_vm_id` is empty).
 ///
-/// Dynamic handles (>= 0x0100) are allocated by KEY_GENERATE and owned
-/// by the creating guest's CID.
+/// Dynamic handles (>= 0x0100) are allocated by KEY_GENERATE and owned by
+/// the creating guest's `vm_id`.
 
 use crate::proto::*;
 
@@ -16,8 +16,8 @@ pub struct HandleEntry {
     pub key_id: String,
     pub algorithm: u32,
     pub permitted_ops: u32,
-    /// Vsock CID of the creator. 0 = well-known (shared).
-    pub owner_cid: u32,
+    /// VM identity of the creator. Empty string = well-known (shared).
+    pub owner_vm_id: String,
     pub persistent: bool,
     pub label: [u8; LABEL_LEN],
 }
@@ -62,7 +62,7 @@ impl HandleTable {
             key_id: key_id.to_string(),
             algorithm,
             permitted_ops,
-            owner_cid: 0,
+            owner_vm_id: String::new(),
             persistent: true,
             label,
         });
@@ -76,7 +76,7 @@ impl HandleTable {
         key_id: &str,
         algorithm: u32,
         permitted_ops: u32,
-        owner_cid: u32,
+        owner_vm_id: &str,
         persistent: bool,
         label: &[u8; LABEL_LEN],
     ) -> Option<u32> {
@@ -92,7 +92,7 @@ impl HandleTable {
             key_id: key_id.to_string(),
             algorithm,
             permitted_ops,
-            owner_cid,
+            owner_vm_id: owner_vm_id.to_string(),
             persistent,
             label: *label,
         });
@@ -105,12 +105,12 @@ impl HandleTable {
         self.entries.iter().find(|e| e.handle == handle)
     }
 
-    /// Resolve a handle for a specific caller CID.
-    /// Well-known handles (owner_cid=0) are accessible to any CID.
-    /// Dynamic handles require matching owner_cid.
-    pub fn resolve(&self, handle: u32, caller_cid: u32) -> Option<&HandleEntry> {
+    /// Resolve a handle for a specific caller.
+    /// Well-known handles (empty owner) are accessible to any caller.
+    /// Dynamic handles require matching `owner_vm_id`.
+    pub fn resolve(&self, handle: u32, caller_vm_id: &str) -> Option<&HandleEntry> {
         let entry = self.get(handle)?;
-        if entry.owner_cid == 0 || entry.owner_cid == caller_cid {
+        if entry.owner_vm_id.is_empty() || entry.owner_vm_id == caller_vm_id {
             Some(entry)
         } else {
             None
@@ -127,10 +127,21 @@ impl HandleTable {
         }
     }
 
-    /// Remove all dynamic handles owned by a CID (on VM disconnect/restart).
-    pub fn remove_by_cid(&mut self, cid: u32) {
-        self.entries
-            .retain(|e| e.owner_cid == 0 || e.owner_cid != cid);
+    /// Remove ephemeral dynamic handles owned by a VM on VM
+    /// disconnect/restart. Persistent handles (allocated with
+    /// `persistent=true`) survive reconnects so a guest's userspace
+    /// can re-open vhsm-ssd connections without losing keys it
+    /// generated — e.g. test_all.sh's per-op `vhsm-test` invocations
+    /// each close their TCP session, but a `key-generate ... persistent`
+    /// call must remain visible to the next `vhsm-test sign <handle>`.
+    /// The handle table itself is in-memory only, so persistent here
+    /// means "survives reconnect", not "survives reboot".
+    pub fn remove_by_vm_id(&mut self, vm_id: &str) {
+        self.entries.retain(|e| {
+            e.owner_vm_id.is_empty()
+                || e.owner_vm_id != vm_id
+                || e.persistent
+        });
     }
 
     /// Number of handles currently in use.
@@ -166,9 +177,9 @@ mod tests {
             PERM_SIGN,
         ));
 
-        // Accessible from any CID
-        assert!(table.resolve(HANDLE_JWT_SIGNING, 3).is_some());
-        assert!(table.resolve(HANDLE_JWT_SIGNING, 4).is_some());
+        // Accessible from any VM
+        assert!(table.resolve(HANDLE_JWT_SIGNING, "vm1").is_some());
+        assert!(table.resolve(HANDLE_JWT_SIGNING, "vm2").is_some());
     }
 
     #[test]
@@ -177,17 +188,17 @@ mod tests {
         let label = [0u8; LABEL_LEN];
 
         let h = table
-            .allocate("temp-key", ALG_AES_256, PERM_ENCRYPT | PERM_DECRYPT, 3, false, &label)
+            .allocate("temp-key", ALG_AES_256, PERM_ENCRYPT | PERM_DECRYPT, "vm1", false, &label)
             .unwrap();
         assert!(h >= HANDLE_DYNAMIC_BASE);
 
         // Owner can access
-        assert!(table.resolve(h, 3).is_some());
-        // Other CID cannot
-        assert!(table.resolve(h, 4).is_none());
+        assert!(table.resolve(h, "vm1").is_some());
+        // Other VM cannot
+        assert!(table.resolve(h, "vm2").is_none());
 
-        // Cleanup by CID
-        table.remove_by_cid(3);
-        assert!(table.resolve(h, 3).is_none());
+        // Cleanup by VM
+        table.remove_by_vm_id("vm1");
+        assert!(table.resolve(h, "vm1").is_none());
     }
 }

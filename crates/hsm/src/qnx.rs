@@ -18,7 +18,7 @@
 /// - `list_keys`: enumerate populated key slots from HSM firmware.
 ///
 /// - `start_service`/`stop_service`: likely no-ops since the HSM
-///   firmware runs independently. May manage a vsock proxy if needed.
+///   firmware runs independently. May manage a TCP proxy if needed.
 ///
 /// - `status`: query HSM firmware health, key slot count, etc.
 

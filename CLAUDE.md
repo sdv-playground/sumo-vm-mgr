@@ -25,8 +25,9 @@ Cargo workspace with 10 crates. Bottom-up:
 - **hsm** (lib): HSM management trait (`HsmProvider`, `HsmCryptoProvider`).
   `SimHsm` (dev/test: vhsm-ssd + file keystore) works; `QnxHsm` is a stub.
 - **vhsm-ssd** (lib+bin): host-side daemon terminating the v2 handle-based
-  vHSM wire protocol from guest `/dev/vhsm`. Transports: vsock (Linux/QEMU)
-  and QNX-native shm/IPC.
+  vHSM wire protocol from guest `/dev/vhsm`. Transport is TCP on a
+  private host bridge (`vbr-vhsm`, 192.168.99.0/24); guest identity is
+  the source IP, pinned by the orchestrator via static MAC→IP lease.
 - **vm-devices** (lib): virtual CAN, health, and time simulators running
   on shared memory (ivshmem vs QNX native shm).
 - **vm-service** (lib+bin): QEMU / `qvm` lifecycle, per-bank VM config,
@@ -109,9 +110,9 @@ crates/hsm/src/
 crates/vhsm-ssd/src/
   proto.rs + codec.rs     — wire format (v2, handle-based)
   handle_table.rs         — dynamic handle allocator (0x0100+)
-  policy.rs               — per-CID ACL
+  policy.rs               — IP allow-list (source IP → vm_id, perms)
   handler.rs              — op dispatch -> HsmCryptoProvider
-  transport.rs            — vsock / QNX shm
+  transport.rs            — TCP on `vbr-vhsm` private bridge
 
 example/
   build.rs                — Generate keys, encrypted firmware, CRL manifests

@@ -58,7 +58,9 @@ pub struct KeyMetadata {
     pub key_id: String,
     pub algorithm: u32,
     pub permitted_ops: u32,
-    pub owner_cid: u32,
+    /// VM identity that owns this dynamic handle. Empty string means
+    /// the handle is shared (well-known) and accessible to any caller.
+    pub owner_vm_id: String,
     pub persistent: bool,
     pub label: String,
 }
@@ -129,49 +131,52 @@ impl From<std::io::Error> for SecstoreError {
     }
 }
 
-// Simple binary serialization (no serde dependency)
+// Simple binary serialization (no serde dependency).
+//
+// Layout: vhsm_handle(4) + algorithm(4) + permitted_ops(4) + persistent(1)
+// then three length-prefixed (u16) UTF-8 strings: key_id, owner_vm_id, label.
+// owner_vm_id of length 0 means "shared / well-known".
 fn serialize_metadata(meta: &KeyMetadata) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&meta.vhsm_handle.to_le_bytes());
     buf.extend_from_slice(&meta.algorithm.to_le_bytes());
     buf.extend_from_slice(&meta.permitted_ops.to_le_bytes());
-    buf.extend_from_slice(&meta.owner_cid.to_le_bytes());
     buf.push(meta.persistent as u8);
-    // Length-prefixed strings
-    let key_id = meta.key_id.as_bytes();
-    buf.extend_from_slice(&(key_id.len() as u16).to_le_bytes());
-    buf.extend_from_slice(key_id);
-    let label = meta.label.as_bytes();
-    buf.extend_from_slice(&(label.len() as u16).to_le_bytes());
-    buf.extend_from_slice(label);
+    for s in [&meta.key_id, &meta.owner_vm_id, &meta.label] {
+        let bytes = s.as_bytes();
+        buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    }
     buf
 }
 
 fn deserialize_metadata(data: &[u8]) -> Option<KeyMetadata> {
-    if data.len() < 17 {
+    if data.len() < 13 {
         return None;
     }
     let vhsm_handle = u32::from_le_bytes(data[0..4].try_into().ok()?);
     let algorithm = u32::from_le_bytes(data[4..8].try_into().ok()?);
     let permitted_ops = u32::from_le_bytes(data[8..12].try_into().ok()?);
-    let owner_cid = u32::from_le_bytes(data[12..16].try_into().ok()?);
-    let persistent = data[16] != 0;
+    let persistent = data[12] != 0;
 
-    let mut pos = 17;
-    let key_id_len = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
-    pos += 2;
-    let key_id = std::str::from_utf8(data.get(pos..pos + key_id_len)?).ok()?.to_string();
-    pos += key_id_len;
-    let label_len = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
-    pos += 2;
-    let label = std::str::from_utf8(data.get(pos..pos + label_len)?).ok()?.to_string();
+    let mut pos = 13;
+    let mut take_str = || -> Option<String> {
+        let len = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
+        pos += 2;
+        let s = std::str::from_utf8(data.get(pos..pos + len)?).ok()?.to_string();
+        pos += len;
+        Some(s)
+    };
+    let key_id = take_str()?;
+    let owner_vm_id = take_str()?;
+    let label = take_str()?;
 
     Some(KeyMetadata {
         vhsm_handle,
         key_id,
         algorithm,
         permitted_ops,
-        owner_cid,
+        owner_vm_id,
         persistent,
         label,
     })
@@ -188,7 +193,7 @@ mod tests {
             key_id: "ecu-signing".into(),
             algorithm: 0x0021,
             permitted_ops: 0x0330,
-            owner_cid: 3,
+            owner_vm_id: "vm1".into(),
             persistent: true,
             label: "ECU signing key".into(),
         };
@@ -198,7 +203,7 @@ mod tests {
         assert_eq!(back.key_id, "ecu-signing");
         assert_eq!(back.algorithm, 0x0021);
         assert_eq!(back.permitted_ops, 0x0330);
-        assert_eq!(back.owner_cid, 3);
+        assert_eq!(back.owner_vm_id, "vm1");
         assert!(back.persistent);
         assert_eq!(back.label, "ECU signing key");
     }
@@ -218,7 +223,7 @@ mod tests {
             key_id: "test-key".into(),
             algorithm: 0x0002,
             permitted_ops: 0x03,
-            owner_cid: 0,
+            owner_vm_id: String::new(),
             persistent: true,
             label: "test".into(),
         };
@@ -255,7 +260,7 @@ mod tests {
             key_id: key_id.into(),
             algorithm: 0x0002,
             permitted_ops: 0x03,
-            owner_cid: 3,
+            owner_vm_id: "vm1".into(),
             persistent: true,
             label: String::new(),
         }
@@ -318,15 +323,15 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_truncated_buffer() {
-        let short = vec![0u8; 5]; // needs at least 17 bytes of fixed fields
+        let short = vec![0u8; 5]; // needs at least 13 bytes of fixed fields
         assert!(deserialize_metadata(&short).is_none());
     }
 
     #[test]
     fn deserialize_rejects_string_length_past_end() {
-        // vhsm_handle(4) + algorithm(4) + permitted_ops(4) + owner_cid(4) +
-        // persistent(1) + key_id_len(2)=big + (key_id missing) → must fail
-        let mut buf = vec![0u8; 4 + 4 + 4 + 4 + 1];
+        // vhsm_handle(4) + algorithm(4) + permitted_ops(4) + persistent(1) +
+        // key_id_len(2)=big + (key_id missing) → must fail
+        let mut buf = vec![0u8; 4 + 4 + 4 + 1];
         buf.extend_from_slice(&(9999_u16).to_le_bytes()); // absurd key_id len
         assert!(deserialize_metadata(&buf).is_none());
     }

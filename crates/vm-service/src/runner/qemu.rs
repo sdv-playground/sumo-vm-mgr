@@ -1,7 +1,7 @@
 /// QEMU runner — translates VM definitions into QEMU command lines
 /// and manages host-side processes (ivshmem-server, simulators).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -340,25 +340,19 @@ impl QemuRunner {
             }
         }
 
-        // vsock for HSM (required — no TCP fallback)
-        let vsock_device = match arch {
-            Arch::Aarch64 => "vhost-vsock-device",
-            Arch::X86_64 => "vhost-vsock-pci",
-        };
+        // Bridge NICs (private vHSM network). Each guest's IP on the
+        // bridge is the host vHSM daemon's identity for that guest, so
+        // the MAC is mandatory: dnsmasq pins MAC → IP via static lease.
         for dev in &def.devices {
-            if matches!(dev, DeviceConfig::Hsm { .. }) {
-                if !Path::new("/dev/vhost-vsock").exists() {
-                    return Err(RunnerError::Config(
-                        "/dev/vhost-vsock not found — load vhost_vsock module".into(),
-                    ));
-                }
-                // CID 3+ — unique per VM for CID-based vHSM identity.
-                // Derive stable CID from VM name hash (range 3..65535).
-                let cid = 3 + (name.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32)) % 65533);
+            if let DeviceConfig::Bridge { bridge, mac } = dev {
+                let id = format!("net{net_idx}");
                 args.extend_from_slice(&[
+                    "-netdev".into(),
+                    format!("bridge,id={id},br={bridge}"),
                     "-device".into(),
-                    format!("{vsock_device},guest-cid={cid}"),
+                    format!("{net_device},netdev={id},mac={mac}"),
                 ]);
+                net_idx += 1;
             }
         }
 
@@ -466,8 +460,9 @@ impl VmRunner for QemuRunner {
             }
         }
 
-        // HSM vsock device is added in build_qemu_args().
-        // The HSM service (vhsm-ssd) is managed by the orchestrator.
+        // The HSM service (vhsm-ssd) is managed by the orchestrator;
+        // each guest reaches it over the private vbr-vhsm bridge — see
+        // the Bridge device branch in build_qemu_args().
 
         // Small delay for processes to initialize
         std::thread::sleep(std::time::Duration::from_millis(500));

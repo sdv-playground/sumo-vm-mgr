@@ -30,7 +30,7 @@ pub struct VmBackendComponent<D: BlockDevice + Send + 'static> {
     /// HSM keystore directory used by `get_csr` to spin up a transient
     /// `SimHsm` for CSR signing. `None` means CSR is not supported.
     csr_keystore: Option<PathBuf>,
-    /// vsock port the HSM service listens on. Required by `SimHsm::new` even
+    /// TCP port the HSM service listens on. Required by `SimHsm::new` even
     /// when only used for CSR signing.
     csr_hsm_port: u16,
 }

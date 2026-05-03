@@ -75,7 +75,7 @@ impl Op {
         }
     }
 
-    /// True if this operation is host-only (rejected over vsock from guests).
+    /// True if this operation is host-only (rejected when the caller is a guest VM).
     pub fn is_host_only(self) -> bool {
         matches!(self, Op::KeyImport | Op::KeyDerive | Op::KeyDelete)
     }

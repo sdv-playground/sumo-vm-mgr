@@ -73,7 +73,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `secstore` | — | Encrypted key-metadata persistence, pluggable encryptor + backend |
 | `vm-boot` | `vm-boot` | Boot decisions, trial counting, auto-rollback (all bank sets) |
 | `hsm` | — | HSM management trait (`HsmProvider` / `HsmCryptoProvider`) |
-| `vhsm-ssd` | `vhsm-ssd` | Host-side vHSM v2 daemon, vsock/QNX-shm transports |
+| `vhsm-ssd` | `vhsm-ssd` | Host-side vHSM v2 daemon — TCP on the private `vbr-vhsm` bridge, source-IP-based identity |
 | `vm-devices` | — | CAN / health / time simulators (host-side) |
 | `vm-service` | `vm-service` | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config, ivshmem |
 | `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic) |

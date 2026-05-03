@@ -1,15 +1,26 @@
 /// Request dispatch (v2) — routes opcodes via handle table + policy.
 
+use std::net::IpAddr;
+
 use hsm::{HsmCryptoProvider, HsmError};
 
 use crate::handle_table::HandleTable;
 use crate::policy::Policy;
 use crate::proto::*;
 
+/// Caller identity passed through the dispatch chain. The `vm_id` is
+/// resolved from the source IP via the policy table at accept time and
+/// is used both to scope dynamic-handle ownership and to label log lines.
+#[derive(Debug, Clone)]
+pub struct CallerId {
+    pub peer_ip: IpAddr,
+    pub vm_id: String,
+}
+
 /// Handle a single request. Returns the response to send.
 pub fn handle_request(
     req: &Request,
-    caller_cid: u32,
+    caller: &CallerId,
     handle_table: &mut HandleTable,
     policy: &Policy,
     crypto: &dyn HsmCryptoProvider,
@@ -18,30 +29,30 @@ pub fn handle_request(
         return Response::err(req.op, req.session_id, StatusCode::InvalidParam);
     };
 
-    // Reject host-only ops from vsock guests
+    // Reject host-only ops from guest callers.
     if op.is_host_only() {
         return Response::err(req.op, req.session_id, StatusCode::PolicyReject);
     }
 
-    // Policy check: is this CID allowed to perform this op at all?
+    // Policy check: is this caller allowed to perform this op at all?
     if let Some(required) = op.required_perm() {
-        if let Err(status) = policy.check(caller_cid, required) {
+        if let Err(status) = policy.check(caller.peer_ip, required) {
             return Response::err(req.op, req.session_id, status);
         }
     }
 
     match op {
         Op::GetRandom => handle_get_random(req, crypto),
-        Op::KeyGenerate => handle_key_generate(req, caller_cid, handle_table, crypto),
-        Op::Encrypt => handle_crypto_with_handle(req, op, caller_cid, handle_table, crypto),
-        Op::Decrypt => handle_crypto_with_handle(req, op, caller_cid, handle_table, crypto),
-        Op::MacGenerate => handle_crypto_with_handle(req, op, caller_cid, handle_table, crypto),
-        Op::MacVerify => handle_crypto_with_handle(req, op, caller_cid, handle_table, crypto),
-        Op::Sign => handle_crypto_with_handle(req, op, caller_cid, handle_table, crypto),
-        Op::Verify => handle_verify(req, caller_cid, handle_table, crypto),
-        Op::GetHandleInfo => handle_get_handle_info(req, caller_cid, handle_table),
-        Op::GetPubkey => handle_get_pubkey(req, caller_cid, handle_table, crypto),
-        Op::GetCert => handle_get_cert(req, caller_cid, handle_table, crypto),
+        Op::KeyGenerate => handle_key_generate(req, caller, handle_table, crypto),
+        Op::Encrypt => handle_crypto_with_handle(req, op, caller, handle_table, crypto),
+        Op::Decrypt => handle_crypto_with_handle(req, op, caller, handle_table, crypto),
+        Op::MacGenerate => handle_crypto_with_handle(req, op, caller, handle_table, crypto),
+        Op::MacVerify => handle_crypto_with_handle(req, op, caller, handle_table, crypto),
+        Op::Sign => handle_crypto_with_handle(req, op, caller, handle_table, crypto),
+        Op::Verify => handle_verify(req, caller, handle_table, crypto),
+        Op::GetHandleInfo => handle_get_handle_info(req, caller, handle_table),
+        Op::GetPubkey => handle_get_pubkey(req, caller, handle_table, crypto),
+        Op::GetCert => handle_get_cert(req, caller, handle_table, crypto),
         // Host-only ops already rejected above
         Op::KeyImport | Op::KeyDerive | Op::KeyDelete => unreachable!(),
     }
@@ -68,7 +79,7 @@ fn handle_get_random(req: &Request, crypto: &dyn HsmCryptoProvider) -> Response 
 
 fn handle_key_generate(
     req: &Request,
-    caller_cid: u32,
+    caller: &CallerId,
     handle_table: &mut HandleTable,
     crypto: &dyn HsmCryptoProvider,
 ) -> Response {
@@ -94,7 +105,7 @@ fn handle_key_generate(
     label.copy_from_slice(&req.payload[12..12 + LABEL_LEN]);
 
     // Generate a key_id for internal use
-    let key_id = format!("gen-{}-{}", caller_cid, handle_table.len());
+    let key_id = format!("gen-{}-{}", caller.vm_id, handle_table.len());
 
     // Actually create the key material on disk (AES .bin or EC .priv+.pub)
     // and collect the public key DER (empty for symmetric).
@@ -114,7 +125,7 @@ fn handle_key_generate(
         &key_id,
         algorithm,
         permitted_ops,
-        caller_cid,
+        &caller.vm_id,
         persistent,
         &label,
     ) {
@@ -134,7 +145,7 @@ fn handle_key_generate(
 fn handle_crypto_with_handle(
     req: &Request,
     op: Op,
-    caller_cid: u32,
+    caller: &CallerId,
     handle_table: &HandleTable,
     crypto: &dyn HsmCryptoProvider,
 ) -> Response {
@@ -149,7 +160,7 @@ fn handle_crypto_with_handle(
         req.payload[3],
     ]);
 
-    let entry = match handle_table.resolve(handle, caller_cid) {
+    let entry = match handle_table.resolve(handle, &caller.vm_id) {
         Some(e) => e,
         None => return Response::err(req.op, req.session_id, StatusCode::InvalidHandle),
     };
@@ -222,7 +233,7 @@ fn handle_crypto_with_handle(
 
 fn handle_verify(
     req: &Request,
-    caller_cid: u32,
+    caller: &CallerId,
     handle_table: &HandleTable,
     crypto: &dyn HsmCryptoProvider,
 ) -> Response {
@@ -238,7 +249,7 @@ fn handle_verify(
         req.payload[3],
     ]);
 
-    let entry = match handle_table.resolve(handle, caller_cid) {
+    let entry = match handle_table.resolve(handle, &caller.vm_id) {
         Some(e) => e,
         None => return Response::err(req.op, req.session_id, StatusCode::InvalidHandle),
     };
@@ -277,7 +288,7 @@ fn handle_verify(
 
 fn handle_get_handle_info(
     req: &Request,
-    caller_cid: u32,
+    caller: &CallerId,
     handle_table: &HandleTable,
 ) -> Response {
     if req.payload.len() < 4 {
@@ -291,7 +302,7 @@ fn handle_get_handle_info(
         req.payload[3],
     ]);
 
-    let entry = match handle_table.resolve(handle, caller_cid) {
+    let entry = match handle_table.resolve(handle, &caller.vm_id) {
         Some(e) => e,
         None => return Response::err(req.op, req.session_id, StatusCode::InvalidHandle),
     };
@@ -309,7 +320,7 @@ fn handle_get_handle_info(
 
 fn handle_get_pubkey(
     req: &Request,
-    caller_cid: u32,
+    caller: &CallerId,
     handle_table: &HandleTable,
     crypto: &dyn HsmCryptoProvider,
 ) -> Response {
@@ -324,7 +335,7 @@ fn handle_get_pubkey(
         req.payload[3],
     ]);
 
-    let entry = match handle_table.resolve(handle, caller_cid) {
+    let entry = match handle_table.resolve(handle, &caller.vm_id) {
         Some(e) => e,
         None => return Response::err(req.op, req.session_id, StatusCode::InvalidHandle),
     };
@@ -352,7 +363,7 @@ fn handle_get_pubkey(
 
 fn handle_get_cert(
     req: &Request,
-    caller_cid: u32,
+    caller: &CallerId,
     handle_table: &HandleTable,
     crypto: &dyn HsmCryptoProvider,
 ) -> Response {
@@ -367,7 +378,7 @@ fn handle_get_cert(
         req.payload[3],
     ]);
 
-    let entry = match handle_table.resolve(handle, caller_cid) {
+    let entry = match handle_table.resolve(handle, &caller.vm_id) {
         Some(e) => e,
         None => return Response::err(req.op, req.session_id, StatusCode::InvalidHandle),
     };
@@ -401,6 +412,7 @@ fn handle_get_cert(
 mod tests {
     use super::*;
     use hsm::sim::SimHsm;
+    use std::net::Ipv4Addr;
     use std::path::PathBuf;
 
     fn new_hsm() -> (SimHsm, PathBuf, tempfile::TempDir) {
@@ -410,6 +422,13 @@ mod tests {
         let keys_dir = keystore.join("keys");
         let hsm = SimHsm::new(PathBuf::from("unused"), keystore, 0, Vec::new());
         (hsm, keys_dir, tmp)
+    }
+
+    fn caller(vm_id: &str) -> CallerId {
+        CallerId {
+            peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            vm_id: vm_id.to_string(),
+        }
     }
 
     /// Build a key_generate payload: algorithm(4) + permitted_ops(4) +
@@ -437,7 +456,7 @@ mod tests {
                 PERM_ENCRYPT | PERM_DECRYPT | PERM_MAC_GEN | PERM_MAC_VFY,
             ),
         };
-        let resp = handle_key_generate(&req, 51296, &mut table, &hsm);
+        let resp = handle_key_generate(&req, &caller("vm1"), &mut table, &hsm);
         assert_eq!(resp.status, StatusCode::Ok as u32);
 
         // Response: handle(4) + pubkey_len(4) + pubkey
@@ -450,7 +469,7 @@ mod tests {
         // Key file must actually exist on disk (regression test for the
         // pre-fix TODO where the handler allocated handles without calling
         // generate_key — mac-generate then failed with CRYPTO_ERROR).
-        assert!(keys_dir.join("gen-51296-0.bin").exists());
+        assert!(keys_dir.join("gen-vm1-0.bin").exists());
     }
 
     #[test]
@@ -463,7 +482,7 @@ mod tests {
             session_id: 0,
             payload: make_keygen_payload(ALG_ECC_P256, PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY),
         };
-        let resp = handle_key_generate(&req, 51296, &mut table, &hsm);
+        let resp = handle_key_generate(&req, &caller("vm1"), &mut table, &hsm);
         assert_eq!(resp.status, StatusCode::Ok as u32);
 
         let pubkey_len = u32::from_le_bytes(resp.payload[4..8].try_into().unwrap()) as usize;
@@ -473,13 +492,13 @@ mod tests {
         // SubjectPublicKeyInfo DER starts with SEQUENCE (0x30).
         assert_eq!(pubkey[0], 0x30);
 
-        assert!(keys_dir.join("gen-51296-0.priv").exists());
-        assert!(keys_dir.join("gen-51296-0.pub").exists());
+        assert!(keys_dir.join("gen-vm1-0.priv").exists());
+        assert!(keys_dir.join("gen-vm1-0.pub").exists());
     }
 
     #[test]
     fn key_generate_unsupported_alg_rejected() {
-        let (hsm, keys_dir, _tmp) = new_hsm();
+        let (hsm, _keys_dir, _tmp) = new_hsm();
         let mut table = HandleTable::new();
 
         let req = Request {
@@ -487,7 +506,7 @@ mod tests {
             session_id: 0,
             payload: make_keygen_payload(ALG_ED25519, 0),
         };
-        let resp = handle_key_generate(&req, 51296, &mut table, &hsm);
+        let resp = handle_key_generate(&req, &caller("vm1"), &mut table, &hsm);
         assert_eq!(
             resp.status,
             StatusCode::InvalidParam as u32,
@@ -501,7 +520,7 @@ mod tests {
         // pointed at a non-existent key_id and `mac_generate` failed with
         // `CRYPTO_ERROR` because `get_key_info` couldn't find the key.
         use hsm::HsmCryptoProvider;
-        let (hsm, keys_dir, _tmp) = new_hsm();
+        let (hsm, _keys_dir, _tmp) = new_hsm();
         let mut table = HandleTable::new();
 
         let req = Request {
@@ -512,7 +531,7 @@ mod tests {
                 PERM_ENCRYPT | PERM_DECRYPT | PERM_MAC_GEN | PERM_MAC_VFY,
             ),
         };
-        let resp = handle_key_generate(&req, 42, &mut table, &hsm);
+        let resp = handle_key_generate(&req, &caller("vm-test"), &mut table, &hsm);
         assert_eq!(resp.status, StatusCode::Ok as u32);
         let handle = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
 

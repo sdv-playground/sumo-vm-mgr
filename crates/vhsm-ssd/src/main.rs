@@ -1,11 +1,15 @@
-/// vHSM Secure Storage Daemon (v2) — host-side crypto service for guest VMs.
-///
-/// Listens on vsock for guest connections. Identity is derived from the
-/// peer vsock CID. Access controlled by a per-CID policy.
-///
-/// Usage:
-///   vhsm-ssd --keystore <path> [--port <vsock_port>] [--policy <path>]
+//! vHSM Secure Storage Daemon (v2) — host-side crypto service for guest VMs.
+//!
+//! Listens on TCP on a private host bridge (`vbr-vhsm`, 192.168.99.0/24).
+//! Identity is derived from the source IP of the connecting socket;
+//! the policy file maps each allowed source IP to a `vm_id` plus a
+//! permitted-ops bitmask.
+//!
+//! Usage:
+//!   vhsm-ssd --keystore <path> [--listen <ip:port>] [--policy <file>]
+//!            [--allow-ip <ip>=<vm_id>]... [--persist-dir <dir>]
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -14,12 +18,15 @@ use hsm::{HsmCryptoProvider, HsmProvider};
 
 use vhsm_ssd::codec;
 use vhsm_ssd::handle_table::HandleTable;
-use vhsm_ssd::handler;
+use vhsm_ssd::handler::{self, CallerId};
 use vhsm_ssd::policy::Policy;
 use vhsm_ssd::proto::*;
-use vhsm_ssd::transport::VsockListener;
+use vhsm_ssd::transport::Connection;
+use vhsm_ssd::transport::TcpListener;
 
-use secstore::{FileBackend, LinuxSimEncryptor, Secstore, KeyMetadata};
+use secstore::{FileBackend, KeyMetadata, LinuxSimEncryptor, Secstore};
+
+const DEFAULT_LISTEN: &str = "192.168.99.1:5100";
 
 fn main() {
     tracing_subscriber::fmt()
@@ -31,9 +38,9 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let mut keystore_path: Option<PathBuf> = None;
-    let mut vsock_port: Option<u32> = None;
+    let mut listen_addr: Option<SocketAddr> = None;
     let mut policy_path: Option<PathBuf> = None;
-    let mut allow_cids: Vec<u32> = Vec::new();
+    let mut allow_ip_args: Vec<(std::net::IpAddr, String)> = Vec::new();
     let mut persist_dir: Option<PathBuf> = None;
 
     let mut i = 1;
@@ -43,9 +50,9 @@ fn main() {
                 keystore_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
-            "--port" if i + 1 < args.len() => {
-                vsock_port = Some(args[i + 1].parse().unwrap_or_else(|_| {
-                    eprintln!("invalid --port: {}", args[i + 1]);
+            "--listen" if i + 1 < args.len() => {
+                listen_addr = Some(args[i + 1].parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --listen '{}': {e}", args[i + 1]);
                     std::process::exit(1);
                 }));
                 i += 2;
@@ -58,22 +65,27 @@ fn main() {
                 persist_dir = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
-            "--allow-cid" if i + 1 < args.len() => {
-                let cid: u32 = args[i + 1].parse().unwrap_or_else(|_| {
-                    eprintln!("invalid --allow-cid: {}", args[i + 1]);
+            "--allow-ip" if i + 1 < args.len() => {
+                let raw = &args[i + 1];
+                let (ip_str, vm_id) = raw.split_once('=').unwrap_or_else(|| {
+                    eprintln!("invalid --allow-ip '{raw}': expected <ip>=<vm_id>");
                     std::process::exit(1);
                 });
-                allow_cids.push(cid);
+                let ip: std::net::IpAddr = ip_str.parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --allow-ip IP '{ip_str}': {e}");
+                    std::process::exit(1);
+                });
+                allow_ip_args.push((ip, vm_id.to_string()));
                 i += 2;
             }
             "--help" | "-h" => {
-                eprintln!("Usage: vhsm-ssd --keystore <path> [--port <vsock_port>] [--policy <path>] [--allow-cid <cid>]...");
+                eprintln!("Usage: vhsm-ssd --keystore <path> [--listen <ip:port>] [--policy <file>] [--allow-ip <ip>=<vm_id>]...");
                 eprintln!();
-                eprintln!("  --keystore <path>   HSM keystore directory (required)");
-                eprintln!("  --port <port>       vsock port (default: {})", VHSM_PORT);
-                eprintln!("  --policy <path>     Binary policy file");
-                eprintln!("  --persist-dir <dir>  Persist dynamic handles to this directory");
-                eprintln!("  --allow-cid <cid>   Allow this CID all operations (repeatable, dev/test)");
+                eprintln!("  --keystore <path>           HSM keystore directory (required)");
+                eprintln!("  --listen <ip:port>          Bind address (default: {DEFAULT_LISTEN})");
+                eprintln!("  --policy <file>             IP allow-list file (production)");
+                eprintln!("  --allow-ip <ip>=<vm_id>     Grant all permissions to (ip, vm_id) (dev/test, repeatable)");
+                eprintln!("  --persist-dir <dir>         Persist dynamic handles to this directory");
                 std::process::exit(0);
             }
             other => {
@@ -88,13 +100,15 @@ fn main() {
         std::process::exit(1);
     });
 
-    let port = vsock_port.unwrap_or(VHSM_PORT);
+    let listen_addr = listen_addr.unwrap_or_else(|| {
+        DEFAULT_LISTEN.parse().expect("DEFAULT_LISTEN parse")
+    });
 
     // Create HSM provider (reads keys from keystore)
     let hsm = SimHsm::new(
         PathBuf::from("unused"),
         keystore_path.clone(),
-        port as u16,
+        listen_addr.port(),
         Vec::new(),
     );
 
@@ -109,9 +123,9 @@ fn main() {
 
     let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(hsm);
 
-    // Load policy
+    // Load policy.
     let policy = if let Some(ref path) = policy_path {
-        match Policy::load_from_file(path, false) {
+        match Policy::load_from_file(path) {
             Ok(p) => {
                 tracing::info!(
                     path = %path.display(),
@@ -125,12 +139,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
-    } else if !allow_cids.is_empty() {
-        tracing::info!("using --allow-cid policy: {:?}", allow_cids);
-        Policy::allow_all(&allow_cids)
+    } else if !allow_ip_args.is_empty() {
+        tracing::info!(?allow_ip_args, "using --allow-ip policy");
+        Policy::allow_all(allow_ip_args.into_iter())
     } else {
-        eprintln!("error: no --policy or --allow-cid specified");
-        eprintln!("       Use --policy <file> for production, or --allow-cid <cid> for dev/test");
+        eprintln!("error: no --policy or --allow-ip specified");
+        eprintln!("       Use --policy <file> for production, or --allow-ip <ip>=<vm_id> for dev/test");
         std::process::exit(1);
     };
     let policy = Arc::new(policy);
@@ -155,7 +169,7 @@ fn main() {
                         label[..copy_len].copy_from_slice(&bytes[..copy_len]);
                         table.allocate(
                             &m.key_id, m.algorithm, m.permitted_ops,
-                            m.owner_cid, m.persistent, &label,
+                            &m.owner_vm_id, m.persistent, &label,
                         );
                     }
                     tracing::info!(count = metas.len(), "loaded persisted handles");
@@ -176,20 +190,23 @@ fn main() {
         "vhsm-ssd v2 starting"
     );
 
-    // Bind vsock
-    let listener = match VsockListener::bind(port) {
+    // Bind TCP listener.
+    let listener = match TcpListener::bind(listen_addr) {
         Ok(l) => {
-            tracing::info!(port, "listening on vsock");
+            tracing::info!(addr = %l.local_addr(), "listening on tcp");
             l
         }
         Err(e) => {
-            eprintln!("error: vsock bind to port {port} failed: {e}");
-            eprintln!("       Is vhost_vsock loaded? (modprobe vhost_vsock)");
+            eprintln!("error: tcp bind to {listen_addr} failed: {e}");
             std::process::exit(1);
         }
     };
 
-    // Accept loop
+    // Accept loop — spawn a thread per accepted connection so a
+    // long-lived client (e.g. Linux's /dev/vhsm kernel module which
+    // keeps a persistent TCP session open) doesn't block other guests
+    // from connecting. All shared state (handle_table, policy, crypto,
+    // store) is already Arc-wrapped and thread-safe.
     loop {
         let mut conn = match listener.accept() {
             Ok(c) => c,
@@ -200,69 +217,108 @@ fn main() {
             }
         };
 
-        let peer_cid = conn.peer_cid();
+        // Resolve peer IP → vm_id via the policy. A connection from an
+        // unallowed IP is rejected immediately, before any bytes are
+        // accepted from the wire.
+        let peer_ip = conn.peer_ip();
+        let vm_id = match policy.lookup(peer_ip) {
+            Some(entry) => entry.vm_id.clone(),
+            None => {
+                tracing::warn!(peer = %peer_ip, "rejecting connection: source IP not in policy");
+                drop(conn);
+                continue;
+            }
+        };
 
-        loop {
-            let req = match codec::read_request(conn.reader()) {
-                Ok(r) => r,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => {
-                    tracing::debug!(cid = peer_cid, error = %e, "connection closed");
-                    break;
-                }
-            };
+        // Clone the per-connection state we'll move into the worker.
+        let handle_table = Arc::clone(&handle_table);
+        let policy = Arc::clone(&policy);
+        let crypto = Arc::clone(&crypto);
+        let store = store.clone();
 
-            tracing::debug!(
-                cid = peer_cid,
-                op = req.op,
-                session_id = req.session_id,
-                "request"
-            );
+        let join = std::thread::Builder::new()
+            .name(format!("vhsm-ssd-{vm_id}"))
+            .spawn(move || {
+                let caller = CallerId {
+                    peer_ip,
+                    vm_id: vm_id.clone(),
+                };
+                serve_connection(&mut conn, &caller, &handle_table, &policy, &*crypto, store.as_deref());
+                handle_table.lock().unwrap().remove_by_vm_id(&caller.vm_id);
+                tracing::info!(vm = %caller.vm_id, "connection closed, dynamic handles released");
+            });
+        if let Err(e) = join {
+            tracing::warn!(error = %e, "failed to spawn worker thread, dropping connection");
+        }
+    }
+}
 
-            let table_len_before = handle_table.lock().unwrap().len();
+/// Per-connection request-loop. Runs on its own thread so the accept
+/// loop in main() stays responsive while a client (e.g. Linux's
+/// /dev/vhsm) holds a long-lived TCP session.
+fn serve_connection(
+    conn: &mut Connection,
+    caller: &CallerId,
+    handle_table: &Arc<Mutex<HandleTable>>,
+    policy: &Policy,
+    crypto: &dyn HsmCryptoProvider,
+    store: Option<&Secstore<LinuxSimEncryptor, FileBackend>>,
+) {
+    loop {
+        let req = match codec::read_request(conn.reader()) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                tracing::debug!(vm = %caller.vm_id, error = %e, "connection closed");
+                break;
+            }
+        };
 
-            let resp = {
-                let mut table = handle_table.lock().unwrap();
-                handler::handle_request(&req, peer_cid, &mut table, &policy, &*crypto)
-            };
+        tracing::debug!(
+            vm = %caller.vm_id,
+            op = req.op,
+            session_id = req.session_id,
+            "request"
+        );
 
-            // Persist if a dynamic handle was added (KEY_GENERATE success)
-            if let Some(ref s) = store {
-                let table = handle_table.lock().unwrap();
-                if table.len() > table_len_before {
-                    // New handle was added — find and persist it
-                    if let Some(entry) = table.last() {
-                        if entry.persistent {
-                            let label_str = std::str::from_utf8(&entry.label)
-                                .unwrap_or("")
-                                .trim_end_matches('\0')
-                                .to_string();
-                            let meta = KeyMetadata {
-                                vhsm_handle: entry.handle,
-                                key_id: entry.key_id.clone(),
-                                algorithm: entry.algorithm,
-                                permitted_ops: entry.permitted_ops,
-                                owner_cid: entry.owner_cid,
-                                persistent: true,
-                                label: label_str,
-                            };
-                            if let Err(e) = s.store(&meta) {
-                                tracing::warn!(handle = entry.handle, error = %e, "failed to persist handle");
-                            }
+        let table_len_before = handle_table.lock().unwrap().len();
+
+        let resp = {
+            let mut table = handle_table.lock().unwrap();
+            handler::handle_request(&req, caller, &mut table, policy, crypto)
+        };
+
+        // Persist if a dynamic handle was added (KEY_GENERATE success)
+        if let Some(s) = store {
+            let table = handle_table.lock().unwrap();
+            if table.len() > table_len_before {
+                if let Some(entry) = table.last() {
+                    if entry.persistent {
+                        let label_str = std::str::from_utf8(&entry.label)
+                            .unwrap_or("")
+                            .trim_end_matches('\0')
+                            .to_string();
+                        let meta = KeyMetadata {
+                            vhsm_handle: entry.handle,
+                            key_id: entry.key_id.clone(),
+                            algorithm: entry.algorithm,
+                            permitted_ops: entry.permitted_ops,
+                            owner_vm_id: entry.owner_vm_id.clone(),
+                            persistent: true,
+                            label: label_str,
+                        };
+                        if let Err(e) = s.store(&meta) {
+                            tracing::warn!(handle = entry.handle, error = %e, "failed to persist handle");
                         }
                     }
                 }
             }
-
-            if let Err(e) = codec::write_response(conn.writer(), &resp) {
-                tracing::warn!(cid = peer_cid, error = %e, "write error, closing connection");
-                break;
-            }
         }
 
-        // Clean up dynamic handles for disconnected VM
-        handle_table.lock().unwrap().remove_by_cid(peer_cid);
-        tracing::info!(cid = peer_cid, "connection closed, dynamic handles released");
+        if let Err(e) = codec::write_response(conn.writer(), &resp) {
+            tracing::warn!(vm = %caller.vm_id, error = %e, "write error, closing connection");
+            break;
+        }
     }
 }
 

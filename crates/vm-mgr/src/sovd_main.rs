@@ -47,7 +47,7 @@ async fn main() {
         eprintln!("  --vm-service-socket <path> Unix socket / TCP address for vm-service lifecycle control");
         eprintln!("  --hsm-daemon <path>        Path to vhsm-test-ssd binary");
         eprintln!("  --hsm-keystore <path>      HSM keystore directory (default: /tmp/vhsm-keys)");
-        eprintln!("  --hsm-port <port>          HSM vsock port (default: 5100)");
+        eprintln!("  --hsm-port <port>          HSM TCP port (default: 5100)");
         eprintln!("  --boot-device <path>       Boot partition block device for IFS activation (e.g. /dev/hd0t177)");
         eprintln!("  --boot-mount <path>        Boot partition mount point (default: /mnt/boot)");
         eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
