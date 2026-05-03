@@ -775,8 +775,21 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     }
 
     /// Send a restart request to vm-service over its Unix socket.
+    ///
+    /// Reads back the HTTP status line so axum gets a chance to fully
+    /// process the request before our side closes the socket. Earlier
+    /// versions of this dropped the stream right after `write_all`,
+    /// which raced under campaign load: when the orchestrator issues
+    /// vm1+vm2 resets in parallel, the two `notify_vm_service` calls
+    /// arrived back-to-back; axum sometimes saw EOF before parsing the
+    /// second request, so vm1 never got started.
+    ///
+    /// vm-service's `restart_vm` returns 200 the moment it has
+    /// initiated the restart (it does NOT wait for QEMU to fully boot),
+    /// so this read is bounded — the orchestrator still polls
+    /// activation state separately to know when the guest is healthy.
     async fn notify_vm_service(socket_path: &std::path::Path, vm_name: &str) -> Result<(), String> {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut stream = tokio::net::UnixStream::connect(socket_path)
             .await
@@ -794,10 +807,24 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             .await
             .map_err(|e| format!("write to vm-service: {e}"))?;
 
-        // Fire-and-forget: don't wait for response. The restart may take
-        // a long time (devb-loopback + qvm spawn) and the orchestrator
-        // will poll activation state to detect when it's done.
-        Ok(())
+        // Read the status line (with a generous timeout — the handler
+        // returns once restart is initiated, ~100s of ms).
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            stream.read(&mut buf),
+        )
+        .await
+        .map_err(|_| "vm-service didn't respond within 15s".to_string())?
+        .map_err(|e| format!("read from vm-service: {e}"))?;
+
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        let status_line = resp.lines().next().unwrap_or("(empty)");
+        if status_line.contains("200") {
+            Ok(())
+        } else {
+            Err(format!("vm-service returned: {status_line}"))
+        }
     }
 
     /// Whether the guest backing this component has finished its
@@ -1404,10 +1431,25 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 let bank_dir = images_dir.join(set_name).join(bank_dir_name);
                 let _ = std::fs::create_dir_all(&bank_dir);
 
-                // staged.img → bank_X/rootfs.img, kernel-staged.img → bank_X/boot.ifs
+                // Kernel rename target depends on what vm-service expects
+                // (per `images.kernel` in vm-service.yaml):
+                //   vm1 (Linux)        → bzImage  — direct kernel boot
+                //   vm2 (QNX BIOS)     → boot.img — IPL+IFS as BIOS disk
+                //   host-os            → boot.ifs — bare IFS for direct boot
+                // The original code hardcoded `boot.ifs` for everything,
+                // which broke vm1 (no bzImage) AND vm2 (no boot.img — VM
+                // fell through to iPXE network boot since BIOS found no
+                // bootable disk). Symptom: orchestrator times out at 60s
+                // waiting for activation; guest_state stays offline (0xffffffff).
+                let kernel_target = match self.bank_set {
+                    BankSet::Vm1 => "bzImage",
+                    BankSet::Vm2 => "boot.img",
+                    _ => "boot.ifs",
+                };
+                // staged.img → bank_X/rootfs.img, kernel-staged.img → bank_X/<kernel_target>
                 let moves: &[(&str, &str)] = &[
                     ("staged.img", "rootfs.img"),
-                    ("kernel-staged.img", "boot.ifs"),
+                    ("kernel-staged.img", kernel_target),
                     ("config-staged.yaml", "vm-config.yaml"),
                 ];
                 for (staged_suffix, target_name) in moves {
@@ -1591,9 +1633,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                             let bank_dir = images_dir.join(set_name).join(format!("bank_{target_bank}"));
                             let _ = std::fs::create_dir_all(&bank_dir);
 
+                            // Same per-bank-set kernel rename as the install-from-disk path above.
+                            let kernel_target = match self.bank_set {
+                                BankSet::Vm1 => "bzImage",
+                                BankSet::Vm2 => "boot.img",
+                                _ => "boot.ifs",
+                            };
                             let moves: &[(&str, &str)] = &[
                                 ("staged.img", "rootfs.img"),
-                                ("kernel-staged.img", "boot.ifs"),
+                                ("kernel-staged.img", kernel_target),
                                 ("config-staged.yaml", "vm-config.yaml"),
                                 ("config-staged.img", "vm-config.yaml"),
                             ];
