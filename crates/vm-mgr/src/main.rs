@@ -266,7 +266,7 @@ fn main() {
             }
 
             // Write FW meta for each bank set with a manifest
-            for name in ["hypervisor", "vm1", "vm2", "hsm"] {
+            for name in ["host-os", "vm1", "vm2", "hsm"] {
                 let manifest_file = dir.join(format!("{name}.yaml"));
                 if !manifest_file.exists() {
                     continue;
