@@ -1,4 +1,4 @@
-# Architecture: sumo-vm-mgr
+# Architecture: sumo-machine-manager
 
 ## Overview
 
@@ -11,7 +11,7 @@ The workspace now spans nine crates (see `Cargo.toml`): `nv-store`, `secstore`, 
 ## Project Structure
 
 ```
-sumo-vm-mgr/
+sumo-machine-manager/
 +-- Cargo.toml                  # Workspace root (9 crates)
 +-- CLAUDE.md                   # AI assistant instructions
 +-- README.md                   # Project overview & quick start
@@ -895,7 +895,7 @@ The `secstore` crate separates "where bytes live" (`SecstoreBackend`) from "how 
 ### 1. Project Scaffolding
 
 ```bash
-cargo init --name sumo-vm-mgr
+cargo init --name sumo-machine-manager
 # Convert to workspace
 mkdir -p crates/{nv-store,secstore,boot,hsm,vhsm-ssd,vm-devices,vm-service,machine-mgr,hypervisor-mgr}/src
 mkdir -p specs example/{factory,profiles,templates,config,keys}

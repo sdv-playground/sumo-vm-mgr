@@ -1,4 +1,4 @@
-# CLAUDE.md — sumo-vm-mgr
+# CLAUDE.md — sumo-machine-manager
 
 ## Project Overview
 

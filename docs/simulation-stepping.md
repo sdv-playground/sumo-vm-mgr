@@ -182,7 +182,7 @@ To control a VM from an external simulation tool:
 5. **Drive the loop**: call `step()` at the simulation tick rate
 6. **For debug sessions**: `pause()` / `resume(0)`
 
-The vm-devices crate is open source: `github.com/sdv-playground/sumo-vm-mgr`
+The vm-devices crate is open source: `github.com/sdv-playground/sumo-machine-manager`
 
 ## Test Coverage
 

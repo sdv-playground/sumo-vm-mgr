@@ -1,4 +1,4 @@
-# sumo-vm-mgr
+# sumo-machine-manager
 
 Platform-agnostic machine manager for automotive ECUs. Handles A/B bank switching, boot decisions, OTA software updates with SUIT manifest validation, encrypted firmware, and SOVD-compatible diagnostics.
 
@@ -26,7 +26,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ sumo-vm-mgr (cargo workspace)                              │
+│ sumo-machine-manager (cargo workspace)                      │
 │                                                            │
 │  nv-store        NV data: boot state, FW meta, factory,    │
 │  (lib)           runtime DIDs, DTCs — pluggable block dev  │
