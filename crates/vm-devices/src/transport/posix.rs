@@ -1,25 +1,24 @@
-//! QNX shared memory + pulse doorbell transport.
+//! POSIX shared memory transport + QNX pulse doorbell.
 //!
-//! Uses POSIX shm_open + mmap for shared memory (works on both QNX and
-//! Linux for testing). Doorbell uses QNX MsgSendPulse on QNX, falls
-//! back to no-op on other platforms.
+//! `PosixSharedMemory` uses shm_open + mmap — works on Linux and QNX.
+//! `QnxPulseDoorbell` uses MsgSendPulse (QNX-only, no-op on Linux).
 
 use std::sync::atomic::Ordering;
 
 use crate::transport::{Doorbell, SharedMemory, TransportError};
 
-/// QNX/POSIX shared memory region.
-pub struct QnxSharedMemory {
+/// POSIX shared memory region (shm_open + mmap).
+pub struct PosixSharedMemory {
     ptr: *mut u8,
     size: usize,
     #[allow(dead_code)]
     name: String,
 }
 
-unsafe impl Send for QnxSharedMemory {}
-unsafe impl Sync for QnxSharedMemory {}
+unsafe impl Send for PosixSharedMemory {}
+unsafe impl Sync for PosixSharedMemory {}
 
-impl QnxSharedMemory {
+impl PosixSharedMemory {
     /// Open an existing shared memory object by name.
     pub fn open(name: &str, size: usize) -> Result<Self, std::io::Error> {
         let c_name = std::ffi::CString::new(name)
@@ -90,13 +89,13 @@ impl QnxSharedMemory {
     }
 }
 
-impl Drop for QnxSharedMemory {
+impl Drop for PosixSharedMemory {
     fn drop(&mut self) {
         unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.size) };
     }
 }
 
-impl SharedMemory for QnxSharedMemory {
+impl SharedMemory for PosixSharedMemory {
     fn len(&self) -> usize { self.size }
 
     fn read_u16(&self, offset: usize) -> u16 {
@@ -214,7 +213,7 @@ mod tests {
     #[test]
     fn shm_create_read_write() {
         let name = "/vm-devices-qnx-test";
-        let shm = QnxSharedMemory::create(name, 4096).unwrap();
+        let shm = PosixSharedMemory::create(name, 4096).unwrap();
         shm.write_u32(0, 0xDEADBEEF);
         assert_eq!(shm.read_u32(0), 0xDEADBEEF);
         shm.write_u64(8, 0x1234567890ABCDEF);

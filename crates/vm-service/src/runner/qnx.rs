@@ -59,12 +59,12 @@ impl QnxRunner {
     /// Start the health simulator on a background thread using QNX shared memory.
     #[cfg(feature = "qnx")]
     fn start_health_sim(&mut self, vm_name: &str) -> Result<(), RunnerError> {
-        use vm_devices::transport::qnx::{QnxSharedMemory, NullDoorbell};
+        use vm_devices::transport::posix::{PosixSharedMemory, NullDoorbell};
         use vm_devices::clock::system::SystemClock;
         use vm_devices::health;
 
         let shm_name = format!("/vm-{vm_name}-health");
-        let shm = QnxSharedMemory::create(&shm_name, HEALTH_SHM_SIZE)
+        let shm = PosixSharedMemory::create(&shm_name, HEALTH_SHM_SIZE)
             .map_err(|e| RunnerError::ProcessFailed(format!("health shm create: {e}")))?;
 
         let clock = Arc::new(SystemClock::new());
