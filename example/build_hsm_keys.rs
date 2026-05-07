@@ -1,19 +1,21 @@
 /// Generate HSM key material as signed + encrypted SUIT envelopes.
 ///
-/// All envelopes are compressed + encrypted (same code path). Factory
-/// envelopes use the well-known factory KEK (scalar=1, public=G).
-/// Re-provision envelopes use the real KEK from slot 0.
+/// Trust model:
+///   - Factory envelope: signed with factory signing key, encrypted to device public key.
+///   - Re-provision envelope: signed with Key Authority, encrypted to device public key.
+///   - Key Authority (slot 0): generated fresh, delivered in factory envelope.
+///     Device uses it to verify subsequent HSM key envelopes.
 ///
 /// Output (default mode):
-///   <output-dir>/hsm-keys-v1.suit — factory envelope (encrypted with factory KEK)
-///   <output-dir>/hsm-keys-v2.suit — re-provision envelope (encrypted with real KEK)
-///   <keys-dir>/hsm-kek.pub        — real KEK public key (COSE_Key CBOR)
-///   <keys-dir>/hsm-kek.key        — real KEK full key (for decryption tests)
+///   <output-dir>/hsm-keys-v1.suit       — factory envelope (signed: factory key, encrypted: device key)
+///   <output-dir>/hsm-keys-v2.suit       — re-provision envelope (signed: key authority, encrypted: device key)
+///   <keys-dir>/key-authority.pub        — Key Authority public key (COSE_Key CBOR)
+///   <keys-dir>/key-authority.key        — Key Authority full key (for re-provisioning)
 ///
 /// Output (--cbor-only mode):
-///   stdout                         — raw CBOR keystore (pipe to sumo-tool build --manifest)
-///   <keys-dir>/hsm-kek.pub        — real KEK public key
-///   <keys-dir>/hsm-kek.key        — real KEK full key
+///   stdout                              — raw CBOR keystore (pipe to sumo-tool build --manifest)
+///   <keys-dir>/key-authority.pub        — Key Authority public key
+///   <keys-dir>/key-authority.key        — Key Authority full key
 ///
 /// Run with:
 ///   cargo run --example build_hsm_keys -- --signing-key <path> --device-key <path> --output-dir <path>
@@ -43,15 +45,16 @@ const NUM_APP_SLOTS: usize = 92;
 const GUESTS: &[&str] = &["bali-vm-1", "bali-vm-2", "bali-vm-3"];
 
 fn usage() {
-    eprintln!("Usage: build_hsm_keys --signing-key <path> [--device-key <path>|--device-csr <path>] [--output-dir <path>] [--cbor-only]");
+    eprintln!("Usage: build_hsm_keys [--signing-key <path>] [--device-pub <path>|--device-csr <path>] [--output-dir <path>] [--cbor-only]");
     eprintln!();
-    eprintln!("  --signing-key <path>   Signing key (COSE_Key CBOR) — used for sw-authority slot");
-    eprintln!("  --device-key <path>    Device key (ECDH P-256) — used for device-decrypt slot (legacy: pushes private key)");
-    eprintln!("  --device-csr <path>    Device CSR (PKCS#10 DER) — extracts public key for device-decrypt slot.");
-    eprintln!("                         Private key stays on device (CSR-based provisioning).");
+    eprintln!("  --signing-key <path>   Signing key (COSE_Key CBOR) — used for sw-authority slot.");
+    eprintln!("                         Default: factory signing key (P-256 generator, scalar=1).");
+    eprintln!("  --device-pub <path>    Device public key (COSE_Key CBOR) — encryption target.");
+    eprintln!("  --device-csr <path>    Device CSR (PKCS#10 DER) — extracts public key.");
+    eprintln!("                         Either --device-pub or --device-csr is required.");
     eprintln!("  --output-dir <path>    Directory for .suit output files (required unless --cbor-only)");
     eprintln!("  --cbor-only            Write raw CBOR keystore to stdout, skip SUIT wrapping.");
-    eprintln!("                         KEK key files are still written to --output-dir or example/keys/.");
+    eprintln!("                         Key Authority files are still written to --output-dir or example/keys/.");
     eprintln!("                         Pipe to: sumo-tool build --manifest hsm-keys.yaml");
 }
 
@@ -59,7 +62,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let mut signing_key_path: Option<String> = None;
-    let mut device_key_path: Option<String> = None;
+    let mut device_pub_path: Option<String> = None;
     let mut device_csr_path: Option<String> = None;
     let mut output_dir_path: Option<String> = None;
     let mut cbor_only = false;
@@ -70,8 +73,8 @@ fn main() {
                 signing_key_path = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--device-key" if i + 1 < args.len() => {
-                device_key_path = Some(args[i + 1].clone());
+            "--device-pub" if i + 1 < args.len() => {
+                device_pub_path = Some(args[i + 1].clone());
                 i += 2;
             }
             "--device-csr" if i + 1 < args.len() => {
@@ -94,19 +97,15 @@ fn main() {
         }
     }
 
-    let signing_key_path = signing_key_path.unwrap_or_else(|| {
+    let signing_key_path = signing_key_path;
+    if device_pub_path.is_none() && device_csr_path.is_none() {
         usage();
-        eprintln!("\nError: --signing-key is required");
-        std::process::exit(1);
-    });
-    if device_key_path.is_none() && device_csr_path.is_none() {
-        usage();
-        eprintln!("\nError: one of --device-key or --device-csr is required");
+        eprintln!("\nError: one of --device-pub or --device-csr is required");
         std::process::exit(1);
     }
-    if device_key_path.is_some() && device_csr_path.is_some() {
+    if device_pub_path.is_some() && device_csr_path.is_some() {
         usage();
-        eprintln!("\nError: --device-key and --device-csr are mutually exclusive");
+        eprintln!("\nError: --device-pub and --device-csr are mutually exclusive");
         std::process::exit(1);
     }
 
@@ -121,7 +120,6 @@ fn main() {
     };
 
     let keys_dir = if let Some(ref p) = output_dir_path {
-        // Write KEK files next to output
         PathBuf::from(p)
     } else {
         Path::new("example").join("keys")
@@ -133,27 +131,54 @@ fn main() {
 
     let crypto = RustCryptoBackend::new();
 
-    let signing_key = {
-        let bytes = fs::read(&signing_key_path)
-            .unwrap_or_else(|e| panic!("failed to read signing key {signing_key_path}: {e}"));
-        CoseKey::from_cose_key_bytes(&bytes).unwrap()
+    // Factory signing key — signs the first (factory) envelope.
+    let envelope_signing_key = {
+        let key = coset::CoseKeyBuilder::new_ec2_priv_key(
+            iana::EllipticCurve::P_256,
+            FACTORY_SIGNING_PUBLIC[1..33].to_vec(),
+            FACTORY_SIGNING_PUBLIC[33..65].to_vec(),
+            FACTORY_SIGNING_SCALAR.to_vec(),
+        )
+        .algorithm(iana::Algorithm::ES256)
+        .build();
+        CoseKey::from_cose_key_bytes(&key.to_vec().unwrap()).unwrap()
     };
 
-    // Load device key material — either from full key file or from CSR (public only)
-    let (dk_priv, dk_pub) = if let Some(ref csr_path) = device_csr_path {
-        // CSR-based provisioning: extract public key from CSR, no private key
+    // Software authority key — its public half goes into the HSM keystore
+    // for firmware signature verification. Defaults to factory signing key if not provided.
+    let signing_key = if let Some(ref path) = signing_key_path {
+        let bytes = fs::read(path)
+            .unwrap_or_else(|e| panic!("failed to read signing key {path}: {e}"));
+        CoseKey::from_cose_key_bytes(&bytes).unwrap()
+    } else {
+        eprintln!("[hsm-keys] using factory signing key as software authority (no --signing-key)");
+        let key = coset::CoseKeyBuilder::new_ec2_priv_key(
+            iana::EllipticCurve::P_256,
+            FACTORY_SIGNING_PUBLIC[1..33].to_vec(),
+            FACTORY_SIGNING_PUBLIC[33..65].to_vec(),
+            FACTORY_SIGNING_SCALAR.to_vec(),
+        )
+        .algorithm(iana::Algorithm::ES256)
+        .build();
+        CoseKey::from_cose_key_bytes(&key.to_vec().unwrap()).unwrap()
+    };
+
+    // Load device public key — from CSR or public key file.
+    // Private key never leaves the device.
+    let dk_pub = if let Some(ref csr_path) = device_csr_path {
         let csr_der = fs::read(csr_path)
             .unwrap_or_else(|e| panic!("failed to read device CSR {csr_path}: {e}"));
         let pub_key = extract_ec_pubkey_from_csr(&csr_der)
             .unwrap_or_else(|e| panic!("failed to extract public key from CSR: {e}"));
         eprintln!("[hsm-keys] device public key extracted from CSR ({} bytes)", pub_key.len());
-        (Vec::new(), pub_key) // empty private key — device holds it
+        pub_key
     } else {
-        let device_key_path = device_key_path.unwrap();
-        let bytes = fs::read(&device_key_path)
-            .unwrap_or_else(|e| panic!("failed to read device key {device_key_path}: {e}"));
-        let device_key = CoseKey::from_cose_key_bytes(&bytes).unwrap();
-        extract_ec_raw(&device_key)
+        let pub_path = device_pub_path.unwrap();
+        let bytes = fs::read(&pub_path)
+            .unwrap_or_else(|e| panic!("failed to read device public key {pub_path}: {e}"));
+        let pub_bytes = extract_ec_pub_only(&bytes);
+        eprintln!("[hsm-keys] device public key loaded ({} bytes)", pub_bytes.len());
+        pub_bytes
     };
 
     // ---------------------------------------------------------------
@@ -163,43 +188,43 @@ fn main() {
 
     let mut slots = Vec::with_capacity(NUM_APP_SLOTS + 8);
 
-    // Slot 0: Real KEK (EC-P256) — its public key encrypts future envelopes
-    let (kek_priv, kek_pub) = generate_ec_p256_raw();
+    // Slot 0: Key Authority (EC-P256) — public key only, verifies subsequent HSM key envelopes.
+    // Private key stays with the backend (never sent to device).
+    let (ka_priv, ka_pub) = generate_ec_p256_raw();
     slots.push(KeySlotDef {
-        key_id: "kek".to_string(),
+        key_id: "key-authority".to_string(),
         key_type: KEY_TYPE_EC_P256,
-        private_key: kek_priv,
-        public_key: Some(kek_pub.clone()),
+        private_key: None,
+        public_key: Some(ka_pub.clone()),
         certificate: None,
         allowed_guests: None,
-        allowed_ops: None,
+        allowed_ops: Some(vec![OP_VERIFY]),
     });
 
-    // Slot 1: Software authority — public key of the signing key pair.
-    // This is the trust anchor that verifies firmware SUIT envelopes on-device.
-    // Must be the same key pair as signing.key so firmware signatures match.
-    let (sw_auth_priv, sw_auth_pub) = extract_ec_raw(&signing_key);
+    // Slot 1: Software authority — public key only, verifies firmware SUIT envelopes.
+    // Private key stays with the backend (never sent to device).
+    let (_sw_auth_priv, sw_auth_pub) = extract_ec_raw(&signing_key);
     slots.push(KeySlotDef {
         key_id: "sw-authority".to_string(),
         key_type: KEY_TYPE_EC_P256,
-        private_key: sw_auth_priv,
+        private_key: None,
         public_key: Some(sw_auth_pub),
         certificate: None,
         allowed_guests: None,
         allowed_ops: Some(vec![OP_VERIFY, OP_GET_PUBKEY]),
     });
 
-    // Slot 2: Device decryption key — ECDH P-256 for firmware decryption.
-    // With --device-csr: private_key is empty (device generated it locally).
-    // With --device-key: private_key is pushed to device (legacy).
+    // Slot 2: Device decryption key — public key only.
+    // Private key is generated and held on-device; we only need the public
+    // half to encrypt firmware envelopes to this device.
     slots.push(KeySlotDef {
         key_id: "device-decrypt".to_string(),
         key_type: KEY_TYPE_EC_P256,
-        private_key: dk_priv,
+        private_key: None,
         public_key: Some(dk_pub.clone()),
         certificate: None,
         allowed_guests: None,
-        allowed_ops: None, // ECDH key, not signing
+        allowed_ops: None,
     });
 
     // Slot 3: General ECU signing key with certificate
@@ -207,7 +232,7 @@ fn main() {
     slots.push(KeySlotDef {
         key_id: "ecu-signing".to_string(),
         key_type: KEY_TYPE_EC_P256,
-        private_key: priv_key,
+        private_key: Some(priv_key),
         public_key: Some(pub_key),
         certificate: Some(dummy_self_signed_cert(&crypto)),
         allowed_guests: Some(vec!["bali-vm-1".into()]),
@@ -219,7 +244,7 @@ fn main() {
     slots.push(KeySlotDef {
         key_id: "jwt-signing".to_string(),
         key_type: KEY_TYPE_EC_P256,
-        private_key: priv_key,
+        private_key: Some(priv_key),
         public_key: Some(pub_key),
         certificate: None,
         allowed_guests: Some(vec!["bali-vm-1".into()]),
@@ -235,7 +260,7 @@ fn main() {
     slots.push(KeySlotDef {
         key_id: "mykey".to_string(),
         key_type: KEY_TYPE_EC_P256,
-        private_key: priv_key,
+        private_key: Some(priv_key),
         public_key: Some(pub_key),
         certificate: Some(dummy_self_signed_cert(&crypto)),
         allowed_guests: Some(vec!["bali-vm-1".into()]),
@@ -248,7 +273,7 @@ fn main() {
     slots.push(KeySlotDef {
         key_id: "storage-key".to_string(),
         key_type: KEY_TYPE_AES_256,
-        private_key: aes_data,
+        private_key: Some(aes_data),
         public_key: None,
         certificate: None,
         allowed_guests: Some(vec!["bali-vm-1".into()]),
@@ -261,7 +286,7 @@ fn main() {
     slots.push(KeySlotDef {
         key_id: "restricted-key".to_string(),
         key_type: KEY_TYPE_AES_256,
-        private_key: aes_restricted,
+        private_key: Some(aes_restricted),
         public_key: None,
         certificate: None,
         allowed_guests: Some(vec!["bali-vm-2".into()]),
@@ -278,7 +303,7 @@ fn main() {
             slots.push(KeySlotDef {
                 key_id: format!("aes-{slot_num:03}"),
                 key_type: KEY_TYPE_AES_256,
-                private_key: key_data,
+                private_key: Some(key_data),
                 public_key: None,
                 certificate: None,
                 allowed_guests: Some(vec![guest.to_string()]),
@@ -290,7 +315,7 @@ fn main() {
             slots.push(KeySlotDef {
                 key_id: format!("ec-{slot_num:03}"),
                 key_type: KEY_TYPE_EC_P256,
-                private_key: priv_key,
+                private_key: Some(priv_key),
                 public_key: Some(pub_key),
                 certificate: None,
                 allowed_guests: Some(vec![guest.to_string()]),
@@ -329,7 +354,6 @@ fn main() {
         security_version: 1,
         identities: identities.clone(),
         slots: slots.clone(),
-        kek_slot_index: Some(0),
     };
 
     let cbor = encode(&keystore).unwrap();
@@ -338,25 +362,24 @@ fn main() {
     let digest = crypto.sha256(&cbor);
 
     // ---------------------------------------------------------------
-    // Export KEK key files (needed for encryption by external tools)
+    // Export Key Authority files (needed for re-provisioning)
     // ---------------------------------------------------------------
-    let (kek_priv_raw, kek_pub_ref) = (kek_priv_bytes(&slots[0]), &kek_pub);
-    let real_kek_cose = build_device_cose_key(
-        &kek_priv_raw,
-        &kek_pub_ref[1..33],
-        &kek_pub_ref[33..65],
+    let ka_full_cose = build_device_cose_key(
+        &ka_priv,
+        &ka_pub[1..33],
+        &ka_pub[33..65],
     );
-    let real_kek_pub_cose = build_public_cose_key(
-        &kek_pub_ref[1..33],
-        &kek_pub_ref[33..65],
+    let ka_pub_cose = build_public_cose_key(
+        &ka_pub[1..33],
+        &ka_pub[33..65],
     );
 
-    let kek_pub_path = keys_dir.join("hsm-kek.pub");
-    fs::write(&kek_pub_path, &real_kek_pub_cose).unwrap();
-    let kek_key_path = keys_dir.join("hsm-kek.key");
-    fs::write(&kek_key_path, &real_kek_cose).unwrap();
-    eprintln!("[hsm-keys] KEK public key: {}", kek_pub_path.display());
-    eprintln!("[hsm-keys] KEK private key: {}", kek_key_path.display());
+    let ka_pub_path = keys_dir.join("key-authority.pub");
+    fs::write(&ka_pub_path, &ka_pub_cose).unwrap();
+    let ka_key_path = keys_dir.join("key-authority.key");
+    fs::write(&ka_key_path, &ka_full_cose).unwrap();
+    eprintln!("[hsm-keys] Key Authority public: {}", ka_pub_path.display());
+    eprintln!("[hsm-keys] Key Authority private: {}", ka_key_path.display());
 
     // Export device public key as COSE_Key (needed by sumo-tool --encrypt)
     let device_pub_cose = build_public_cose_key(
@@ -385,30 +408,19 @@ fn main() {
     }
 
     // ---------------------------------------------------------------
-    // 4. Factory envelope (compressed + encrypted with factory KEK)
+    // 4. Factory envelope (signed: factory key, encrypted: device key)
     // ---------------------------------------------------------------
-    println!("\n[hsm-keys] === Factory envelope (encrypted with factory KEK) ===");
-
-    let factory_kek_cose = build_device_cose_key(
-        &FACTORY_KEK_SCALAR,
-        &FACTORY_KEK_PUBLIC[1..33],  // x
-        &FACTORY_KEK_PUBLIC[33..65], // y
-    );
-    let factory_kek_pub_cose = build_public_cose_key(
-        &FACTORY_KEK_PUBLIC[1..33],
-        &FACTORY_KEK_PUBLIC[33..65],
-    );
+    println!("\n[hsm-keys] === Factory envelope (signed: factory, encrypted: device key) ===");
 
     let factory_envelope = build_encrypted_envelope(
-        &signing_key,
-        &factory_kek_cose,
-        &factory_kek_pub_cose,
+        &envelope_signing_key,
+        &device_pub_cose,
         &cbor,
         &digest,
         1, // sequence_number
         1, // security_version
         "1.0.0",
-        "Factory HSM key provisioning (100 slots, factory KEK)",
+        "Factory HSM key provisioning (100 slots)",
     );
 
     let factory_path = output_dir.join("hsm-keys-v1.suit");
@@ -417,25 +429,37 @@ fn main() {
         factory_path.display(), factory_envelope.len());
 
     // ---------------------------------------------------------------
-    // 5. Re-provision envelope (compressed + encrypted with real KEK)
+    // 5. Re-provision envelope (signed: key authority, encrypted: device key)
     // ---------------------------------------------------------------
-    println!("\n[hsm-keys] === Re-provision envelope (encrypted with real KEK) ===");
+    println!("\n[hsm-keys] === Re-provision envelope (signed: key authority, encrypted: device key) ===");
 
     let mut keystore_v2 = keystore.clone();
     keystore_v2.security_version = 2;
     let cbor_v2 = encode(&keystore_v2).unwrap();
     let digest_v2 = crypto.sha256(&cbor_v2);
 
+    // Build CoseKey for Key Authority signing
+    let ka_signing_key = {
+        let key = coset::CoseKeyBuilder::new_ec2_priv_key(
+            iana::EllipticCurve::P_256,
+            ka_pub[1..33].to_vec(),
+            ka_pub[33..65].to_vec(),
+            ka_priv.clone(),
+        )
+        .algorithm(iana::Algorithm::ES256)
+        .build();
+        CoseKey::from_cose_key_bytes(&key.to_vec().unwrap()).unwrap()
+    };
+
     let reprov_envelope = build_encrypted_envelope(
-        &signing_key,
-        &real_kek_cose,
-        &real_kek_pub_cose,
+        &ka_signing_key,
+        &device_pub_cose,
         &cbor_v2,
         &digest_v2,
         2,
         2,
         "2.0.0",
-        "Re-provision HSM keys (100 slots, real KEK)",
+        "Re-provision HSM keys (100 slots, key authority signed)",
     );
 
     let reprov_path = output_dir.join("hsm-keys-v2.suit");
@@ -448,25 +472,25 @@ fn main() {
     // ---------------------------------------------------------------
     println!("\n=== HSM Key Provisioning Artifacts ===");
     println!();
-    println!("  Factory envelope:      {} ({} bytes, factory KEK)",
+    println!("  Factory envelope:      {} ({} bytes, signed: factory, encrypted: device)",
         factory_path.display(), factory_envelope.len());
-    println!("  Re-provision envelope: {} ({} bytes, real KEK)",
+    println!("  Re-provision envelope: {} ({} bytes, signed: key-authority, encrypted: device)",
         reprov_path.display(), reprov_envelope.len());
-    println!("  KEK public key:        {}", kek_pub_path.display());
-    println!("  Signing key:           {}", keys_dir.join("signing.key").display());
+    println!("  Key Authority public:  {}", ka_pub_path.display());
+    println!("  Key Authority private: {}", ka_key_path.display());
+    println!("  Device public key:     {}", device_pub_path.display());
     println!();
     println!("  Key slots:     {}", keystore.slots.len());
     println!("  Identities:    {}", keystore.identities.len());
     println!("  CBOR payload:  {} bytes", cbor.len());
     println!();
-    println!("Both envelopes use the same pipeline: CBOR → zstd → AES-GCM → SUIT.");
-    println!("Factory uses well-known KEK (scalar=1). Re-provision uses real KEK.");
+    println!("Both envelopes: CBOR → zstd → AES-GCM (to device key) → SUIT.");
+    println!("Factory signed with built-in factory key. Re-provision signed with Key Authority.");
 }
 
 /// Build a compressed + encrypted SUIT envelope.
 fn build_encrypted_envelope(
     signing_key: &CoseKey,
-    sender_key_cbor: &[u8],
     recipient_pub_cbor: &[u8],
     cbor_payload: &[u8],
     plaintext_digest: &[u8; 32],
@@ -475,18 +499,16 @@ fn build_encrypted_envelope(
     version: &str,
     description: &str,
 ) -> Vec<u8> {
-    let _sender_key = CoseKey::from_cose_key_bytes(sender_key_cbor).unwrap();
     let recipient_pub = CoseKey::from_cose_key_bytes(recipient_pub_cbor).unwrap();
 
     // Compress
     let compressed = encryptor::compress_firmware(cbor_payload, 3, None).unwrap();
 
-    // Encrypt (ECDH-ES+A128KW + AES-128-GCM)
-    // Use a fresh ephemeral sender key for each envelope
+    // Encrypt (ECDH-ES+A128KW + AES-128-GCM) with fresh ephemeral sender key
     let ephemeral_sender = keygen::generate_device_key(keygen::ES256).unwrap();
     let recipients = [Recipient {
         public_key: recipient_pub,
-        kid: b"hsm-kek".to_vec(),
+        kid: b"device-decrypt".to_vec(),
     }];
     let encrypted = encryptor::encrypt_firmware_ecdh(
         &compressed,
@@ -536,7 +558,34 @@ fn build_public_cose_key(x: &[u8], y: &[u8]) -> Vec<u8> {
     key.to_vec().unwrap()
 }
 
-/// Extract raw EC-P256 key material from an existing CoseKey.
+/// Extract public key (65 bytes uncompressed) from COSE_Key CBOR bytes.
+fn extract_ec_pub_only(cose_bytes: &[u8]) -> Vec<u8> {
+    let cose_key: coset::CoseKey = coset::CoseKey::from_slice(cose_bytes).unwrap();
+
+    let mut x = Vec::new();
+    let mut y = Vec::new();
+
+    for (label, value) in &cose_key.params {
+        if let (coset::Label::Int(n), ciborium::Value::Bytes(bytes)) = (label, value) {
+            match *n {
+                -2 => x = bytes.clone(),
+                -3 => y = bytes.clone(),
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(x.len(), 32, "EC-P256 x coordinate must be 32 bytes");
+    assert_eq!(y.len(), 32, "EC-P256 y coordinate must be 32 bytes");
+
+    let mut pub_key = Vec::with_capacity(65);
+    pub_key.push(0x04);
+    pub_key.extend_from_slice(&x);
+    pub_key.extend_from_slice(&y);
+    pub_key
+}
+
+/// Extract raw EC-P256 key material from an existing CoseKey (signing key).
 /// Returns (32-byte scalar, 65-byte uncompressed public).
 fn extract_ec_raw(key: &CoseKey) -> (Vec<u8>, Vec<u8>) {
     let cose_bytes = key.to_cose_key_bytes();
@@ -592,11 +641,6 @@ fn generate_ec_p256_raw() -> (Vec<u8>, Vec<u8>) {
     pub_key.extend_from_slice(&y);
 
     (d, pub_key)
-}
-
-/// Extract private key bytes from a KeySlotDef.
-fn kek_priv_bytes(slot: &KeySlotDef) -> Vec<u8> {
-    slot.private_key.clone()
 }
 
 /// Generate a dummy self-signed certificate (fake DER for testing).

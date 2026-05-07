@@ -47,31 +47,25 @@ impl std::error::Error for HsmError {}
 /// These define the standard slot indices for keys used by the SOVD
 /// update pipeline. Slots beyond these are application keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
 pub enum KeyRole {
-    /// Slot 0: KEK (EC-P256) — encrypts future provisioning envelopes.
-    Kek = 0,
-    /// Slot 1: Software authority (EC-P256 public) — verifies firmware SUIT.
-    /// Replaces file-based trust anchor once HSM is provisioned.
-    SoftwareAuthority = 1,
-    /// Slot 2: Device decryption key (EC-P256 ECDH) — decrypts firmware.
-    /// Replaces file-based device.key once HSM is provisioned.
-    DeviceDecryption = 2,
-    /// Slot 3: ECU signing key (EC-P256) with certificate.
-    EcuSigning = 3,
+    /// Software authority (EC-P256 public) — verifies firmware SUIT envelopes.
+    SoftwareAuthority,
+    /// Device decryption key (EC-P256 ECDH) — decrypts all encrypted content.
+    DeviceDecryption,
+    /// ECU signing key (EC-P256) with certificate.
+    EcuSigning,
+    /// Key authority (EC-P256 public) — verifies future HSM key envelopes.
+    /// After first provisioning, replaces the factory signing key as trust anchor.
+    KeyAuthority,
 }
 
 impl KeyRole {
-    pub fn slot_index(self) -> usize {
-        self as usize
-    }
-
     pub fn key_id(self) -> &'static str {
         match self {
-            KeyRole::Kek => "kek",
             KeyRole::SoftwareAuthority => "sw-authority",
             KeyRole::DeviceDecryption => "device-decrypt",
             KeyRole::EcuSigning => "ecu-signing",
+            KeyRole::KeyAuthority => "key-authority",
         }
     }
 }
@@ -185,30 +179,21 @@ mod tests {
     }
 
     #[test]
-    fn keyrole_slot_index_matches_repr_u8() {
-        assert_eq!(KeyRole::Kek.slot_index(), 0);
-        assert_eq!(KeyRole::SoftwareAuthority.slot_index(), 1);
-        assert_eq!(KeyRole::DeviceDecryption.slot_index(), 2);
-        assert_eq!(KeyRole::EcuSigning.slot_index(), 3);
-    }
-
-    #[test]
     fn keyrole_key_id_is_unique_per_role() {
         use std::collections::HashSet;
         let roles = [
-            KeyRole::Kek,
             KeyRole::SoftwareAuthority,
             KeyRole::DeviceDecryption,
             KeyRole::EcuSigning,
+            KeyRole::KeyAuthority,
         ];
         let ids: HashSet<_> = roles.iter().map(|r| r.key_id()).collect();
         assert_eq!(ids.len(), roles.len(), "key_id() must be unique per role");
 
-        // Freeze the wire format — these are used in filenames on disk.
-        assert_eq!(KeyRole::Kek.key_id(), "kek");
         assert_eq!(KeyRole::SoftwareAuthority.key_id(), "sw-authority");
         assert_eq!(KeyRole::DeviceDecryption.key_id(), "device-decrypt");
         assert_eq!(KeyRole::EcuSigning.key_id(), "ecu-signing");
+        assert_eq!(KeyRole::KeyAuthority.key_id(), "key-authority");
     }
 
     #[test]

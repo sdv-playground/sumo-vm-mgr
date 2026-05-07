@@ -1,0 +1,15 @@
+[package]
+name = "app-mgr"
+version = "0.1.0"
+edition = "2021"
+description = "Self-updating application component — filesystem A/B banks with NV-backed state"
+
+[dependencies]
+nv-store = { path = "../nv-store" }
+machine-mgr = { path = "../machine-mgr" }
+async-trait = "0.1"
+tracing = "0.1"
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+futures = "0.3"

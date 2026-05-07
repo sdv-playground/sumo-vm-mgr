@@ -420,7 +420,7 @@ mod tests {
         let keystore = PathBuf::from(tmp.path());
         // Matches SimHsm's internal keys_dir() — keystore_path/keys.
         let keys_dir = keystore.join("keys");
-        let hsm = SimHsm::new(PathBuf::from("unused"), keystore, 0, Vec::new());
+        let hsm = SimHsm::new(PathBuf::from("unused"), keystore, 0);
         (hsm, keys_dir, tmp)
     }
 

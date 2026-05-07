@@ -55,7 +55,6 @@ impl TestFixture {
             PathBuf::from("unused"),
             keystore_path.clone(),
             5100,
-            Vec::new(),
         );
         let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(hsm);
 
@@ -151,7 +150,7 @@ impl TestFixture {
                 KeySlotDef {
                     key_id: "mykey".into(),
                     key_type: KEY_TYPE_EC_P256,
-                    private_key: mykey.to_bytes().to_vec(),
+                    private_key: Some(mykey.to_bytes().to_vec()),
                     public_key: Some(mykey_pub.as_bytes().to_vec()),
                     certificate: Some(fake_cert),
                     allowed_guests: None,
@@ -160,7 +159,7 @@ impl TestFixture {
                 KeySlotDef {
                     key_id: "storage-key".into(),
                     key_type: KEY_TYPE_AES_256,
-                    private_key: aes_key.to_vec(),
+                    private_key: Some(aes_key.to_vec()),
                     public_key: None,
                     certificate: None,
                     allowed_guests: None,
@@ -169,21 +168,19 @@ impl TestFixture {
                 KeySlotDef {
                     key_id: "restricted-key".into(),
                     key_type: KEY_TYPE_AES_256,
-                    private_key: restricted_key.to_vec(),
+                    private_key: Some(restricted_key.to_vec()),
                     public_key: None,
                     certificate: None,
                     allowed_guests: None,
                     allowed_ops: None,
                 },
             ],
-            kek_slot_index: None,
         };
 
         let hsm = SimHsm::new(
             PathBuf::from("unused"),
             path.to_path_buf(),
             5100,
-            Vec::new(),
         );
         hsm.write_keystore(&ks).unwrap();
         std::fs::write(path.join("provision_state"), b"1\n").unwrap();

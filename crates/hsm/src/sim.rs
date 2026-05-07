@@ -8,10 +8,10 @@
 /// Key material arrives as a SUIT envelope (component `["hsm", "keys"]`).
 /// The payload is CBOR-encoded `HsmKeystore` (see `payload.rs`).
 ///
-/// - **Factory** (empty HSM): envelope is signed but not encrypted.
-///   Accepted without verification — trust is physical (factory floor).
-/// - **Re-provision** (has keys): envelope is signed and encrypted
-///   with the bootstrap KEK. `security_version` must exceed current.
+/// - **Factory** (empty HSM): envelope signed with factory signing key,
+///   encrypted to device public key. Verified with built-in factory key.
+/// - **Re-provision** (has keys): envelope signed with Key Authority,
+///   encrypted to device public key. `security_version` must exceed current.
 ///
 /// # Keystore layout (written by provision)
 ///
@@ -19,7 +19,7 @@
 /// <keystore_path>/
 ///   manifest             — key inventory (vhsm-test-ssd line format)
 ///   identities           — guest-id → pubkey mapping
-///   provision_state       — security_version + KEK slot ref
+///   provision_state       — security_version
 ///   keys/
 ///     {key_id}.priv      — EC P-256 private key (PEM)
 ///     {key_id}.pub       — EC P-256 public key (PEM)
@@ -41,8 +41,6 @@ pub struct SimHsm {
     keystore_path: PathBuf,
     /// TCP port the daemon listens on (always bound to 127.0.0.1 in test mode).
     tcp_port: u16,
-    /// SUIT trust anchor (signing public key, COSE_Key CBOR).
-    provisioning_authority: Vec<u8>,
     /// Running daemon process handle.
     child: Option<Child>,
 }
@@ -52,15 +50,30 @@ impl SimHsm {
         daemon_bin: PathBuf,
         keystore_path: PathBuf,
         tcp_port: u16,
-        provisioning_authority: Vec<u8>,
     ) -> Self {
         Self {
             daemon_bin,
             keystore_path,
             tcp_port,
-            provisioning_authority,
             child: None,
         }
+    }
+
+    /// Factory signing public key as COSE_Key CBOR — the built-in provisioning authority.
+    fn factory_provisioning_authority() -> Vec<u8> {
+        use coset::CborSerializable;
+        let pub_key = &payload::FACTORY_SIGNING_PUBLIC;
+        let x = &pub_key[1..33];
+        let y = &pub_key[33..65];
+        coset::CoseKeyBuilder::new_ec2_pub_key(
+            coset::iana::EllipticCurve::P_256,
+            x.to_vec(),
+            y.to_vec(),
+        )
+        .algorithm(coset::iana::Algorithm::ES256)
+        .build()
+        .to_vec()
+        .expect("COSE_Key serialization")
     }
 
     /// Path to the manifest file inside the keystore.
@@ -125,14 +138,8 @@ impl SimHsm {
             .ok_or_else(|| HsmError::KeystoreError("corrupt provision_state".into()))
     }
 
-    /// Save security_version and KEK slot info to provision_state.
-    fn save_state(&self, security_version: u64, kek_slot: Option<&str>) -> Result<(), HsmError> {
-        let mut content = security_version.to_string();
-        if let Some(kek) = kek_slot {
-            content.push('\n');
-            content.push_str(kek);
-        }
-        std::fs::write(self.state_path(), content.as_bytes())
+    fn save_state(&self, security_version: u64) -> Result<(), HsmError> {
+        std::fs::write(self.state_path(), security_version.to_string().as_bytes())
             .map_err(|e| HsmError::KeystoreError(format!("write provision_state: {e}")))?;
         Ok(())
     }
@@ -154,12 +161,7 @@ impl SimHsm {
         // Write identities
         self.write_identities(ks)?;
 
-        // Save provision state
-        let kek_id = ks
-            .kek_slot_index
-            .and_then(|idx| ks.slots.get(idx as usize))
-            .map(|s| s.key_id.as_str());
-        self.save_state(ks.security_version, kek_id)?;
+        self.save_state(ks.security_version)?;
 
         Ok(())
     }
@@ -169,18 +171,25 @@ impl SimHsm {
         match slot.key_type {
             KEY_TYPE_EC_P256 => {
                 let priv_path = keys_dir.join(format!("{}.priv", slot.key_id));
-                if slot.private_key.is_empty() {
-                    // CSR-based provisioning: device already generated this key.
-                    // Preserve the locally-generated private key.
-                    if !priv_path.exists() {
-                        return Err(HsmError::KeystoreError(format!(
-                            "key bundle has empty private_key for '{}' but no local key exists",
-                            slot.key_id
-                        )));
+                match &slot.private_key {
+                    None => {
+                        // Public-key-only trust anchor (key-authority, sw-authority).
+                        // No private key to write — device only needs public half.
+                        tracing::debug!(key_id = %slot.key_id, "public-key-only slot, no private key");
                     }
-                    tracing::debug!(key_id = %slot.key_id, "preserving locally-generated private key");
-                } else {
-                    write_pem_ec_private(&priv_path, &slot.private_key)?;
+                    Some(pk) if pk.is_empty() => {
+                        // CSR-based provisioning: device already generated this key.
+                        if !priv_path.exists() {
+                            return Err(HsmError::KeystoreError(format!(
+                                "key bundle has empty private_key for '{}' but no local key exists",
+                                slot.key_id
+                            )));
+                        }
+                        tracing::debug!(key_id = %slot.key_id, "preserving locally-generated private key");
+                    }
+                    Some(pk) => {
+                        write_pem_ec_private(&priv_path, pk)?;
+                    }
                 }
 
                 // Write public key if available
@@ -196,10 +205,11 @@ impl SimHsm {
                 }
             }
             KEY_TYPE_AES_256 => {
-                // Raw 32-byte key
-                let path = keys_dir.join(format!("{}.bin", slot.key_id));
-                std::fs::write(&path, &slot.private_key)
-                    .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))?;
+                if let Some(ref key_data) = slot.private_key {
+                    let path = keys_dir.join(format!("{}.bin", slot.key_id));
+                    std::fs::write(&path, key_data)
+                        .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))?;
+                }
             }
             other => {
                 tracing::warn!(key_id = %slot.key_id, key_type = other, "unknown key type, skipping");
@@ -340,9 +350,9 @@ impl SimHsm {
 
     /// Extract the CBOR payload from a SUIT envelope.
     ///
-    /// All envelopes are encrypted. Factory uses the well-known factory KEK
-    /// (scalar=1). Re-provision uses the stored KEK from the keystore.
-    /// Same decrypt code path for both.
+    /// All envelopes are encrypted to the device decryption key (slot 2).
+    /// Signature is verified against the provisioning authority (factory signing
+    /// key on first provision, key authority from HSM on subsequent ones).
     #[cfg(feature = "suit")]
     fn extract_payload(
         &self,
@@ -355,8 +365,16 @@ impl SimHsm {
 
         let crypto = RustCryptoBackend::new();
 
-        // Validate SUIT envelope
-        let mut validator = Validator::new(&self.provisioning_authority, None);
+        // Select trust anchor: factory signing key for first provision,
+        // key authority from HSM for subsequent ones.
+        let trust_anchor = if is_factory {
+            Self::factory_provisioning_authority()
+        } else {
+            self.get_public_key(KeyRole::KeyAuthority)
+                .unwrap_or_else(|_| Self::factory_provisioning_authority())
+        };
+
+        let mut validator = Validator::new(&trust_anchor, None);
         if !is_factory {
             let current_sv = self.load_security_version()?;
             validator.set_min_sequence(current_sv);
@@ -391,24 +409,18 @@ impl SimHsm {
             }
         }
 
-        // Always decrypt — factory KEK or stored KEK
-        let kek_cose = if is_factory {
-            self.factory_kek_cose_key()
-        } else {
-            self.load_kek_cose_key()?
-        };
+        // Decrypt with device key (slot 2) — always the same key
+        let device_key = self.load_device_decrypt_key()?;
 
-        // Decrypt integrated payload
         let ciphertext = manifest
             .integrated_payload("#hsm-keys")
             .ok_or_else(|| {
                 HsmError::EnvelopeInvalid("missing integrated payload #hsm-keys".into())
             })?;
 
-        let mut decryptor = StreamingDecryptor::new(&manifest, 0, &kek_cose, &crypto)
+        let mut decryptor = StreamingDecryptor::new(&manifest, 0, &device_key, &crypto)
             .map_err(|e| HsmError::DecryptionFailed(format!("{e:?}")))?;
 
-        // Decrypt in one shot (payload is small, ~12KB)
         let mut plaintext = vec![0u8; ciphertext.len() + 256];
         let mut total = 0;
         let n = decryptor
@@ -431,64 +443,17 @@ impl SimHsm {
         Ok((payload, security_version))
     }
 
-    /// Build the well-known factory KEK as a coset::CoseKey.
+    /// Load the device decryption private key as a coset::CoseKey (ECDH).
     #[cfg(feature = "suit")]
-    fn factory_kek_cose_key(&self) -> coset::CoseKey {
-        let scalar = &payload::FACTORY_KEK_SCALAR;
-        let pub_key = &payload::FACTORY_KEK_PUBLIC;
-        let x = &pub_key[1..33];
-        let y = &pub_key[33..65];
-
-        let mut key = coset::CoseKeyBuilder::new_ec2_priv_key(
-            coset::iana::EllipticCurve::P_256,
-            x.to_vec(),
-            y.to_vec(),
-            scalar.to_vec(),
-        )
-        .build();
-        key.alg = None; // ECDH key, not signing
-        key
-    }
-
-    /// Load the stored KEK private key as a coset::CoseKey.
-    #[cfg(feature = "suit")]
-    fn load_kek_cose_key(&self) -> Result<coset::CoseKey, HsmError> {
-        // Read the KEK private key scalar from the keystore
-        let state = std::fs::read_to_string(self.state_path())
-            .map_err(|e| HsmError::KeystoreError(format!("read provision_state: {e}")))?;
-
-        let kek_id = state.lines().nth(1).ok_or_else(|| {
-            HsmError::KeystoreError("no KEK slot in provision_state".into())
-        })?;
-
-        // Parse the manifest to find the KEK's key path
-        let manifest_text = std::fs::read_to_string(self.manifest_path())
-            .map_err(|e| HsmError::KeystoreError(format!("read manifest: {e}")))?;
-
-        let kek_line = manifest_text
-            .lines()
-            .find(|l| l.starts_with(kek_id))
-            .ok_or_else(|| {
-                HsmError::KeystoreError(format!("KEK slot '{kek_id}' not found in manifest"))
-            })?;
-
-        let parts: Vec<&str> = kek_line.split_whitespace().collect();
-        if parts.len() < 3 {
-            return Err(HsmError::KeystoreError("corrupt KEK manifest entry".into()));
-        }
-
-        // Read the PEM private key and extract the scalar
-        let priv_path = self.keystore_path.join(parts[2]);
+    fn load_device_decrypt_key(&self) -> Result<coset::CoseKey, HsmError> {
+        let priv_path = self.keys_dir().join("device-decrypt.priv");
         let pem = std::fs::read_to_string(&priv_path)
-            .map_err(|e| HsmError::KeystoreError(format!("read KEK key: {e}")))?;
-
+            .map_err(|e| HsmError::KeystoreError(format!("read device key: {e}")))?;
         let scalar = extract_ec_scalar_from_pem(&pem)?;
 
-        // Read the public key
-        let pub_path = self.keys_dir().join(format!("{kek_id}.pub"));
+        let pub_path = self.keys_dir().join("device-decrypt.pub");
         let pub_pem = std::fs::read_to_string(&pub_path)
-            .map_err(|e| HsmError::KeystoreError(format!("read KEK pubkey: {e}")))?;
-
+            .map_err(|e| HsmError::KeystoreError(format!("read device pubkey: {e}")))?;
         let (x, y) = extract_ec_public_from_pem(&pub_pem)?;
 
         let mut key = coset::CoseKeyBuilder::new_ec2_priv_key(
@@ -692,10 +657,10 @@ impl HsmProvider for SimHsm {
 
         // Signing verification keys need alg=ES256; ECDH keys have no algorithm.
         let alg = match role {
-            KeyRole::SoftwareAuthority | KeyRole::EcuSigning => {
+            KeyRole::SoftwareAuthority | KeyRole::EcuSigning | KeyRole::KeyAuthority => {
                 Some(coset::iana::Algorithm::ES256)
             }
-            KeyRole::Kek | KeyRole::DeviceDecryption => None,
+            KeyRole::DeviceDecryption => None,
         };
         Ok(build_public_cose_key_with_alg(&x, &y, alg))
     }
@@ -761,7 +726,7 @@ fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, HsmError> {
         .map_err(|e| HsmError::PayloadInvalid(format!("zstd finalize: {e:?}")))
 }
 
-// --- PEM decoding helpers (for loading stored KEK) ---
+// --- PEM decoding helpers ---
 
 /// Extract the raw 32-byte EC-P256 scalar from a SEC1 PEM private key.
 pub(crate) fn extract_ec_scalar_from_pem(pem: &str) -> Result<Vec<u8>, HsmError> {
@@ -1070,7 +1035,7 @@ mod tests {
                 KeySlotDef {
                     key_id: "mykey".into(),
                     key_type: KEY_TYPE_EC_P256,
-                    private_key: vec![0xAA; 32],
+                    private_key: Some(vec![0xAA; 32]),
                     public_key: Some({
                         let mut pk = vec![0x04];
                         pk.extend_from_slice(&[0xBB; 32]);
@@ -1084,14 +1049,13 @@ mod tests {
                 KeySlotDef {
                     key_id: "storage-key".into(),
                     key_type: KEY_TYPE_AES_256,
-                    private_key: vec![0xDD; 32],
+                    private_key: Some(vec![0xDD; 32]),
                     public_key: None,
                     certificate: None,
                     allowed_guests: Some(vec!["bali-vm-1".into()]),
                     allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT]),
                 },
             ],
-            kek_slot_index: None,
         }
     }
 
@@ -1104,7 +1068,6 @@ mod tests {
             PathBuf::from("/dev/null"),
             tmp.clone(),
             5100,
-            Vec::new(),
         );
 
         let ks = sample_keystore();
@@ -1173,18 +1136,17 @@ mod tests {
             PathBuf::from("/dev/null"),
             tmp.clone(),
             5100,
-            Vec::new(),
         );
 
         // No state file → version 0
         assert_eq!(hsm.load_security_version().unwrap(), 0);
 
         // Save and reload
-        hsm.save_state(42, Some("kek")).unwrap();
+        hsm.save_state(42).unwrap();
         assert_eq!(hsm.load_security_version().unwrap(), 42);
 
         let state = std::fs::read_to_string(tmp.join("provision_state")).unwrap();
-        assert_eq!(state, "42\nkek");
+        assert_eq!(state, "42");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

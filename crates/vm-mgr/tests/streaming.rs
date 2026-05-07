@@ -42,6 +42,7 @@ fn test_provider(signing_key: &CoseKey, device_key: Option<&CoseKey>) -> SuitPro
     provider.update_keys(
         signing_key.public_key_bytes(),
         device_key.map(|k| k.to_cose_key_bytes()),
+        None,
     );
     provider
 }

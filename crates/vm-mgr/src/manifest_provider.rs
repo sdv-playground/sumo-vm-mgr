@@ -92,9 +92,8 @@ pub trait ManifestProvider: Send + Sync {
         None
     }
 
-    /// Update software authority and device key after HSM provisioning.
-    /// Default is no-op for providers that don't support dynamic key updates.
-    fn update_keys(&self, _sw_authority: Vec<u8>, _device_key: Option<Vec<u8>>) {}
+    /// Update keys from HSM after provisioning.
+    fn update_keys(&self, _sw_authority: Vec<u8>, _device_key: Option<Vec<u8>>, _key_authority: Option<Vec<u8>>) {}
 }
 
 #[cfg(test)]
@@ -188,6 +187,6 @@ mod tests {
     fn update_keys_default_is_noop() {
         // Just verify it doesn't panic.
         let p = StubProvider;
-        p.update_keys(vec![1, 2, 3], Some(vec![4, 5]));
+        p.update_keys(vec![1, 2, 3], Some(vec![4, 5]), None);
     }
 }

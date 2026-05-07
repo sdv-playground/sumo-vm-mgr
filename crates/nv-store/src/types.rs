@@ -1,10 +1,11 @@
 /// Core types for the NV store bank management system.
 ///
-/// Four independent A/B bank sets:
+/// Five independent A/B bank sets:
 ///   - HostOs (IFS + rootfs, updated atomically)
 ///   - VM1 (Linux or QNX VM)
 ///   - VM2 (Linux or QNX VM)
 ///   - HSM (Hardware Security Module — single-banked, non-rollbackable)
+///   - App (self-updating application component, filesystem A/B banks)
 
 /// Identifies which bank is active within a bank set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +40,12 @@ pub enum BankSet {
     Vm1 = 1,
     Vm2 = 2,
     Hsm = 3,
+    App = 4,
 }
 
 impl BankSet {
     pub fn all() -> [BankSet; NUM_BANK_SETS] {
-        [BankSet::HostOs, BankSet::Vm1, BankSet::Vm2, BankSet::Hsm]
+        [BankSet::HostOs, BankSet::Vm1, BankSet::Vm2, BankSet::Hsm, BankSet::App]
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
@@ -52,12 +54,13 @@ impl BankSet {
             "os1" | "vm1" => Some(BankSet::Vm1),
             "os2" | "vm2" => Some(BankSet::Vm2),
             "hsm" => Some(BankSet::Hsm),
+            "app" | "supernova" => Some(BankSet::App),
             _ => None,
         }
     }
 }
 
-pub const NUM_BANK_SETS: usize = 4;
+pub const NUM_BANK_SETS: usize = 5;
 pub const MAX_TRIAL_BOOTS: u8 = 10;
 
 // NV partition magic numbers (sector validation)
@@ -142,7 +145,7 @@ impl Default for BankBootState {
 
 /// Complete boot state for all bank sets.
 ///
-/// Wire format (24 bytes):
+/// Wire format (28 bytes):
 /// ```text
 /// [0..4]   magic (NVB1)
 /// [4..8]   write_seq
@@ -158,7 +161,10 @@ impl Default for BankBootState {
 /// [17]     hsm.active_bank
 /// [18]     hsm.committed
 /// [19]     hsm.boot_count
-/// [20..24] padding
+/// [20]     app.active_bank
+/// [21]     app.committed
+/// [22]     app.boot_count
+/// [23..28] padding
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NvBootState {
@@ -179,7 +185,7 @@ impl NvRecord for NvBootState {
     const MAGIC: u32 = MAGIC_BOOT;
 
     fn size() -> usize {
-        24 // 4 magic + 4 seq + 4*3 banks + 4 padding
+        28 // 4 magic + 4 seq + 5*3 banks + 5 padding
     }
 
     fn write_seq(&self) -> u32 {
@@ -199,7 +205,6 @@ impl NvRecord for NvBootState {
             buf[off + 1] = bs.committed as u8;
             buf[off + 2] = bs.boot_count;
         }
-        // [23..28] padding stays zero
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {

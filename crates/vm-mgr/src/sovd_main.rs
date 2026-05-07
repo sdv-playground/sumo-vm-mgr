@@ -31,16 +31,11 @@ async fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!(
-            "Usage: vm-sovd <nv-store-path> <provisioning-authority-path> [options] [bind-addr]"
-        );
+    if args.len() < 2 {
+        eprintln!("Usage: vm-sovd <nv-store-path> [options] [bind-addr]");
         eprintln!();
         eprintln!("Positional:");
         eprintln!("  nv-store-path              NV store file (created if missing)");
-        eprintln!(
-            "  provisioning-authority-path COSE_Key public key for HSM key envelope validation"
-        );
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --images-dir <path>        Directory for A/B bank image files (enables real image OTA)");
@@ -52,19 +47,16 @@ async fn main() {
         eprintln!("  --boot-mount <path>        Boot partition mount point (default: /mnt/boot)");
         eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
         eprintln!();
-        eprintln!(
-            "Software authority and device decryption keys are loaded from HSM after provisioning."
-        );
-        eprintln!("Firmware flash is rejected until HSM is provisioned.");
+        eprintln!("Provisioning authority: built-in factory signing key (P-256 generator G).");
+        eprintln!("Software authority and device key loaded from HSM after provisioning.");
         eprintln!();
         eprintln!("Examples:");
-        eprintln!("  vm-sovd /tmp/nv.bin keys/signing.pub");
-        eprintln!("  vm-sovd /data/nv.bin /data/signing.pub --images-dir /data/images --hsm-keystore /data/vhsm-keys");
+        eprintln!("  vm-sovd /tmp/nv.bin");
+        eprintln!("  vm-sovd /data/nv.bin --images-dir /data/images --hsm-keystore /data/vhsm-keys");
         std::process::exit(1);
     }
 
     let nv_path = PathBuf::from(&args[1]);
-    let provisioning_authority_path = PathBuf::from(&args[2]);
 
     // Parse remaining args
     let mut images_dir: Option<PathBuf> = None;
@@ -75,7 +67,7 @@ async fn main() {
     let mut boot_device: Option<String> = None;
     let mut boot_mount = PathBuf::from("/mnt/boot");
     let mut bind_addr = "0.0.0.0:4000";
-    let mut i = 3;
+    let mut i = 2;
     while i < args.len() {
         if args[i] == "--images-dir" && i + 1 < args.len() {
             images_dir = Some(PathBuf::from(&args[i + 1]));
@@ -107,18 +99,7 @@ async fn main() {
         }
     }
 
-    // Load provisioning authority (validates HSM key envelopes)
-    let provisioning_authority = std::fs::read(&provisioning_authority_path).unwrap_or_else(|e| {
-        eprintln!(
-            "failed to read provisioning authority {}: {e}",
-            provisioning_authority_path.display()
-        );
-        std::process::exit(1);
-    });
-
-    // Create SuitProvider with provisioning authority only.
-    // Software authority and device key will be loaded from HSM after provisioning.
-    let provider = SuitProvider::new(provisioning_authority.clone());
+    let provider = SuitProvider::with_factory_authority();
     let manifest_provider = Arc::new(provider);
     let security_provider = Arc::new(TestSecurityProvider);
 
@@ -148,7 +129,6 @@ async fn main() {
             daemon_bin.clone(),
             hsm_keystore_path.clone(),
             hsm_port,
-            provisioning_authority,
         );
 
         if hsm_daemon_path.is_some() {
@@ -166,15 +146,16 @@ async fn main() {
             );
         }
 
-        // If HSM is already provisioned, load software authority + device key
+        // If HSM is already provisioned, load keys
         if provider.is_provisioned().unwrap_or(false) {
             match (
                 provider.get_public_key(KeyRole::SoftwareAuthority),
                 provider.get_private_key(KeyRole::DeviceDecryption),
             ) {
                 (Ok(sw_key), Ok(dk)) => {
-                    manifest_provider.update_keys(sw_key, Some(dk));
-                    tracing::info!("loaded software authority and device key from HSM keystore");
+                    let ka = provider.get_public_key(KeyRole::KeyAuthority).ok();
+                    manifest_provider.update_keys(sw_key, Some(dk), ka);
+                    tracing::info!("loaded keys from HSM keystore");
                 }
                 (Err(e), _) | (_, Err(e)) => {
                     tracing::warn!("HSM provisioned but failed to load keys: {e}");
@@ -344,10 +325,7 @@ async fn main() {
 
     tracing::info!("vm-sovd listening on {bind_addr}");
     tracing::info!("  NV store: {}", nv_path.display());
-    tracing::info!(
-        "  provisioning authority: {}",
-        provisioning_authority_path.display()
-    );
+    tracing::info!("  provisioning authority: built-in factory signing key");
     tracing::info!(
         "  software authority: {}",
         if manifest_provider.has_software_authority() {

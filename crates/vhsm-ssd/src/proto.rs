@@ -141,12 +141,12 @@ pub const PERM_KEY_GENERATE: u32 = 1 << 10;
 // ---- Well-known handles -------------------------------------------------
 
 pub const HANDLE_INVALID: u32 = 0x0000;
-pub const HANDLE_KEK: u32 = 0x0001;
 pub const HANDLE_SW_AUTHORITY: u32 = 0x0002;
 pub const HANDLE_DEVICE_DECRYPT: u32 = 0x0003;
 pub const HANDLE_ECU_SIGNING: u32 = 0x0004;
-pub const HANDLE_JWT_SIGNING: u32 = 0x0005;
-pub const HANDLE_STORAGE: u32 = 0x0006;
+pub const HANDLE_KEY_AUTHORITY: u32 = 0x0005;
+pub const HANDLE_JWT_SIGNING: u32 = 0x0006;
+pub const HANDLE_STORAGE: u32 = 0x0007;
 pub const HANDLE_DYNAMIC_BASE: u32 = 0x0100;
 
 pub fn handle_is_well_known(h: u32) -> bool {
@@ -294,9 +294,7 @@ mod tests {
 
     #[test]
     fn well_known_handle_range_boundary() {
-        // Everything in [0x0001, 0x0100) is well-known; below/above isn't.
         assert!(!handle_is_well_known(HANDLE_INVALID));
-        assert!(handle_is_well_known(HANDLE_KEK));
         assert!(handle_is_well_known(HANDLE_SW_AUTHORITY));
         assert!(handle_is_well_known(HANDLE_STORAGE));
         assert!(handle_is_well_known(HANDLE_DYNAMIC_BASE - 1));
@@ -308,10 +306,10 @@ mod tests {
     #[test]
     fn well_known_handles_have_distinct_values() {
         let hs = [
-            HANDLE_KEK,
             HANDLE_SW_AUTHORITY,
             HANDLE_DEVICE_DECRYPT,
             HANDLE_ECU_SIGNING,
+            HANDLE_KEY_AUTHORITY,
             HANDLE_JWT_SIGNING,
             HANDLE_STORAGE,
         ];

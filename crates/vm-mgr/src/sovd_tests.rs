@@ -58,7 +58,7 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
     let keys = generate_test_keys();
     let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
     // In tests, same key is both provisioning authority and software authority
-    suit_provider.update_keys(keys.trust_anchor.clone(), None);
+    suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
     let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
     let security_provider = Arc::new(TestSecurityProvider);
 
@@ -495,7 +495,7 @@ fn suit_provider_validates_good_envelope() {
     let keys = generate_test_keys();
     let provider = SuitProvider::new(keys.trust_anchor.clone());
     // Software authority = same key as signing key (trust anchor) for tests
-    provider.update_keys(keys.trust_anchor.clone(), None);
+    provider.update_keys(keys.trust_anchor.clone(), None, None);
     let image = vec![0xDD; 4096];
     let envelope = make_test_suit_envelope(&keys, "vm1", 5, &image);
 
@@ -511,7 +511,7 @@ fn suit_provider_rejects_wrong_key() {
     let other_keys = generate_test_keys();
     let provider = SuitProvider::new(other_keys.trust_anchor.clone());
     // Set wrong software authority — should reject firmware
-    provider.update_keys(other_keys.trust_anchor.clone(), None);
+    provider.update_keys(other_keys.trust_anchor.clone(), None, None);
     let image = vec![0xEE; 256];
     let envelope = make_test_suit_envelope(&keys, "vm1", 1, &image);
     assert!(provider.validate(&envelope, 0).is_err());
@@ -521,7 +521,7 @@ fn suit_provider_rejects_wrong_key() {
 fn suit_provider_rejects_rollback() {
     let keys = generate_test_keys();
     let provider = SuitProvider::new(keys.trust_anchor.clone());
-    provider.update_keys(keys.trust_anchor.clone(), None);
+    provider.update_keys(keys.trust_anchor.clone(), None, None);
     let image = vec![0xFF; 256];
     let envelope = make_test_suit_envelope(&keys, "vm1", 3, &image);
     assert!(provider.validate(&envelope, 5).is_err());

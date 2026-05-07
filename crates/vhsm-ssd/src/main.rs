@@ -109,7 +109,6 @@ fn main() {
         PathBuf::from("unused"),
         keystore_path.clone(),
         listen_addr.port(),
-        Vec::new(),
     );
 
     if !hsm.is_provisioned().unwrap_or(false) {
@@ -329,10 +328,10 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     // Map well-known handles to keystore key_ids.
     // These match KeyRole in hsm/src/types.rs.
     let well_known = [
-        (HANDLE_KEK, "kek", ALG_ECC_P256, PERM_ENCRYPT | PERM_DECRYPT),
         (HANDLE_SW_AUTHORITY, "sw-authority", ALG_ECC_P256, PERM_VERIFY),
         (HANDLE_DEVICE_DECRYPT, "device-decrypt", ALG_ECC_P256, PERM_DECRYPT | PERM_GET_PUBKEY),
         (HANDLE_ECU_SIGNING, "ecu-signing", ALG_ECC_P256, PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY | PERM_GET_CERT),
+        (HANDLE_KEY_AUTHORITY, "key-authority", ALG_ECC_P256, PERM_VERIFY),
         (HANDLE_JWT_SIGNING, "jwt-signing", ALG_ECC_P256, PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY),
         (HANDLE_STORAGE, "storage-key", ALG_AES_256, PERM_ENCRYPT | PERM_DECRYPT),
     ];

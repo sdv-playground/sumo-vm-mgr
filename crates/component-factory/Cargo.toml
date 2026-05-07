@@ -1,0 +1,19 @@
+[package]
+name = "component-factory"
+version = "0.1.0"
+edition = "2021"
+description = "Config-driven component construction for sumo machine manager"
+
+[dependencies]
+machine-mgr = { path = "../machine-mgr" }
+nv-store = { path = "../nv-store" }
+vm-mgr = { path = "../vm-mgr" }
+app-mgr = { path = "../app-mgr" }
+host-os-mgr = { path = "../host-os-mgr" }
+hsm = { path = "../hsm", features = ["crypto"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[dependencies.sovd-core]
+git = "https://github.com/sdv-playground/SOVDd.git"
+branch = "main"

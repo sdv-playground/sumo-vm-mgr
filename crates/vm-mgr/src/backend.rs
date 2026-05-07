@@ -225,6 +225,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             BankSet::Vm1 => ("vm1", "VM1", "Virtual machine slot 1"),
             BankSet::Vm2 => ("vm2", "VM2", "Virtual machine slot 2"),
             BankSet::Hsm => ("hsm", "HSM Key Store", "Hardware Security Module"),
+            BankSet::App => ("app", "App", "Self-updating application component"),
         };
 
         // Read the current active bank at startup — this is what we're running on.
@@ -467,6 +468,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             BankSet::Vm1 => "vm1",
             BankSet::Vm2 => "vm2",
             BankSet::Hsm => "hsm",
+            BankSet::App => "app",
         };
 
         let images_dir = self.images_dir.as_ref()
@@ -682,6 +684,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             BankSet::Vm1 => "vm1",
             BankSet::Vm2 => "vm2",
             BankSet::Hsm => "hsm",
+            BankSet::App => "app",
         };
 
         let output_suffix = match uri {
@@ -1362,8 +1365,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     hsm_guard.get_private_key(hsm::KeyRole::DeviceDecryption),
                 ) {
                     (Ok(sw_key), Ok(dk)) => {
-                        self.manifest_provider.update_keys(sw_key, Some(dk));
-                        tracing::info!("loaded software authority and device key from HSM");
+                        let ka = hsm_guard.get_public_key(hsm::KeyRole::KeyAuthority).ok();
+                        self.manifest_provider.update_keys(sw_key, Some(dk), ka);
+                        tracing::info!("loaded keys from HSM");
                     }
                     (Err(e), _) | (_, Err(e)) => {
                         tracing::warn!("HSM provisioned but failed to load keys: {e}");
@@ -1423,6 +1427,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     BankSet::Vm1 => "vm1",
                     BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
+                    BankSet::App => "app",
                 };
                 let bank_dir_name = match result.target_bank {
                     Bank::A => "bank_a",
@@ -1484,6 +1489,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     BankSet::Vm1 => "vm1",
                     BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
+                    BankSet::App => "app",
                 };
                 let bank_dir_name = match result.target_bank {
                     Bank::A => "bank_a",
@@ -1574,16 +1580,17 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                                 .map_err(|e| BackendError::Internal(format!("HSM provision: {e}")))?;
 
                             // Load keys from HSM into manifest provider
+                            let ka = hsm_guard.get_public_key(hsm::KeyRole::KeyAuthority).ok();
                             match (
                                 hsm_guard.get_public_key(hsm::KeyRole::SoftwareAuthority),
                                 hsm_guard.get_private_key(hsm::KeyRole::DeviceDecryption),
                             ) {
                                 (Ok(sw_key), Ok(dk)) => {
-                                    self.manifest_provider.update_keys(sw_key, Some(dk));
+                                    self.manifest_provider.update_keys(sw_key, Some(dk), ka);
                                     tracing::info!("HSM keys provisioned, software authority loaded");
                                 }
                                 (Ok(sw_key), Err(_)) => {
-                                    self.manifest_provider.update_keys(sw_key, None);
+                                    self.manifest_provider.update_keys(sw_key, None, ka);
                                     tracing::info!("HSM keys provisioned (no device key)");
                                 }
                                 _ => {
@@ -1626,6 +1633,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                                 BankSet::Vm1 => "vm1",
                                 BankSet::Vm2 => "vm2",
                                 BankSet::Hsm => "hsm",
+                                BankSet::App => "app",
                             };
                             let rb = *self.running_bank.lock().unwrap();
                             let target_bank = if rb == nv_store::types::Bank::A { "b" } else { "a" };
@@ -1859,6 +1867,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 BankSet::Vm1 => "vm1",
                 BankSet::Vm2 => "vm2",
                 BankSet::Hsm => "hsm",
+                BankSet::App => "app",
             };
             let target_bank = *self.running_bank.lock().unwrap();
             let bank_dir_name = match target_bank {

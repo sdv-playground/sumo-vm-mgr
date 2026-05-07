@@ -14,6 +14,7 @@
 use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
 
+use coset::{iana, CborSerializable, CoseKeyBuilder};
 use nv_store::types::BankSet;
 use sumo_crypto::{CryptoBackend, RustCryptoBackend};
 use sumo_onboard::error::Sum2Error;
@@ -62,32 +63,50 @@ fn map_sum2_error(err: Sum2Error, envelope_bytes: &[u8], crypto: &RustCryptoBack
 /// URI key for the integrated firmware payload inside the SUIT envelope.
 const INTEGRATED_PAYLOAD_KEY: &str = "#firmware";
 
+/// Build the factory provisioning authority as COSE_Key CBOR bytes.
+/// Uses the P-256 generator point G (scalar=1) — the well-known factory signing key.
+pub fn factory_provisioning_authority() -> Vec<u8> {
+    let pub_key = &hsm::payload::FACTORY_SIGNING_PUBLIC;
+    let x = &pub_key[1..33];
+    let y = &pub_key[33..65];
+    CoseKeyBuilder::new_ec2_pub_key(iana::EllipticCurve::P_256, x.to_vec(), y.to_vec())
+        .algorithm(iana::Algorithm::ES256)
+        .build()
+        .to_vec()
+        .expect("COSE_Key serialization")
+}
+
 pub struct SuitProvider {
-    /// Provisioning authority — validates HSM key envelopes only.
-    /// Set at startup, never changes.
-    provisioning_authority: Vec<u8>,
+    /// Factory signing key — fallback trust anchor for HSM key envelopes.
+    factory_authority: Vec<u8>,
+    /// Key authority — verifies HSM key envelopes after first provisioning.
+    key_authority: Arc<RwLock<Option<Vec<u8>>>>,
     /// Software authority — validates firmware SUIT envelopes.
-    /// Loaded from HSM after provisioning. None until HSM is provisioned.
     software_authority: Arc<RwLock<Option<Vec<u8>>>>,
     /// Device decryption key — ECDH for firmware decryption.
-    /// Loaded from HSM after provisioning. None until HSM is provisioned.
     device_key: Arc<RwLock<Option<Vec<u8>>>>,
 }
 
 impl SuitProvider {
-    pub fn new(provisioning_authority: Vec<u8>) -> Self {
+    pub fn new(factory_authority: Vec<u8>) -> Self {
         Self {
-            provisioning_authority,
+            factory_authority,
+            key_authority: Arc::new(RwLock::new(None)),
             software_authority: Arc::new(RwLock::new(None)),
             device_key: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Load software authority and device key from HSM after provisioning.
-    pub fn update_keys(&self, sw_authority: Vec<u8>, device_key: Option<Vec<u8>>) {
+    pub fn with_factory_authority() -> Self {
+        Self::new(factory_provisioning_authority())
+    }
+
+    /// Load all trust keys from HSM after provisioning.
+    pub fn update_keys(&self, sw_authority: Vec<u8>, device_key: Option<Vec<u8>>, key_authority: Option<Vec<u8>>) {
         *self.software_authority.write().unwrap() = Some(sw_authority);
         *self.device_key.write().unwrap() = device_key;
-        tracing::info!("SuitProvider: loaded software authority and device key from HSM");
+        *self.key_authority.write().unwrap() = key_authority;
+        tracing::info!("SuitProvider: loaded keys from HSM");
     }
 
     /// Check if software authority keys have been loaded.
@@ -98,7 +117,10 @@ impl SuitProvider {
     /// Select the trust anchor based on manifest type.
     fn trust_anchor_for(&self, manifest_type: ManifestType) -> Result<Vec<u8>, ManifestError> {
         match manifest_type {
-            ManifestType::HsmKeys => Ok(self.provisioning_authority.clone()),
+            ManifestType::HsmKeys => {
+                Ok(self.key_authority.read().unwrap().clone()
+                    .unwrap_or_else(|| self.factory_authority.clone()))
+            }
             ManifestType::Firmware => {
                 self.software_authority
                     .read()
@@ -337,8 +359,8 @@ impl ManifestProvider for SuitProvider {
         self.device_key.read().unwrap().clone()
     }
 
-    fn update_keys(&self, sw_authority: Vec<u8>, device_key: Option<Vec<u8>>) {
-        SuitProvider::update_keys(self, sw_authority, device_key);
+    fn update_keys(&self, sw_authority: Vec<u8>, device_key: Option<Vec<u8>>, key_authority: Option<Vec<u8>>) {
+        SuitProvider::update_keys(self, sw_authority, device_key, key_authority);
     }
 }
 

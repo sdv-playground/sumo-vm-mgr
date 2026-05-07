@@ -12,7 +12,6 @@
 ///   1: uint,              ; security_version
 ///   2: [* Identity],      ; guest identities
 ///   3: [* KeySlot],       ; key slots
-///   4: ?uint,             ; kek_slot_index
 /// }
 ///
 /// Identity = {
@@ -23,7 +22,7 @@
 /// KeySlot = {
 ///   0: tstr,              ; key_id
 ///   1: uint,              ; key_type (0 = EC-P256, 1 = AES-256)
-///   2: bstr,              ; private_key
+///   2: ?bstr,             ; private_key (None for trust anchors — public-key-only slots)
 ///   3: ?bstr,             ; public_key (EC-P256 only)
 ///   4: ?bstr,             ; certificate (X.509 DER)
 ///   5: ?[* tstr],         ; allowed_guests
@@ -38,24 +37,21 @@ use crate::KeyType;
 /// Current schema version. Bump when breaking changes are made.
 pub const SCHEMA_VERSION: u64 = 1;
 
-/// Well-known factory KEK — used to encrypt the first provisioning envelope.
+/// Well-known factory signing key — verifies the first HSM key provisioning envelope.
 ///
 /// This is NOT real security. The private key is published in the spec.
-/// Its purpose is to ensure the same encrypt→decrypt code path is used
-/// for both factory and re-provision, eliminating an `if encrypted` branch.
-///
-/// On re-provision, the real KEK (from slot 0) replaces this.
+/// After first provisioning, the Key Authority (slot 0) verifies subsequent envelopes.
 ///
 /// EC-P256 key with private scalar = 1 (public key = generator point G).
-pub const FACTORY_KEK_SCALAR: [u8; 32] = {
+pub const FACTORY_SIGNING_SCALAR: [u8; 32] = {
     let mut s = [0u8; 32];
     s[31] = 1;
     s
 };
 
-/// Factory KEK public key (P-256 generator point G, uncompressed).
+/// Factory signing key public half (P-256 generator point G, uncompressed).
 #[rustfmt::skip]
-pub const FACTORY_KEK_PUBLIC: [u8; 65] = [
+pub const FACTORY_SIGNING_PUBLIC: [u8; 65] = [
     0x04,
     0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47,
     0xF8, 0xBC, 0xE6, 0xE5, 0x63, 0xA4, 0x40, 0xF2,
@@ -85,11 +81,6 @@ pub struct HsmKeystore {
     /// Key slots.
     #[serde(rename = "3")]
     pub slots: Vec<KeySlotDef>,
-
-    /// Index into `slots` for the bootstrap KEK (EC-P256).
-    /// The KEK's public key is used to encrypt future provisioning envelopes.
-    #[serde(rename = "4", default, skip_serializing_if = "Option::is_none")]
-    pub kek_slot_index: Option<u64>,
 }
 
 /// Guest identity for challenge-response registration.
@@ -115,11 +106,11 @@ pub struct KeySlotDef {
     #[serde(rename = "1")]
     pub key_type: u64,
 
-    /// Private key material.
+    /// Private key material (None for public-key-only trust anchor slots).
     /// - EC-P256: 32-byte scalar (big-endian).
     /// - AES-256: 32 random bytes.
-    #[serde(rename = "2", with = "serde_bytes")]
-    pub private_key: Vec<u8>,
+    #[serde(rename = "2", default, skip_serializing_if = "Option::is_none", with = "serde_bytes_opt")]
+    pub private_key: Option<Vec<u8>>,
 
     /// Public key (EC-P256 only, 65 bytes uncompressed).
     #[serde(rename = "3", default, skip_serializing_if = "Option::is_none", with = "serde_bytes_opt")]
@@ -233,11 +224,11 @@ mod tests {
     fn sample_keystore(num_slots: usize) -> HsmKeystore {
         let mut slots = Vec::with_capacity(num_slots);
 
-        // KEK slot (always first)
+        // Key Authority slot (public-key-only trust anchor)
         slots.push(KeySlotDef {
-            key_id: "kek".to_string(),
+            key_id: "key-authority".to_string(),
             key_type: KEY_TYPE_EC_P256,
-            private_key: vec![0xAA; 32],
+            private_key: None,
             public_key: Some({
                 let mut pk = vec![0x04]; // uncompressed prefix
                 pk.extend_from_slice(&[0xBB; 32]); // x
@@ -256,7 +247,7 @@ mod tests {
                 slots.push(KeySlotDef {
                     key_id: format!("aes-key-{i}"),
                     key_type: KEY_TYPE_AES_256,
-                    private_key: vec![(i & 0xFF) as u8; 32],
+                    private_key: Some(vec![(i & 0xFF) as u8; 32]),
                     public_key: None,
                     certificate: None,
                     allowed_guests: Some(vec!["bali-vm-1".into()]),
@@ -267,7 +258,7 @@ mod tests {
                 slots.push(KeySlotDef {
                     key_id: format!("ec-key-{i}"),
                     key_type: KEY_TYPE_EC_P256,
-                    private_key: vec![(i & 0xFF) as u8; 32],
+                    private_key: Some(vec![(i & 0xFF) as u8; 32]),
                     public_key: Some({
                         let mut pk = vec![0x04];
                         pk.extend_from_slice(&vec![(i & 0xFF) as u8; 32]);
@@ -298,7 +289,6 @@ mod tests {
                 },
             }],
             slots,
-            kek_slot_index: Some(0),
         }
     }
 
@@ -312,9 +302,8 @@ mod tests {
         assert_eq!(decoded.security_version, 1);
         assert_eq!(decoded.slots.len(), 5);
         assert_eq!(decoded.identities.len(), 1);
-        assert_eq!(decoded.kek_slot_index, Some(0));
-        assert_eq!(decoded.slots[0].key_id, "kek");
-        assert_eq!(decoded.slots[0].private_key.len(), 32);
+        assert_eq!(decoded.slots[0].key_id, "key-authority");
+        assert!(decoded.slots[0].private_key.is_none());
         assert_eq!(decoded.slots[0].public_key.as_ref().unwrap().len(), 65);
     }
 
@@ -330,7 +319,7 @@ mod tests {
         assert_eq!(decoded.slots.len(), 100);
 
         // Spot check a few slots
-        assert_eq!(decoded.slots[0].key_id, "kek");
+        assert_eq!(decoded.slots[0].key_id, "key-authority");
         assert_eq!(decoded.slots[0].key_type, KEY_TYPE_EC_P256);
         assert_eq!(decoded.slots[3].key_id, "aes-key-3");
         assert_eq!(decoded.slots[3].key_type, KEY_TYPE_AES_256);
@@ -351,7 +340,7 @@ mod tests {
         let slot = KeySlotDef {
             key_id: "test".into(),
             key_type: KEY_TYPE_EC_P256,
-            private_key: vec![0; 32],
+            private_key: Some(vec![0; 32]),
             public_key: None,
             certificate: None,
             allowed_guests: None,
@@ -366,7 +355,7 @@ mod tests {
         let ec = KeySlotDef {
             key_id: "x".into(),
             key_type: KEY_TYPE_EC_P256,
-            private_key: vec![],
+            private_key: None,
             public_key: None,
             certificate: None,
             allowed_guests: None,
@@ -377,7 +366,7 @@ mod tests {
         let aes = KeySlotDef {
             key_id: "y".into(),
             key_type: KEY_TYPE_AES_256,
-            private_key: vec![],
+            private_key: None,
             public_key: None,
             certificate: None,
             allowed_guests: None,

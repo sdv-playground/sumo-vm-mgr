@@ -308,7 +308,6 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for VmBackendComponent<D>
             PathBuf::from("unused"),
             keystore.clone(),
             self.csr_hsm_port,
-            Vec::new(),
         );
         use hsm::HsmCryptoProvider;
         let der = tmp

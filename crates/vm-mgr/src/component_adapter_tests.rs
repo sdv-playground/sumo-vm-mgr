@@ -251,7 +251,7 @@ async fn get_csr_generates_csr_when_keystore_configured() {
 
     // Pre-generate the device key as the real flow does, so CSR signing has
     // something to sign with.
-    let setup = hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), 5100, Vec::new());
+    let setup = hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), 5100);
     setup.ensure_device_key().expect("device key created");
 
     let comp = VmBackendComponent::new(vm).with_csr_keystore(keystore, 5100);

@@ -488,7 +488,7 @@ mod tests {
     fn new_hsm() -> (SimHsm, TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let keystore = PathBuf::from(tmp.path());
-        let hsm = SimHsm::new(PathBuf::from("unused"), keystore, 0, Vec::new());
+        let hsm = SimHsm::new(PathBuf::from("unused"), keystore, 0);
         (hsm, tmp)
     }
 

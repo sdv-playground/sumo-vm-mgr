@@ -7,7 +7,7 @@
 # The same firmware can be re-signed with different security_version.
 #
 # Output:
-#   example/keys/          signing + device key pairs (COSE_Key CBOR)
+#   example/keys/          signing key + device public key (COSE_Key CBOR)
 #   example/output/        signed SUIT envelopes
 #   example/output/firmware/   content-addressable firmware binaries
 #
@@ -37,11 +37,18 @@ SUMO_TOOL="$SUMO_RS_DIR/target/release/sumo-tool"
 mkdir -p "$KEYS_DIR" "$OUTPUT_DIR" "$FW_DIR"
 
 # ---------------------------------------------------------------
-# 1. Generate signing key + device key
+# 1. Generate signing key (backend holds private); device public key from CSR
 # ---------------------------------------------------------------
-echo "[build] generating keys..."
+echo "[build] generating signing key..."
 "$SUMO_TOOL" keygen --output "$KEYS_DIR/signing.key" --public "$KEYS_DIR/signing.pub"
-"$SUMO_TOOL" keygen --device --output "$KEYS_DIR/device.key" --public "$KEYS_DIR/device.pub"
+
+# In production, device.pub comes from the device's CSR endpoint.
+# For offline dev/test, generate a placeholder (only public half is used).
+if [ ! -f "$KEYS_DIR/device.pub" ]; then
+    echo "[build] no device.pub found — generating placeholder for offline dev..."
+    "$SUMO_TOOL" keygen --device --output /dev/null --public "$KEYS_DIR/device.pub"
+    echo "[build] NOTE: real deployments get device.pub from CSR at runtime"
+fi
 echo "[build] wrote keys to $KEYS_DIR/"
 
 # ---------------------------------------------------------------
