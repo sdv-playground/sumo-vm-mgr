@@ -120,11 +120,19 @@ async fn restart_vm(
         mgr.finalize_stop(&name);
     }
 
-    // Start phase
-    let mut mgr = mgr.lock().await;
-    match mgr.start_vm(&name) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
-        Err(e) => error_response(e),
+    // Start phase (may block on devb-loopback wait)
+    let mgr_clone = mgr.clone();
+    let name_clone = name.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        let mut mgr = rt.block_on(mgr_clone.lock());
+        mgr.start_vm(&name_clone)
+    }).await;
+
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+        Ok(Err(e)) => error_response(e),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "start task panicked"}))),
     }
 }
 

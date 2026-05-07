@@ -66,8 +66,6 @@ async fn main() {
     };
 
     let socket_path = config.socket.clone();
-    #[cfg(not(target_os = "linux"))]
-    let tcp_port = config.tcp_port;
     let vm_count = config.vms.len();
 
     // Collect auto-start VM names before config is consumed
@@ -101,79 +99,48 @@ async fn main() {
 
     let app = api::router(manager);
 
-    // Platform-specific listener: Unix socket on Linux, TCP on QNX
-    #[cfg(target_os = "linux")]
-    {
-        // Clean stale socket file
-        let _ = std::fs::remove_file(&socket_path);
+    // Clean stale socket file
+    let _ = std::fs::remove_file(&socket_path);
 
-        // Ensure parent directory exists
-        if let Some(parent) = socket_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    // Ensure parent directory exists
+    if let Some(parent) = socket_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let listener = match tokio::net::UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("failed to bind {}: {e}", socket_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    tracing::info!("listening on {}", socket_path.display());
+
+    // Graceful shutdown on SIGTERM/SIGINT
+    let shutdown = async move {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ).expect("failed to register SIGTERM");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM");
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received SIGINT");
+            }
         }
 
-        let listener = match tokio::net::UnixListener::bind(&socket_path) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("failed to bind {}: {e}", socket_path.display());
-                std::process::exit(1);
-            }
-        };
+        tracing::info!("shutting down, stopping all VMs...");
+        manager_shutdown.lock().await.stop_all();
 
-        tracing::info!("listening on {}", socket_path.display());
+        // Clean up socket
+        let _ = std::fs::remove_file(&socket_path);
+    };
 
-        // Graceful shutdown on SIGTERM/SIGINT
-        let shutdown = async move {
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            ).expect("failed to register SIGTERM");
-
-            tokio::select! {
-                _ = sigterm.recv() => {
-                    tracing::info!("received SIGTERM");
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("received SIGINT");
-                }
-            }
-
-            tracing::info!("shutting down, stopping all VMs...");
-            manager_shutdown.lock().await.stop_all();
-
-            // Clean up socket
-            let _ = std::fs::remove_file(&socket_path);
-        };
-
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await
-            .unwrap();
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let port = tcp_port.unwrap_or(9100);
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("failed to bind {addr}: {e}");
-                std::process::exit(1);
-            }
-        };
-
-        tracing::info!("listening on {addr}");
-
-        let shutdown = async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("received shutdown signal");
-            tracing::info!("shutting down, stopping all VMs...");
-            manager_shutdown.lock().await.stop_all();
-        };
-
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await
-            .unwrap();
-    }
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .unwrap();
 }

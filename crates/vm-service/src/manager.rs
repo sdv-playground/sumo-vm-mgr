@@ -48,6 +48,7 @@ pub fn wait_for_exit(pid: u32, timeout_secs: u64) {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    tracing::warn!("pid {pid} did not exit within {timeout_secs}s — will force-kill");
 }
 
 #[derive(Debug)]
@@ -148,6 +149,16 @@ impl VmManager {
             None => vm.def.clone(),
         };
 
+        // Don't start if boot images are missing (e.g. first boot before provisioning)
+        if let Some(kernel) = effective_def.kernel_path() {
+            if !kernel.exists() {
+                tracing::warn!("VM {name}: kernel not found: {} — deferring start", kernel.display());
+                return Err(ManagerError::Runner(
+                    crate::runner::RunnerError::Config(format!("kernel not found: {}", kernel.display()))
+                ));
+            }
+        }
+
         let handle = vm.runner.start(name, &effective_def)?;
         tracing::info!("started VM {name} (pid: {:?})", handle.pid);
         vm.handle = Some(handle);
@@ -169,13 +180,20 @@ impl VmManager {
             return Ok(StopHandle { name: name.to_string(), pid: None, timeout_secs: 0 });
         }
 
-        // Send shutdown signal via health monitor (writes CMD_SHUTDOWN to shm)
-        if let Some(ref monitor) = vm.health_monitor {
-            monitor.request_shutdown();
-        }
+        // Send shutdown signal via health monitor (writes CMD_SHUTDOWN to shm).
+        // If the shm region doesn't exist yet (e.g. health sim not running),
+        // request_shutdown() returns false — skip the wait and force-kill immediately.
+        let timeout_secs = if let Some(ref monitor) = vm.health_monitor {
+            if monitor.request_shutdown() {
+                vm.def.shutdown_timeout_secs()
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
         let pid = handle.pid;
-        let timeout_secs = vm.def.shutdown_timeout_secs();
         tracing::info!("signalled shutdown for VM {name} (pid: {pid:?}, timeout: {timeout_secs}s)");
 
         Ok(StopHandle { name: name.to_string(), pid, timeout_secs })

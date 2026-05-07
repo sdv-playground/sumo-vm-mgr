@@ -12,12 +12,10 @@ use serde::Deserialize;
 /// Top-level service configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VmServiceConfig {
-    /// Unix socket path for the control API (Linux).
+    /// Unix socket path for the control API.
+    /// Platform-specific default: /var/run/vm-service.sock (Linux),
+    /// /dev/shmem/vm-service.sock (QNX).
     pub socket: PathBuf,
-    /// TCP port for the control API (QNX/non-Linux, default 9100).
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub tcp_port: Option<u16>,
     /// VM definitions, keyed by name (e.g., "vm1", "vm2").
     pub vms: HashMap<String, VmDefinition>,
 }
