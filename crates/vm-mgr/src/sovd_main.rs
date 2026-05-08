@@ -60,7 +60,7 @@ async fn main() {
 
     // Parse remaining args
     let mut images_dir: Option<PathBuf> = None;
-    let mut vm_service_socket: Option<PathBuf> = None;
+    let mut vm_service_addr: Option<String> = None;
     let mut hsm_daemon_path: Option<PathBuf> = None;
     let mut hsm_keystore_path = PathBuf::from("/tmp/vhsm-keys");
     let mut hsm_port: u16 = 5100;
@@ -73,7 +73,7 @@ async fn main() {
             images_dir = Some(PathBuf::from(&args[i + 1]));
             i += 2;
         } else if args[i] == "--vm-service-socket" && i + 1 < args.len() {
-            vm_service_socket = Some(PathBuf::from(&args[i + 1]));
+            vm_service_addr = Some(args[i + 1].clone());
             i += 2;
         } else if args[i] == "--hsm-daemon" && i + 1 < args.len() {
             hsm_daemon_path = Some(PathBuf::from(&args[i + 1]));
@@ -216,7 +216,7 @@ async fn main() {
             manifest_provider.clone(),
             security_provider.clone(),
             config,
-            vm_service_socket.clone(),
+            vm_service_addr.clone(),
             images_dir.clone(),
         );
         // Read display_name from per-bank vm-config.yaml if available
@@ -337,8 +337,8 @@ async fn main() {
     if let Some(ref dir) = images_dir {
         tracing::info!("  images dir: {} (real image OTA enabled)", dir.display());
     }
-    if let Some(ref sock) = vm_service_socket {
-        tracing::info!("  vm-service socket: {}", sock.display());
+    if let Some(ref addr) = vm_service_addr {
+        tracing::info!("  vm-service addr: {addr}");
     }
     tracing::info!("  HSM keystore: {}", hsm_keystore_path.display());
     if let Some(ref dev) = boot_device {

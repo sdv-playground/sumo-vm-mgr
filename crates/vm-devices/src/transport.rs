@@ -1,17 +1,39 @@
-//! Transport abstractions for host↔guest shared memory communication.
+//! Transport abstractions for host↔guest device communication.
+//!
+//! Two layers:
+//!
+//! - **Low-level** `SharedMemory` + `Doorbell`: byte-level shmem ops + notify.
+//!   Used by shmem-backed transport impls. Tied to "this is a memory region"
+//!   semantics.
+//!
+//! - **High-level** `DeviceChannel` + `DeviceTransport`: substrate-agnostic
+//!   "structured-state-with-notification" primitive. Devices consume this so
+//!   the same device code runs over shmem (`IvshmemTransport`,
+//!   `QvmShmemTransport`) and network (`HttpTransport`) without changes.
+//!
+//! See `tasks/device-transport-design.md` for the full design.
 
 pub mod mem;
+pub mod shmem;
+pub mod tcp_stream;
 #[cfg(target_os = "linux")]
 pub mod ivshmem;
-pub mod posix;
+#[cfg(feature = "http-transport")]
+pub mod http;
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Error type for transport operations.
 #[derive(Debug)]
 pub enum TransportError {
     Io(std::io::Error),
     OutOfBounds { offset: usize, len: usize, size: usize },
+    /// The transport doesn't support the requested channel shape — typically
+    /// returned by `DeviceTransport::open_stream` on register-only transports
+    /// (HTTP, plain ivshmem) and by `open_channel` on stream-only transports.
+    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for TransportError {
@@ -21,11 +43,130 @@ impl std::fmt::Display for TransportError {
             TransportError::OutOfBounds { offset, len, size } => {
                 write!(f, "out of bounds: offset={offset} len={len} size={size}")
             }
+            TransportError::Unsupported(s) => write!(f, "unsupported: {s}"),
         }
     }
 }
 
 impl std::error::Error for TransportError {}
+
+impl From<std::io::Error> for TransportError {
+    fn from(e: std::io::Error) -> Self {
+        TransportError::Io(e)
+    }
+}
+
+/// One direction of a device's state-with-notification.
+///
+/// Each channel carries a single byte snapshot from one peer to the other,
+/// plus an optional notification primitive. Devices serialize their wire
+/// format (typically a `#[repr(C)]` struct via `bytemuck`) into bytes and
+/// hand them to `write`; readers `read` and deserialize.
+///
+/// Implementations:
+/// - **`MemChannel`** (in-process, tests): heap buffer + condvar.
+/// - **`ShmemChannel`** (real shmem, future): seqlock-protected region of a
+///   `SharedMemory` impl + `Doorbell`. Concurrency safety lives here, not in
+///   the device.
+/// - **`HttpChannel`** (future): host-side serves PUT/GET/notify endpoints;
+///   guest-side is a thin reqwest wrapper.
+pub trait DeviceChannel: Send + Sync {
+    /// Read the current snapshot. Implementations are responsible for
+    /// internal coherency (seqlock retry on shmem, atomic swap in-mem,
+    /// HTTP GET on network). Returned `Vec<u8>` may be empty on a fresh
+    /// channel that has not been written.
+    fn read(&self) -> Result<Vec<u8>, TransportError>;
+
+    /// Write a new snapshot, replacing whatever was there. For shmem-backed
+    /// channels this uses a seqlock so a concurrent reader sees a consistent
+    /// view. For HTTP it's a single PUT.
+    fn write(&self, data: &[u8]) -> Result<(), TransportError>;
+
+    /// Wake the peer that data changed. May be a no-op for transports that
+    /// rely on polling (HTTP without long-poll).
+    fn notify(&self) -> Result<(), TransportError>;
+
+    /// Block until peer notifies us, or `timeout` elapses. `None` means
+    /// wait forever. Returns `Ok(true)` on signal, `Ok(false)` on timeout.
+    fn wait(&self, timeout: Option<Duration>) -> Result<bool, TransportError>;
+}
+
+/// One direction of a device's frame stream.
+///
+/// `StreamChannel` is the FIFO sibling of [`DeviceChannel`]: where a channel
+/// holds a single snapshot that any reader can re-fetch, a stream carries an
+/// ordered, lossless sequence of distinct frames where each frame is read
+/// once and then gone. CAN frames, audio buffers, and log records fit here;
+/// heartbeat / power-command / time-sync fit `DeviceChannel`.
+///
+/// Wire framing is the transport's concern (the existing TCP impl uses a
+/// 4-byte little-endian length prefix per frame). Devices serialize their
+/// per-frame wire format into bytes and hand them to `send_frame`; readers
+/// `recv_frame` and deserialize.
+pub trait StreamChannel: Send + Sync {
+    /// Send one frame to the peer. Frames are delivered in order; the
+    /// transport must not reorder or drop them silently. Backpressure is
+    /// transport-defined (TCP: blocks; bounded queues: returns error).
+    fn send_frame(&self, data: &[u8]) -> Result<(), TransportError>;
+
+    /// Receive the next frame, blocking up to `timeout` (or forever if
+    /// `None`). Returns:
+    /// - `Ok(Some(frame))` on a frame
+    /// - `Ok(None)` on clean EOF (peer closed) or timeout
+    /// - `Err(...)` on transport failure
+    fn recv_frame(&self, timeout: Option<Duration>) -> Result<Option<Vec<u8>>, TransportError>;
+
+    /// Non-blocking variant of `recv_frame`. Returns `Ok(None)` when no
+    /// frame is currently queued (vs `recv_frame(Some(0))` which short-
+    /// circuits the same way but isn't required to).
+    fn try_recv_frame(&self) -> Result<Option<Vec<u8>>, TransportError>;
+}
+
+/// Factory that constructs `DeviceChannel` and/or `StreamChannel` for a
+/// given transport substrate.
+///
+/// The runner picks one impl per VM at start time, based on `(host, guest_os)`,
+/// then hands `Arc<dyn DeviceTransport>` to each device. Devices request
+/// channels by `(vm, device, channel)` triple; the transport decides storage:
+/// shmem region, HTTP endpoint, TCP socket, etc.
+///
+/// `open_channel` and `open_stream` are idempotent — calling either twice
+/// with the same triple returns the same underlying channel.
+///
+/// Each transport implementation declares which shapes it supports by
+/// providing real impls; the defaults below return `Unsupported` so a
+/// register-only transport (HTTP) doesn't need to know about streams and
+/// vice versa.
+pub trait DeviceTransport: Send + Sync {
+    /// Open or attach to a register-shaped channel. `size_hint` is advisory
+    /// — shmem-backed transports use it to size the underlying region;
+    /// HTTP ignores it. Default returns `Unsupported`.
+    fn open_channel(
+        &self,
+        _vm: &str,
+        _device: &str,
+        _channel: &str,
+        _size_hint: usize,
+    ) -> Result<Arc<dyn DeviceChannel>, TransportError> {
+        Err(TransportError::Unsupported(
+            "this transport does not provide register-shaped channels",
+        ))
+    }
+
+    /// Open or attach to a stream-shaped channel. Default returns
+    /// `Unsupported` — implement this on transports whose substrate
+    /// naturally carries a frame FIFO (TCP, shmem rings).
+    fn open_stream(
+        &self,
+        _vm: &str,
+        _device: &str,
+        _channel: &str,
+    ) -> Result<Arc<dyn StreamChannel>, TransportError> {
+        Err(TransportError::Unsupported(
+            "this transport does not provide stream-shaped channels",
+        ))
+    }
+}
 
 /// A region of shared memory accessible by both host and guest.
 ///

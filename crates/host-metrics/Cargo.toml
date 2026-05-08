@@ -1,0 +1,21 @@
+[package]
+name = "host-metrics"
+version = "0.1.0"
+edition = "2021"
+description = "Host hardware metrics — Prometheus endpoint with pluggable SensorReader"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Used by the QNX reader for `sysconf` / `getloadavg`. Tiny on Linux too.
+libc = "0.2"
+
+[lib]
+name = "host_metrics"
+path = "src/lib.rs"
+
+[[bin]]
+name = "host-metrics"
+path = "src/main.rs"

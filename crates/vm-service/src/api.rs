@@ -18,7 +18,7 @@ use axum::{
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::health::HealthStatus;
+use crate::health_status::HealthStatus;
 use crate::manager::{self, ManagerError, VmManager};
 
 type SharedManager = Arc<Mutex<VmManager>>;
@@ -30,7 +30,20 @@ pub fn router(manager: SharedManager) -> Router {
         .route("/vms/{name}/stop", post(stop_vm))
         .route("/vms/{name}/restart", post(restart_vm))
         .route("/vms/{name}/health", get(health_vm))
+        .layer(axum::middleware::from_fn(log_request))
         .with_state(manager)
+}
+
+async fn log_request(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    tracing::info!(target: "vm_service::api", %method, %uri, "vm-service request");
+    let resp = next.run(req).await;
+    tracing::info!(target: "vm_service::api", status = %resp.status(), "vm-service response");
+    resp
 }
 
 #[derive(Serialize)]
@@ -99,7 +112,12 @@ async fn restart_vm(
     State(mgr): State<SharedManager>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    // Stop phase (same 3-phase pattern as stop_vm)
+    // Initiate stop synchronously — fast, just sends signal + records pid.
+    // Anything that can block (wait_for_exit, finalize_stop, start_vm) runs
+    // in the background after we've returned 200, matching the documented
+    // contract that callers (vm-mgr's notify_vm_service) rely on:
+    // "restart_vm returns 200 the moment it has initiated the restart (it
+    // does NOT wait for QEMU to fully boot)".
     let stop_handle = {
         let mut mgr = mgr.lock().await;
         match mgr.initiate_stop(&name) {
@@ -109,31 +127,38 @@ async fn restart_vm(
         }
     };
 
-    if let Some(sh) = stop_handle {
-        if let Some(pid) = sh.pid {
-            let timeout = sh.timeout_secs;
-            tokio::task::spawn_blocking(move || {
-                manager::wait_for_exit(pid, timeout);
-            }).await.ok();
-        }
-        let mut mgr = mgr.lock().await;
-        mgr.finalize_stop(&name);
-    }
-
-    // Start phase (may block on devb-loopback wait)
     let mgr_clone = mgr.clone();
     let name_clone = name.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        let mut mgr = rt.block_on(mgr_clone.lock());
-        mgr.start_vm(&name_clone)
-    }).await;
+    tokio::spawn(async move {
+        // Wait for previous instance (if any) to exit, then finalize.
+        if let Some(sh) = stop_handle {
+            if let Some(pid) = sh.pid {
+                let timeout = sh.timeout_secs;
+                tokio::task::spawn_blocking(move || {
+                    manager::wait_for_exit(pid, timeout);
+                }).await.ok();
+            }
+            let mut mgr = mgr_clone.lock().await;
+            mgr.finalize_stop(&name_clone);
+        }
 
-    match result {
-        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
-        Ok(Err(e)) => error_response(e),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "start task panicked"}))),
-    }
+        // Start the new instance (may block on devb-loopback wait).
+        let start_name = name_clone.clone();
+        let start_mgr = mgr_clone.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            let mut mgr = rt.block_on(start_mgr.lock());
+            mgr.start_vm(&start_name)
+        }).await;
+
+        match result {
+            Ok(Ok(())) => tracing::info!(vm = %name_clone, "restart_vm: VM restarted in background"),
+            Ok(Err(e)) => tracing::error!(vm = %name_clone, error = %e, "restart_vm: background start_vm failed"),
+            Err(e)     => tracing::error!(vm = %name_clone, error = %e, "restart_vm: background start_vm panicked"),
+        }
+    });
+
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "queued": true})))
 }
 
 async fn health_vm(

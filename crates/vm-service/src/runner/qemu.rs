@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::*;
-use crate::health::HealthMonitor;
 use crate::ivshmem::{self, HostProcess, IvshmemSockets};
 use super::*;
 
@@ -23,9 +22,9 @@ pub struct QemuRunner {
     host_processes: Vec<HostProcess>,
     /// Socket paths to clean up.
     sockets: Vec<PathBuf>,
-    /// Health monitor for the current VM.
-    health_monitor: Option<HealthMonitor>,
-    /// Cancel flags for Rust simulator threads.
+    /// Cancel flags for Rust simulator threads (time, CAN bridge).
+    /// Health used to be in this list — now `VmManager` reads heartbeat
+    /// directly via `HeartbeatDevice` over the configured `DeviceTransport`.
     sim_cancellers: Vec<Arc<AtomicBool>>,
 }
 
@@ -37,7 +36,6 @@ impl QemuRunner {
             try_kvm: true,
             host_processes: Vec::new(),
             sockets: Vec::new(),
-            health_monitor: None,
             sim_cancellers: Vec::new(),
         }
     }
@@ -63,31 +61,6 @@ impl QemuRunner {
         self.qemu_bin.as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| arch.qemu_binary().to_string())
-    }
-
-    /// Start the Rust health simulator on a background thread.
-    fn start_health_sim(&mut self, vm_name: &str) -> Result<(), RunnerError> {
-        use vm_devices::transport::ivshmem::{IvshmemSharedMemory, NullDoorbell};
-        use vm_devices::clock::system::SystemClock;
-        use vm_devices::health;
-
-        let shm = IvshmemSharedMemory::open_by_name(vm_name, "health")
-            .map_err(|e| RunnerError::ProcessFailed(format!("health shm: {e}")))?;
-        let clock = Arc::new(SystemClock::new());
-        let sim = health::HealthSim::new(shm, NullDoorbell, clock, health::default_sensors());
-
-        // Init header immediately (guest driver probes before sim loop starts)
-        sim.init();
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_clone = cancel.clone();
-        std::thread::Builder::new()
-            .name("health-sim".into())
-            .spawn(move || sim.run(&cancel_clone))
-            .map_err(|e| RunnerError::ProcessFailed(format!("health-sim thread: {e}")))?;
-        self.sim_cancellers.push(cancel);
-        tracing::info!("started Rust health-sim for {vm_name}");
-        Ok(())
     }
 
     /// Start the Rust time simulator on a background thread.
@@ -448,7 +421,12 @@ impl VmRunner for QemuRunner {
             if !dev.needs_ivshmem() { continue; }
             match dev {
                 DeviceConfig::Health { .. } => {
-                    self.start_health_sim(name)?;
+                    // Heartbeat / power channels are owned by VmManager via
+                    // the DeviceTransport — nothing to start here. The
+                    // ivshmem region's host-side mmap is created by
+                    // `IvshmemTransport::open_channel` before QEMU launches,
+                    // so QEMU's `-device ivshmem-plain,memdev=...` finds the
+                    // file ready when it tries to mmap it.
                 }
                 DeviceConfig::Time { .. } => {
                     self.start_time_sim(name)?;
@@ -480,12 +458,6 @@ impl VmRunner for QemuRunner {
             name: "qemu".to_string(),
             child,
         });
-
-        // Set up health monitor if health device is configured
-        let has_health = def.devices.iter().any(|d| matches!(d, DeviceConfig::Health { .. }));
-        if has_health {
-            self.health_monitor = Some(HealthMonitor::new(name));
-        }
 
         // Start CAN bridges now that QEMU is connected to ivshmem-server
         // (we need the guest peer's eventfd for the doorbell)
@@ -550,33 +522,12 @@ impl VmRunner for QemuRunner {
             let _ = std::fs::remove_file(sock);
         }
         self.sockets.clear();
-
-        self.health_monitor = None;
     }
 
-    fn wait_ready(&mut self, handle: &VmHandle, timeout: Duration) -> Result<(), RunnerError> {
-        if let Some(ref mut monitor) = self.health_monitor {
-            let pid = handle.pid;
-            monitor.wait_ready(timeout, || {
-                pid.map(|p| unsafe { libc::kill(p as i32, 0) == 0 }).unwrap_or(false)
-            }).map_err(|e| RunnerError::ProcessFailed(e))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn graceful_shutdown(&mut self, handle: &VmHandle, timeout: Duration) -> Result<(), RunnerError> {
-        if let Some(ref monitor) = self.health_monitor {
-            if monitor.request_shutdown() {
-                let pid = handle.pid;
-                if monitor.wait_shutdown(timeout, || {
-                    pid.map(|p| unsafe { libc::kill(p as i32, 0) == 0 }).unwrap_or(false)
-                }) {
-                    return Ok(());
-                }
-            }
-        }
-        // Graceful failed or no health device — force kill
+    fn graceful_shutdown(&mut self, handle: &VmHandle, _timeout: Duration) -> Result<(), RunnerError> {
+        // Heartbeat-driven graceful shutdown is now `VmManager`'s job —
+        // it sends `PowerCommand::Shutdown` over the device transport before
+        // calling stop(). The runner just force-kills if VmManager arrives here.
         self.stop(handle)
     }
 }

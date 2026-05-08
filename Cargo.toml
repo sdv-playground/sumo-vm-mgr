@@ -13,4 +13,5 @@ members = [
     "crates/vm-devices",
     "crates/secstore",
     "crates/component-factory",
+    "crates/host-metrics",
 ]

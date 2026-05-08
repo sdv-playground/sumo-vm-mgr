@@ -169,9 +169,12 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     session: Mutex<SessionState>,
     security: Mutex<SecurityAccessState>,
     next_id: Mutex<u64>,
-    /// Optional Unix socket path for vm-service control API.
+    /// Optional TCP address ("host:port") for vm-service control API.
     /// When set, ecu_reset() POSTs to vm-service to restart the VM.
-    vm_service_socket: Option<PathBuf>,
+    /// Loopback only — same locality boundary as the prior Unix-socket
+    /// path, but TCP avoids `tokio::net::UnixListener::accept()` not
+    /// waking up reliably on QNX 7.1.
+    vm_service_addr: Option<String>,
     /// Optional images directory — when set, firmware payloads are written
     /// to {images_dir}/{set}-{bank}.img during flash. Required for real
     /// image-based OTA (e.g. QEMU rootfs swap).
@@ -187,6 +190,14 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// Optional IFS activator — when set (for BankSet::HostOs), ecu_reset()
     /// copies the IFS to the boot partition instead of symlink switching.
     ifs_activator: Option<Arc<dyn host_os_mgr::ifs::IfsActivator>>,
+    /// In-memory cache of all NV-backed DID values. Populated at startup
+    /// and updated atomically whenever NV is written (under the NV mutex
+    /// + cache write lock). Reads bypass NV entirely — eliminates the
+    /// 1-2 second per-call latency observed on QNX/eMMC during flash
+    /// when the NV mutex is contended with write operations. RwLock so
+    /// the campaign viewer's parallel-poll-of-many-DIDs runs concurrent.
+    /// Keyed by raw 16-bit DID number.
+    did_cache: std::sync::RwLock<std::collections::HashMap<u16, Vec<u8>>>,
 }
 
 impl<D: BlockDevice + Send + 'static> VmBackend<D> {
@@ -206,9 +217,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         manifest_provider: Arc<dyn ManifestProvider>,
         security_provider: Arc<dyn SecurityProvider>,
         config: ComponentConfig,
-        vm_service_socket: Option<PathBuf>,
+        vm_service_addr: Option<String>,
     ) -> Self {
-        Self::with_options(bank_set, nv, manifest_provider, security_provider, config, vm_service_socket, None)
+        Self::with_options(bank_set, nv, manifest_provider, security_provider, config, vm_service_addr, None)
     }
 
     pub fn with_options(
@@ -217,7 +228,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         manifest_provider: Arc<dyn ManifestProvider>,
         security_provider: Arc<dyn SecurityProvider>,
         config: ComponentConfig,
-        vm_service_socket: Option<PathBuf>,
+        vm_service_addr: Option<String>,
         images_dir: Option<PathBuf>,
     ) -> Self {
         let (id, name, desc) = match bank_set {
@@ -238,7 +249,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 .unwrap_or(Bank::A)
         };
 
-        Self {
+        let backend = Self {
             entity_info: EntityInfo {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -275,12 +286,20 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             session: Mutex::new(SessionState::Default),
             security: Mutex::new(SecurityAccessState::default()),
             next_id: Mutex::new(1),
-            vm_service_socket,
+            vm_service_addr,
             images_dir,
             upload_phase: Mutex::new(None),
             hsm_provider: None,
             ifs_activator: None,
+            did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
+        };
+        // Populate DID cache from NV once at construction time. After this,
+        // SOVD reads of NV-backed DIDs hit RAM only — see refresh_did_cache.
+        {
+            let nv_guard = backend.nv.lock().unwrap();
+            backend.refresh_did_cache_locked(&*nv_guard);
         }
+        backend
     }
 
     /// Override the component display name (shown in SOVD component listing).
@@ -308,6 +327,68 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         v.to_string()
     }
 
+    /// Re-read every NV-backed DID and atomically replace the in-memory
+    /// cache. Caller must already hold the NV mutex (passed as `nv`) so
+    /// the NV-read side is consistent with concurrent writers.
+    ///
+    /// **Build-then-swap**: the new cache is built WITHOUT holding the
+    /// cache lock, so concurrent readers keep hitting the old cache
+    /// during the slow per-DID NV scan. Only the final HashMap swap is
+    /// done under the cache write lock — that's a single pointer move
+    /// in `mem::replace`, microseconds. This avoids the 2-second
+    /// reader-block we had with `clear() + insert(...)` under lock.
+    ///
+    /// Health DIDs (guest_state, heartbeat_seq) are deliberately NOT
+    /// cached — they go through `query_vm_health` which is already a
+    /// fast in-memory loopback HTTP read against vm-service.
+    ///
+    /// Called from:
+    /// - `with_options` (one-shot at startup)
+    /// - automatic `NvWriteGuard::drop` after every NV write
+    /// - factory_reset (full re-population)
+    fn refresh_did_cache_locked(&self, nv: &NvStore<D>) {
+        let rb = *self.running_bank.lock().unwrap();
+
+        // Build the new map outside any cache lock — readers proceed
+        // against the old map throughout this loop.
+        let mut new_cache: std::collections::HashMap<u16, Vec<u8>> =
+            std::collections::HashMap::with_capacity(DID_REGISTRY.len());
+        for entry in DID_REGISTRY.iter() {
+            // Skip health DIDs — sourced from vm-service, not NV.
+            if entry.did == did::DID_GUEST_STATE || entry.did == did::DID_HEARTBEAT_SEQ {
+                continue;
+            }
+            if let did::DidValue::Bytes(bytes) = did::read_did(nv, self.bank_set, entry.did, Some(rb)) {
+                new_cache.insert(entry.did, bytes);
+            }
+        }
+
+        // Atomic swap — lock held for a single move, microseconds.
+        *self.did_cache.write().expect("did_cache poisoned") = new_cache;
+    }
+
+    /// Acquire the NV mutex with a write-side guard that automatically
+    /// refreshes the DID cache when the guard drops.
+    ///
+    /// **Use this for every NV write site.** Readers can keep using
+    /// `self.nv.lock()` directly — they don't need the refresh. Writers
+    /// MUST go through this so the cache stays in sync; forgetting to
+    /// refresh on a callsite would silently leave stale DID values
+    /// served via SOVD. Pushing the refresh into `Drop` makes it
+    /// impossible to forget.
+    ///
+    /// The refresh runs while the NV mutex is still held, so a reader
+    /// scheduled after the write sees the new cache atomically with
+    /// the new NV state. After the refresh, the mutex drops in the
+    /// normal way.
+    fn nv_write(&self) -> BackendResult<NvWriteGuard<'_, D>> {
+        let inner = self
+            .nv
+            .lock()
+            .map_err(|_| BackendError::Internal("nv lock poisoned".into()))?;
+        Ok(NvWriteGuard { backend: self, inner: Some(inner) })
+    }
+
     // =================================================================
     // Accessors used by component_adapter::VmBackendComponent.
     // Kept narrow on purpose — the adapter is the only outside caller.
@@ -326,7 +407,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     }
 
     pub fn has_vm_service(&self) -> bool {
-        self.vm_service_socket.is_some()
+        self.vm_service_addr.is_some()
     }
 
     pub fn has_hsm_provider(&self) -> bool {
@@ -370,6 +451,14 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         self.packages.lock().unwrap().clear();
         self.manifests.lock().unwrap().clear();
         self.payloads.lock().unwrap().clear();
+    }
+
+    /// Whether a flash session is currently in flight.
+    ///
+    /// Used by destructive ops (e.g. factory_reset) that must refuse rather
+    /// than corrupt mid-write banks.
+    pub fn flash_in_progress(&self) -> bool {
+        self.flash_session.lock().unwrap().is_some()
     }
 
     /// True if the in-flight flash session has progressed past finalize
@@ -791,10 +880,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// initiated the restart (it does NOT wait for QEMU to fully boot),
     /// so this read is bounded — the orchestrator still polls
     /// activation state separately to know when the guest is healthy.
-    async fn notify_vm_service(socket_path: &std::path::Path, vm_name: &str) -> Result<(), String> {
+    async fn notify_vm_service(addr: &str, vm_name: &str) -> Result<(), String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut stream = tokio::net::UnixStream::connect(socket_path)
+        let mut stream = tokio::net::TcpStream::connect(addr)
             .await
             .map_err(|e| format!("connect to vm-service: {e}"))?;
 
@@ -844,8 +933,8 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     ///   - we have no baseline (VM was offline pre-reset, e.g. factory
     ///     provision): `state == 1` is sufficient since there's no
     ///     stale heartbeat to confuse with.
-    fn guest_is_running(&self) -> bool {
-        let socket = match &self.vm_service_socket {
+    async fn guest_is_running(&self) -> bool {
+        let socket = match &self.vm_service_addr {
             Some(s) => s,
             None => return true,
         };
@@ -855,7 +944,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             .unwrap()
             .as_ref()
             .and_then(|t| t.verify_baseline_hb_seq);
-        match query_vm_health(socket, &self.entity_info.id) {
+        match query_vm_health(socket, &self.entity_info.id).await {
             Some(h) if h.guest_state != 1 => false,
             Some(h) => match baseline {
                 Some(b) => h.hb_seq < b,
@@ -863,6 +952,51 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             },
             None => false,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NvWriteGuard — RAII wrapper around the NV mutex for write sites.
+//
+// Holds the NV mutex for as long as the guard lives. On drop, refreshes
+// the DID cache before releasing the mutex — so callers don't have to
+// remember to call refresh_did_cache_locked at every write site, and
+// readers that wake up after the mutex drops always see a cache
+// consistent with the just-written NV state.
+//
+// Use `VmBackend::nv_write()` to acquire. Read sites should keep using
+// `self.nv.lock()` directly — they don't need the refresh, and going
+// through the guard would do useless work.
+// ---------------------------------------------------------------------------
+
+struct NvWriteGuard<'a, D: BlockDevice + Send + 'static> {
+    backend: &'a VmBackend<D>,
+    /// `Option` so `Drop` can take it via `Option::take()` and refresh
+    /// against the unwrapped guard before releasing the mutex.
+    inner: Option<std::sync::MutexGuard<'a, NvStore<D>>>,
+}
+
+impl<'a, D: BlockDevice + Send + 'static> std::ops::Deref for NvWriteGuard<'a, D> {
+    type Target = NvStore<D>;
+    fn deref(&self) -> &NvStore<D> {
+        self.inner.as_ref().expect("guard active")
+    }
+}
+
+impl<'a, D: BlockDevice + Send + 'static> std::ops::DerefMut for NvWriteGuard<'a, D> {
+    fn deref_mut(&mut self) -> &mut NvStore<D> {
+        self.inner.as_mut().expect("guard active")
+    }
+}
+
+impl<'a, D: BlockDevice + Send + 'static> Drop for NvWriteGuard<'a, D> {
+    fn drop(&mut self) {
+        if let Some(ref guard) = self.inner {
+            // Refresh while still holding the mutex — readers waking up
+            // after this point see new NV + new cache, never half-state.
+            self.backend.refresh_did_cache_locked(&**guard);
+        }
+        // `inner` drops normally → mutex released.
     }
 }
 
@@ -886,7 +1020,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
         let comp_id = &self.entity_info.id;
 
-        let has_health = self.vm_service_socket.is_some();
+        let has_health = self.vm_service_addr.is_some();
         let mut params: Vec<ParameterInfo> = DID_REGISTRY
             .iter()
             .filter(|d| has_health || (d.did != did::DID_GUEST_STATE && d.did != did::DID_HEARTBEAT_SEQ))
@@ -930,7 +1064,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn read_data(&self, param_ids: &[String]) -> BackendResult<Vec<DataValue>> {
-        let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+        // No NV mutex acquired here. Health DIDs go through query_vm_health
+        // (a fast HTTP loopback to vm-service); all other DIDs are served
+        // from the in-memory `did_cache`, populated at startup and kept in
+        // sync after every NV write. This eliminates the NV-mutex
+        // contention that turned the campaign-viewer's poll cycle into
+        // a 10-15 s blocked dance during flash on QNX/eMMC.
         let mut values = Vec::new();
 
         for param_id in param_ids {
@@ -939,8 +1078,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
             // Health DIDs — query vm-service HTTP API
             if did_num == did::DID_GUEST_STATE || did_num == did::DID_HEARTBEAT_SEQ {
-                let health = self.vm_service_socket.as_ref()
-                    .and_then(|sock| query_vm_health(sock, &self.entity_info.id));
+                let health = match self.vm_service_addr.as_ref() {
+                    Some(sock) => query_vm_health(sock, &self.entity_info.id).await,
+                    None => None,
+                };
                 let (value, raw) = match (did_num, &health) {
                     (did::DID_GUEST_STATE, Some(h)) => {
                         let s = guest_state_str(h.guest_state);
@@ -971,10 +1112,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 continue;
             }
 
-            let rb = *self.running_bank.lock().unwrap();
-            let result = did::read_did(&*nv, self.bank_set, did_num, Some(rb));
-            match result {
-                did::DidValue::Bytes(bytes) => {
+            let cached = self.did_cache.read().expect("did_cache poisoned").get(&did_num).cloned();
+            match cached {
+                Some(bytes) => {
                     let value = did_value_to_json(did_num, &bytes, reg);
                     let raw_hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
                     let name = reg.map(|r| r.name).unwrap_or(param_id.as_str());
@@ -989,7 +1129,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                         length: Some(bytes.len()),
                     });
                 }
-                did::DidValue::NotFound => {
+                None => {
                     return Err(BackendError::ParameterNotFound(param_id.clone()));
                 }
             }
@@ -1011,7 +1151,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             }
         }
 
-        let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+        let mut nv = self.nv_write()?;
         match did::write_did(&mut *nv, self.bank_set, did_num, value) {
             Ok(true) => Ok(()),
             Ok(false) => Err(BackendError::Internal("runtime DID store full".into())),
@@ -1054,7 +1194,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn clear_faults(&self, _group: Option<u32>) -> BackendResult<ClearFaultsResult> {
-        let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+        let mut nv = self.nv_write()?;
         let active = *self.running_bank.lock().unwrap();
         let mut runtime = nv.read_runtime(self.bank_set, active).unwrap_or_default();
 
@@ -1376,7 +1516,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             }
 
             // Update NV metadata (security_version, fw_version) via single-bank path
-            let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let mut nv = self.nv_write()?;
             let _result = ota::install(&mut *nv, self.bank_set, &[], &meta, true)
                 .map_err(map_ota_error)?;
 
@@ -1398,7 +1538,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
         if is_crl {
             // CRL / security-floor-only manifest — raise floor without flashing.
-            let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let mut nv = self.nv_write()?;
             let active = *self.running_bank.lock().unwrap();
             if let Some(mut fw_meta) = nv.read_fw_meta(self.bank_set, active) {
                 if meta.fw_secver > fw_meta.min_security_ver {
@@ -1409,7 +1549,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             }
         } else if is_streamed {
             // Streaming path — image already written to staged file, use pre-computed hash
-            let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let mut nv = self.nv_write()?;
             let result = ota::install_precomputed(
                 &mut *nv,
                 self.bank_set,
@@ -1478,7 +1618,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             }
         } else {
             // Buffered path — install from memory
-            let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let mut nv = self.nv_write()?;
             let result = ota::install(&mut *nv, self.bank_set, &image_data, &meta, self.config.single_bank)
                 .map_err(map_ota_error)?;
 
@@ -1615,8 +1755,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                         )
                     };
                     if let Some(meta) = meta {
-                        let mut nv = self.nv.lock()
-                            .map_err(|_| BackendError::Internal("NV lock".into()))?;
+                        let mut nv = self.nv_write()?;
                         let _ = crate::ota::install_precomputed(
                             &mut *nv,
                             self.bank_set,
@@ -1775,7 +1914,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
         if !self.config.single_bank {
             let idx = self.bank_set as usize;
-            let mut nv = self.nv.lock().unwrap();
+            let mut nv = self.nv_write()?;
             if let Some(mut state) = nv.read_boot_state() {
                 // Switch to the staged bank
                 *self.running_bank.lock().unwrap() = state.banks[idx].active_bank;
@@ -1803,11 +1942,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         let baseline_hb_seq = if self.config.single_bank {
             None
         } else {
-            self.vm_service_socket
-                .as_ref()
-                .and_then(|sock| query_vm_health(sock, &self.entity_info.id))
-                .filter(|h| h.guest_state == 1)
-                .map(|h| h.hb_seq)
+            let health = match self.vm_service_addr.as_ref() {
+                Some(sock) => query_vm_health(sock, &self.entity_info.id).await,
+                None => None,
+            };
+            health.filter(|h| h.guest_state == 1).map(|h| h.hb_seq)
         };
 
         // Advance flash state.
@@ -1861,7 +2000,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         }
 
         // Flip the `current` symlink so vm-service boots the right bank
-        if let (Some(ref images_dir), Some(ref socket_path)) = (&self.images_dir, &self.vm_service_socket) {
+        if let (Some(ref images_dir), Some(ref socket_path)) = (&self.images_dir, &self.vm_service_addr) {
             let set_name = match self.bank_set {
                 BankSet::HostOs => "host-os",
                 BankSet::Vm1 => "vm1",
@@ -1893,7 +2032,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 Ok(()) => tracing::info!("vm-service restart requested for {id}"),
                 Err(e) => tracing::warn!("failed to notify vm-service for {id}: {e}"),
             }
-        } else if let Some(ref socket_path) = self.vm_service_socket {
+        } else if let Some(ref socket_path) = self.vm_service_addr {
             // No images_dir — just restart without symlink flip
             let id = &self.entity_info.id;
             match Self::notify_vm_service(socket_path, id).await {
@@ -1936,7 +2075,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         if matches!(*self.flash_transfer.lock().unwrap(),
             Some(ref t) if t.state == FlashState::Verifying)
         {
-            if self.guest_is_running() {
+            if self.guest_is_running().await {
                 let mut ft = self.flash_transfer.lock().unwrap();
                 if let Some(ref mut t) = *ft {
                     if t.state == FlashState::Verifying {
@@ -1987,7 +2126,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn commit_flash(&self) -> BackendResult<()> {
-        let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+        let mut nv = self.nv_write()?;
         match ota::commit(&mut *nv, self.bank_set) {
             Ok(()) => {}
             Err(ota::OtaError::AlreadyCommitted) => {} // CRL or idempotent commit — OK
@@ -2004,7 +2143,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 "rollback not supported for this component".into(),
             ));
         }
-        let mut nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+        let mut nv = self.nv_write()?;
         ota::rollback(&mut *nv, self.bank_set).map_err(map_ota_error)?;
         // Clear flash transfer state after rollback
         *self.flash_transfer.lock().unwrap() = None;
@@ -2236,14 +2375,28 @@ struct GuestHealth {
     hb_seq: u32,
 }
 
-/// Query vm-service health endpoint via Unix socket.
+/// Query vm-service health endpoint via TCP loopback.
 /// Returns guest_state and hb_seq from the JSON response.
-fn query_vm_health(socket_path: &std::path::Path, vm_name: &str) -> Option<GuestHealth> {
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
+/// Query vm-service's `/vms/<name>/health` endpoint over TCP loopback.
+///
+/// **Async** intentionally: `vm-mgr` runs on the same tokio runtime as
+/// vm-service (supernova embeds both). A blocking `std::net::TcpStream`
+/// call inside an `async fn` parks an entire tokio worker for up to the
+/// 2-second read timeout, which is observable as "every other SOVD DID
+/// read takes 2s" when workers are scarce (e.g. the 2-core S32G3).
+/// Using `tokio::net::TcpStream` keeps the worker available — the await
+/// suspension lets other futures run while we wait on I/O.
+async fn query_vm_health(addr: &str, vm_name: &str) -> Option<GuestHealth> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
-    let mut stream = UnixStream::connect(socket_path).ok()?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
+    // Cap connect+read at 2 s combined. Both ends are on loopback so a
+    // healthy vm-service responds in microseconds; this timeout is a
+    // ceiling on misbehaviour.
+    let deadline = std::time::Duration::from_secs(2);
+
+    let mut stream = tokio::time::timeout(deadline, TcpStream::connect(addr))
+        .await.ok()?.ok()?;
 
     let request = format!(
         "GET /vms/{vm_name}/health HTTP/1.1\r\n\
@@ -2251,11 +2404,13 @@ fn query_vm_health(socket_path: &std::path::Path, vm_name: &str) -> Option<Guest
          Connection: close\r\n\
          \r\n"
     );
-    stream.write_all(request.as_bytes()).ok()?;
+    tokio::time::timeout(deadline, stream.write_all(request.as_bytes()))
+        .await.ok()?.ok()?;
 
-    let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).ok()?;
-    let response = std::str::from_utf8(&buf[..n]).ok()?;
+    let mut buf = Vec::with_capacity(1024);
+    tokio::time::timeout(deadline, stream.read_to_end(&mut buf))
+        .await.ok()?.ok()?;
+    let response = std::str::from_utf8(&buf).ok()?;
 
     let body = response.split("\r\n\r\n").nth(1)?;
     let json: serde_json::Value = serde_json::from_str(body).ok()?;

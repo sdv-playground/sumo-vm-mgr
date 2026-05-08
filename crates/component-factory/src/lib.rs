@@ -36,11 +36,14 @@ pub struct ComponentSpec {
     pub base_path: Option<PathBuf>,
 }
 
-/// Result of building a component — includes the Component trait object
-/// and optionally a SOVD diagnostic backend for wire-level access.
+/// Result of building a component — includes the Component trait object,
+/// optionally a SOVD diagnostic backend for wire-level access, and an
+/// optional probe that returns whether a flash session is currently
+/// in flight (used by destructive ops such as factory_reset).
 pub struct BuiltComponent {
     pub component: Arc<dyn Component>,
     pub diag_backend: Option<Arc<dyn sovd_core::DiagnosticBackend>>,
+    pub flash_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// Shared dependencies passed to the factory for all components.
@@ -48,7 +51,7 @@ pub struct FactoryDeps<D: BlockDevice> {
     pub nv: Arc<Mutex<NvStore<D>>>,
     pub manifest_provider: Arc<dyn ManifestProvider>,
     pub security_provider: Arc<dyn SecurityProvider>,
-    pub vm_service_socket: Option<PathBuf>,
+    pub vm_service_addr: Option<String>,
     pub hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
     pub hsm_keystore: Option<PathBuf>,
     pub hsm_port: u16,
@@ -102,11 +105,16 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 deps.manifest_provider.clone(),
                 deps.security_provider.clone(),
                 comp_config,
-                deps.vm_service_socket.clone(),
+                deps.vm_service_addr.clone(),
                 spec.storage_path.clone().or_else(|| spec.base_path.clone()),
             );
             let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);
             let component: Arc<dyn Component> = Arc::new(comp);
+
+            let flash_probe: Arc<dyn Fn() -> bool + Send + Sync> = {
+                let b = backend_arc.clone();
+                Arc::new(move || b.flash_in_progress())
+            };
 
             let fallback: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
             let diag = vm_mgr::diag_backend::ComponentDiagBackend::new(
@@ -117,6 +125,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             Some(BuiltComponent {
                 component,
                 diag_backend: Some(Arc::new(diag)),
+                flash_probe: Some(flash_probe),
             })
         }
         "vm" | "hpc" | "hsm" => {
@@ -135,7 +144,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 deps.manifest_provider.clone(),
                 deps.security_provider.clone(),
                 comp_config,
-                deps.vm_service_socket.clone(),
+                deps.vm_service_addr.clone(),
                 images_dir,
             );
 
@@ -162,6 +171,11 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
 
             let component: Arc<dyn Component> = Arc::new(component_inner);
 
+            let flash_probe: Arc<dyn Fn() -> bool + Send + Sync> = {
+                let b = backend_arc.clone();
+                Arc::new(move || b.flash_in_progress())
+            };
+
             let fallback: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
             let diag = vm_mgr::diag_backend::ComponentDiagBackend::new(
                 component.clone(),
@@ -171,6 +185,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             Some(BuiltComponent {
                 component,
                 diag_backend: Some(Arc::new(diag)),
+                flash_probe: Some(flash_probe),
             })
         }
         other => {

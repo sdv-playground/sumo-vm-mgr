@@ -8,11 +8,12 @@
 
 mod api;
 mod config;
-mod health;
+mod health_status;
 #[cfg(target_os = "linux")]
 mod ivshmem;
 mod manager;
 mod runner;
+mod transport_setup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,7 +66,7 @@ async fn main() {
         }
     };
 
-    let socket_path = config.socket.clone();
+    let bind_addr = config.bind.clone();
     let vm_count = config.vms.len();
 
     // Collect auto-start VM names before config is consumed
@@ -77,12 +78,16 @@ async fn main() {
         .collect();
 
     tracing::info!(
-        "loaded config: {} VMs, socket: {}",
+        "loaded config: {} VMs, bind: {}",
         vm_count,
-        socket_path.display()
+        bind_addr,
     );
 
-    let manager = Arc::new(Mutex::new(manager::VmManager::new(config)));
+    // VmManager builds the device-transport from `config.device_transport`
+    // internally. supernova-machine-manager (which embeds VmManager
+    // in-process) goes through the same constructor, so transport setup
+    // is consistent across both binaries.
+    let manager = Arc::new(Mutex::new(manager::VmManager::new(config).await));
 
     // Auto-start VMs that have auto_start: true
     if !auto_start_vms.is_empty() {
@@ -99,23 +104,15 @@ async fn main() {
 
     let app = api::router(manager);
 
-    // Clean stale socket file
-    let _ = std::fs::remove_file(&socket_path);
-
-    // Ensure parent directory exists
-    if let Some(parent) = socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let listener = match tokio::net::UnixListener::bind(&socket_path) {
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("failed to bind {}: {e}", socket_path.display());
+            tracing::error!("failed to bind {bind_addr}: {e}");
             std::process::exit(1);
         }
     };
 
-    tracing::info!("listening on {}", socket_path.display());
+    tracing::info!("listening on {bind_addr}");
 
     // Graceful shutdown on SIGTERM/SIGINT
     let shutdown = async move {
@@ -134,9 +131,6 @@ async fn main() {
 
         tracing::info!("shutting down, stopping all VMs...");
         manager_shutdown.lock().await.stop_all();
-
-        // Clean up socket
-        let _ = std::fs::remove_file(&socket_path);
     };
 
     axum::serve(listener, app)

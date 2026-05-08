@@ -10,8 +10,14 @@ pub mod regs;
 #[cfg(target_os = "linux")]
 pub mod qmp;
 
+// Heartbeat (guest → host liveness signal) and power-command (host → guest
+// shutdown/reboot/suspend) devices, both built on top of `DeviceChannel`.
+// Sensor publishing was previously here as `HealthDevice` — deleted; sensor
+// data now flows via host-side OpenTelemetry, not host↔guest shmem.
 #[cfg(feature = "health")]
-pub mod health;
+pub mod heartbeat;
+#[cfg(feature = "health")]
+pub mod power;
 
 #[cfg(feature = "time")]
 pub mod time;

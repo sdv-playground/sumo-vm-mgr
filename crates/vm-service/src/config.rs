@@ -12,12 +12,60 @@ use serde::Deserialize;
 /// Top-level service configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VmServiceConfig {
-    /// Unix socket path for the control API.
-    /// Platform-specific default: /var/run/vm-service.sock (Linux),
-    /// /dev/shmem/vm-service.sock (QNX).
-    pub socket: PathBuf,
+    /// TCP bind address for the control API (e.g. "127.0.0.1:9101").
+    /// Localhost-only by default — clients (vm-mgr inside supernova,
+    /// CLI tools on the host) reach it over loopback.
+    ///
+    /// Originally a Unix socket path (`socket: ...`); switched to TCP
+    /// after `tokio::net::UnixListener::accept()` was found not to wake
+    /// up reliably on QNX 7.1. Real-fs AF_UNIX paths still create the
+    /// socket file but no async events ever fire. TCP on loopback
+    /// avoids the issue entirely on the same locality boundary.
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    /// Host↔guest device-transport configuration. When set, vm-service
+    /// constructs the named transport at startup and `VmManager` opens
+    /// `HeartbeatDevice` + `PowerCommandDevice` channels through it for
+    /// every VM that declares a `health` device. When unset, VMs with
+    /// health devices warn at startup and have no liveness signal.
+    ///
+    /// Production qvm hosts: `kind: http, bind: 10.0.100.1:9200`.
+    /// Linux/QEMU dev: `kind: ivshmem, base_dir: /dev/shm`.
+    #[serde(default)]
+    pub device_transport: Option<DeviceTransportConfig>,
     /// VM definitions, keyed by name (e.g., "vm1", "vm2").
     pub vms: HashMap<String, VmDefinition>,
+}
+
+/// Which device-transport substrate to use for host↔guest channels.
+///
+/// One transport per vm-service instance. All VMs share it; channels are
+/// keyed by `(vm, device, channel)` so namespace collisions can't happen.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum DeviceTransportConfig {
+    /// Files at `<base_dir>/ivshmem-{vm}-{device}-{channel}`. Each is
+    /// `mmap`'d on the host by `IvshmemTransport` and exposed to the guest
+    /// via QEMU's `-device ivshmem-plain,memdev=...` (the QemuRunner adds
+    /// the `-object memory-backend-file` + `-device ivshmem-plain` pair).
+    /// Linux only.
+    Ivshmem {
+        #[serde(default = "default_ivshmem_dir")]
+        base_dir: PathBuf,
+    },
+    /// HTTP server on `bind` (e.g. `10.0.100.1:9200`). Guests reach it via
+    /// virtio-net + their host-route (typically the vp0 IP). Universal —
+    /// works under any hypervisor with a usable guest network. Use for
+    /// QNX qvm where ivshmem is not available without writing FFI.
+    Http { bind: String },
+}
+
+fn default_ivshmem_dir() -> PathBuf {
+    PathBuf::from("/dev/shm")
+}
+
+fn default_bind() -> String {
+    "127.0.0.1:9101".to_string()
 }
 
 /// Everything needed to run a single VM.
@@ -568,14 +616,14 @@ extra_cmdline: "debug"
     #[test]
     fn vm_service_config_parses_minimal_yaml() {
         let yaml = r#"
-socket: /tmp/vm-service.sock
+bind: 127.0.0.1:9999
 vms:
   vm1:
     backend: dummy
     image_dir: /var/lib/vms/vm1
 "#;
         let cfg: VmServiceConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.socket, PathBuf::from("/tmp/vm-service.sock"));
+        assert_eq!(cfg.bind, "127.0.0.1:9999");
         assert_eq!(cfg.vms.len(), 1);
         let vm1 = cfg.vms.get("vm1").unwrap();
         assert!(matches!(vm1.backend, BackendType::Dummy));
@@ -608,16 +656,53 @@ vms:
     }
 
     #[test]
-    fn vm_service_config_missing_required_field_errors() {
-        // `socket` is required
+    fn vm_service_config_parses_with_defaults_when_only_vms_present() {
+        // `bind` and `device_transport` are both optional. A minimal config
+        // is just the vms map.
         let yaml = r#"
 vms:
   vm1:
     backend: dummy
     image_dir: /x
 "#;
-        let err = serde_yaml::from_str::<VmServiceConfig>(yaml).err();
-        assert!(err.is_some(), "missing socket should fail");
+        let cfg: VmServiceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.bind, default_bind());
+        assert!(cfg.device_transport.is_none());
+        assert_eq!(cfg.vms.len(), 1);
+    }
+
+    #[test]
+    fn vm_service_config_parses_http_device_transport() {
+        let yaml = r#"
+device_transport:
+  kind: http
+  bind: 10.0.100.1:9200
+vms:
+  vm2:
+    backend: qnx
+    image_dir: /var/lib/vms/vm2
+"#;
+        let cfg: VmServiceConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg.device_transport {
+            Some(DeviceTransportConfig::Http { bind }) => assert_eq!(bind, "10.0.100.1:9200"),
+            other => panic!("expected http transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_service_config_parses_ivshmem_device_transport_with_default_dir() {
+        let yaml = r#"
+device_transport:
+  kind: ivshmem
+vms: {}
+"#;
+        let cfg: VmServiceConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg.device_transport {
+            Some(DeviceTransportConfig::Ivshmem { base_dir }) => {
+                assert_eq!(base_dir, default_ivshmem_dir());
+            }
+            other => panic!("expected ivshmem transport, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------

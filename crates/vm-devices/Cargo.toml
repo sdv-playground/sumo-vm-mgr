@@ -7,15 +7,22 @@ description = "Host-side device simulators for virtual CAN, health, and time"
 [dependencies]
 libc = "0.2"
 tracing = "0.1"
+# HTTP transport (optional — only pulled in when the http-transport feature
+# is on). Heavy-weight deps; consumers that only use shmem keep the lean tree.
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
+hyper = { version = "1", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
 
 [features]
 default = ["health", "time", "can"]
 health = []
 time = []
 can = []
-
-[[bin]]
-name = "vm-health-check"
-path = "src/bin/vm-health-check.rs"
+http-transport = ["dep:axum", "dep:tokio", "dep:hyper", "dep:serde"]
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
