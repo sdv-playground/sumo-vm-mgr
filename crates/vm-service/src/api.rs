@@ -40,9 +40,14 @@ async fn log_request(
 ) -> axum::response::Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    tracing::info!(target: "vm_service::api", %method, %uri, "vm-service request");
+    // Demoted from INFO to DEBUG — supernova polls /vms/<vm>/health for
+    // every component every second, so logging both the request and
+    // response at INFO floods supernova.log at ~16 lines/sec (≈ 14 MB/day
+    // per running VM). Errors and 4xx/5xx still show via tracing in the
+    // route handlers; this trace is only useful for development.
+    tracing::debug!(target: "vm_service::api", %method, %uri, "vm-service request");
     let resp = next.run(req).await;
-    tracing::info!(target: "vm_service::api", status = %resp.status(), "vm-service response");
+    tracing::debug!(target: "vm_service::api", status = %resp.status(), "vm-service response");
     resp
 }
 
