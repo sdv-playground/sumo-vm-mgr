@@ -1,71 +1,20 @@
 //! Power-command device — host → guest control channel.
 //!
-//! ## Wire format ownership
+//! Wire types ([`PowerCommand`], [`PowerCommandFrame`]) live in the
+//! [`vm_transport`] contract crate. This module only carries the
+//! **host-side wrapper** ([`PowerCommandDevice`]) that owns the
+//! monotonic seq counter and writes encoded frames to a `DeviceChannel`.
 //!
-//! Same pattern as `heartbeat.rs`: canonical types live in
-//! `guest-vm-spec/crates/vm-wire-format/src/power.rs`; this file holds a
-//! host-side duplicate plus the device wrapper. The `canonical_wire_bytes`
-//! fixture is pinned to match the spec — drift fails on both sides.
-//! See `heartbeat.rs` for the rationale on duplication vs. shared crate.
+//! Re-exports the wire types so existing host callers
+//! (`use vm_devices::power::PowerCommand;`) keep working.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::transport::{DeviceChannel, TransportError};
 
-/// Wire size in bytes.
-pub const POWER_WIRE_SIZE: usize = 8;
-
-/// Power command codes. Numeric values must match `vm-wire-format` in spec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum PowerCommand {
-    None = 0,
-    Shutdown = 1,
-    Reboot = 2,
-    Suspend = 3,
-    Hibernate = 4,
-    Freeze = 5,
-}
-
-impl PowerCommand {
-    fn from_u32(v: u32) -> Option<Self> {
-        match v {
-            0 => Some(Self::None),
-            1 => Some(Self::Shutdown),
-            2 => Some(Self::Reboot),
-            3 => Some(Self::Suspend),
-            4 => Some(Self::Hibernate),
-            5 => Some(Self::Freeze),
-            _ => None,
-        }
-    }
-}
-
-/// One frame on the wire — what the host published.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PowerCommandFrame {
-    pub seq: u32,
-    pub cmd: PowerCommand,
-}
-
-impl PowerCommandFrame {
-    pub fn to_bytes(&self) -> [u8; POWER_WIRE_SIZE] {
-        let mut buf = [0u8; POWER_WIRE_SIZE];
-        buf[0..4].copy_from_slice(&self.seq.to_le_bytes());
-        buf[4..8].copy_from_slice(&(self.cmd as u32).to_le_bytes());
-        buf
-    }
-
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < POWER_WIRE_SIZE {
-            return None;
-        }
-        let seq = u32::from_le_bytes(data[0..4].try_into().ok()?);
-        let cmd = PowerCommand::from_u32(u32::from_le_bytes(data[4..8].try_into().ok()?))?;
-        Some(Self { seq, cmd })
-    }
-}
+// Re-export wire types from the contract crate.
+pub use vm_transport::{PowerCommand, PowerCommandFrame, POWER_WIRE_SIZE};
 
 /// Host → guest power-command channel. Owns the monotonic next_seq.
 pub struct PowerCommandDevice {
@@ -143,18 +92,5 @@ mod tests {
         let frame = guest.read().unwrap();
         assert_eq!(frame.seq, s3);
         assert_eq!(frame.cmd, PowerCommand::Suspend);
-    }
-
-    /// Pinned canonical bytes — same fixture as
-    /// `vm-wire-format::power::tests::canonical_wire_bytes_shutdown` in spec.
-    #[test]
-    fn canonical_wire_bytes_shutdown() {
-        let frame = PowerCommandFrame { seq: 0x0000_0007, cmd: PowerCommand::Shutdown };
-        let bytes = frame.to_bytes();
-        let expected: [u8; 8] = [
-            0x07, 0x00, 0x00, 0x00, // seq
-            0x01, 0x00, 0x00, 0x00, // cmd = Shutdown
-        ];
-        assert_eq!(bytes, expected);
     }
 }

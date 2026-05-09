@@ -1,0 +1,24 @@
+[package]
+name = "vm-transport"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Cross-VM transport contract — DeviceChannel/StreamChannel traits, SharedMemory + Doorbell primitives, TransportError, and canonical wire formats (Heartbeat, PowerCommand). Consumed by both host and guest implementations."
+repository = "https://github.com/sdv-playground/sumo-machine-manager"
+
+# Pure-types crate. No I/O, no async runtime, no transport impls.
+# Transport implementations live in:
+#   - vm-devices (host wrappers + IvshmemTransport)
+#   - qnx-devices/qvm_transport.rs (host qvm-shmem, links libhyp)
+#   - guest-vm-spec/crates/{vm-guest-lib, qvm-shmem} (guest)
+#
+# The contract here is the byte-exact, byte-portable definition of
+# how host and guest agree to talk. Wire types are byte-pinned via
+# canonical_wire_bytes test fixtures.
+
+[dependencies]
+# Intentionally none. Trait methods use std types only.
+
+[lib]
+name = "vm_transport"
+path = "src/lib.rs"

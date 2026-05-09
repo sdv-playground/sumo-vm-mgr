@@ -10,6 +10,7 @@ members = [
     "crates/vm-service",
     "crates/hsm",
     "crates/vhsm-ssd",
+    "crates/vm-transport",
     "crates/vm-devices",
     "crates/secstore",
     "crates/component-factory",
