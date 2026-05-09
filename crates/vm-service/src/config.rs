@@ -42,7 +42,7 @@ pub struct VmServiceConfig {
 /// One transport per vm-service instance. All VMs share it; channels are
 /// keyed by `(vm, device, channel)` so namespace collisions can't happen.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DeviceTransportConfig {
     /// Files at `<base_dir>/ivshmem-{vm}-{device}-{channel}`. Each is
     /// `mmap`'d on the host by `IvshmemTransport` and exposed to the guest
@@ -55,13 +55,39 @@ pub enum DeviceTransportConfig {
     },
     /// HTTP server on `bind` (e.g. `10.0.100.1:9200`). Guests reach it via
     /// virtio-net + their host-route (typically the vp0 IP). Universal —
-    /// works under any hypervisor with a usable guest network. Use for
-    /// QNX qvm where ivshmem is not available without writing FFI.
+    /// works under any hypervisor with a usable guest network.
     Http { bind: String },
+    /// QNX hypervisor `vdev shmem` — zero-copy cross-VM transport via
+    /// libhyp on the host side and qvm-shmem.ko (Linux guest) or
+    /// vm-guest-pci (QNX guest). Construction lives in supernova-mm
+    /// because it links the proprietary `libhyp.a`; vm-service's
+    /// `build_device_transport` returns `None` for this variant and
+    /// expects the embedding binary to construct the transport itself
+    /// via `VmManager::with_device_transport`.
+    QvmShmem {
+        /// Pages per region (one slot per peer, 4 KiB each). Default
+        /// 16 — full GUEST_SHM_MAX_CLIENTS capacity.
+        #[serde(default = "default_qvm_region_pages")]
+        region_pages: u32,
+        /// Per-VM slot assignment. `peer_idx[vm_name] = N` makes the
+        /// guest's slot index N. Defaults to 1 for any VM not listed
+        /// (matches the common host=0 / guest=1 layout).
+        #[serde(default)]
+        peer_idx: HashMap<String, u32>,
+        /// Channel triples that should be read-only on the host side
+        /// (host doesn't write — e.g. heartbeat is guest-published).
+        /// Format: `"{vm}-{device}-{channel}"`.
+        #[serde(default)]
+        read_only_channels: Vec<String>,
+    },
 }
 
 fn default_ivshmem_dir() -> PathBuf {
     PathBuf::from("/dev/shm")
+}
+
+fn default_qvm_region_pages() -> u32 {
+    16
 }
 
 fn default_bind() -> String {

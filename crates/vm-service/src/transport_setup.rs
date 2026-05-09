@@ -69,6 +69,25 @@ pub async fn build_device_transport(
             );
             None
         }
+        Some(DeviceTransportConfig::QvmShmem { .. }) => {
+            // QvmShmemTransport links libhyp.a (proprietary QNX SDP) and
+            // therefore lives in supernova-machine-manager / qnx-devices,
+            // not here. The embedding binary detects this variant in its
+            // own startup, constructs the transport, and passes it to
+            // VmManager::with_device_transport(...) instead of going
+            // through VmManager::new() which calls into this function.
+            //
+            // Reaching this branch from VmManager::new() means the
+            // embedding binary forgot to handle qvm-shmem — log loudly
+            // and run without device transport so VMs at least start.
+            tracing::warn!(
+                "device_transport kind=qvm-shmem requires platform-specific \
+                 construction — embedding binary must call \
+                 VmManager::with_device_transport directly. Falling through \
+                 to no-transport mode (heartbeat / power channels disabled)."
+            );
+            None
+        }
         None => {
             tracing::warn!(
                 "no device_transport configured — VMs with health devices will run \
