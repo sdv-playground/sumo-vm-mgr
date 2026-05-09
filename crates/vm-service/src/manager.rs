@@ -1,11 +1,18 @@
 //! VM lifecycle manager — owns runners + per-VM device handles.
 //!
-//! `VmManager` constructs `HeartbeatDevice` + `PowerCommandDevice` at startup
-//! for every VM that declares a `health` device, by opening channels on the
-//! configured `DeviceTransport`. Runners are now thin wrappers around the
-//! VM process (qvm / qemu / dummy) — they no longer construct their own
-//! shmem regions or sensor sims. All host-side device I/O flows through
-//! `DeviceChannel`.
+//! `VmManager` opens `HeartbeatDevice` + `PowerCommandDevice` channels
+//! when a VM starts and drops them when it stops. The lifetime is tied
+//! to the VM process because the qvm-shmem transport's libhyp handles
+//! belong to a specific qvm process — when qvm restarts (e.g. after an
+//! ECU reset), the host must release its old handle and attach to the
+//! fresh region the new qvm registers. For transports whose backing
+//! state is independent of the VM process (HTTP, ivshmem files, mem),
+//! `DeviceTransport::release_vm` is a no-op so this lifecycle is
+//! cheap.
+//!
+//! Runners are thin wrappers around the VM process (qvm / qemu / dummy)
+//! — they no longer construct their own shmem regions or sensor sims.
+//! All host-side device I/O flows through `DeviceChannel`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -78,10 +85,11 @@ struct ManagedVm {
 
 pub struct VmManager {
     vms: HashMap<String, ManagedVm>,
-    /// Held so re-creation paths (restart_vm) can re-resolve channels.
-    /// Marked `dead_code`-allowed because today VmManager builds devices
-    /// once at startup; future hot-add of a VM would re-call open_channel.
-    #[allow(dead_code)]
+    /// Used by `start_vm` to (re-)open device channels and by
+    /// `finalize_stop` to release per-VM state — the qvm-shmem path
+    /// in particular needs the cached Region dropped before the next
+    /// qvm spawn, otherwise the host reads stale memory from the
+    /// previous qvm process.
     device_transport: Option<Arc<dyn DeviceTransport>>,
 }
 
@@ -178,45 +186,14 @@ impl VmManager {
                 BackendType::Dummy => Box::new(DummyRunner::new()),
             };
 
-            // Open device channels when both the VM declares a health
-            // device AND a transport is configured. Transport open_channel
-            // creates the underlying storage (file / state entry / etc.) so
-            // it must happen before the runner spawns the VM process — for
-            // ivshmem the file has to exist before QEMU mmaps it.
-            let has_health = def.devices.iter()
-                .any(|d| matches!(d, crate::config::DeviceConfig::Health { .. }));
-            let (heartbeat, power) = if has_health {
-                if let Some(ref tx) = device_transport {
-                    let hb = tx.open_channel(&name, "heartbeat", "data", HEARTBEAT_WIRE_SIZE);
-                    let pw = tx.open_channel(&name, "power", "cmd", POWER_WIRE_SIZE);
-                    match (hb, pw) {
-                        (Ok(hb_ch), Ok(pw_ch)) => (
-                            Some(HeartbeatDevice::new(hb_ch)),
-                            Some(PowerCommandDevice::new(pw_ch)),
-                        ),
-                        (hb_res, pw_res) => {
-                            if let Err(e) = hb_res { tracing::warn!("VM {name}: heartbeat channel open failed: {e}"); }
-                            if let Err(e) = pw_res { tracing::warn!("VM {name}: power channel open failed: {e}"); }
-                            (None, None)
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        "VM {name}: health device declared but no device_transport configured \
-                         — heartbeat unavailable"
-                    );
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
-
+            // Channels are opened lazily in `start_vm` so their lifetime
+            // matches the VM process — see module docs.
             vms.insert(name, ManagedVm {
                 def,
                 runner,
                 handle: None,
-                heartbeat,
-                power,
+                heartbeat: None,
+                power: None,
                 liveness: HeartbeatLiveness::new(),
             });
         }
@@ -240,6 +217,16 @@ impl VmManager {
             vm.handle = None;
         }
 
+        // Defense in depth: drop any device channels left from a previous
+        // qvm process. finalize_stop is the canonical release path, but
+        // covering this here protects against asymmetric stop paths
+        // (process crashed, started without going through stop_vm).
+        vm.heartbeat = None;
+        vm.power = None;
+        if let Some(ref tx) = self.device_transport {
+            tx.release_vm(name);
+        }
+
         // Reset liveness so a stale-from-prior-boot reading doesn't carry over.
         vm.liveness = HeartbeatLiveness::new();
 
@@ -260,6 +247,37 @@ impl VmManager {
                 return Err(ManagerError::Runner(
                     crate::runner::RunnerError::Config(format!("kernel not found: {}", kernel.display()))
                 ));
+            }
+        }
+
+        // Open device channels for the new VM lifetime. This must happen
+        // BEFORE runner.start spawns qvm — qvm-shmem regions are
+        // host-registered (via libhyp factory) and qvm attaches to the
+        // existing region by name. For ivshmem-file transports the file
+        // must exist before QEMU mmaps it. Both are satisfied by opening
+        // here.
+        let has_health = effective_def.devices.iter()
+            .any(|d| matches!(d, crate::config::DeviceConfig::Health { .. }));
+        if has_health {
+            if let Some(ref tx) = self.device_transport {
+                match (
+                    tx.open_channel(name, "heartbeat", "data", HEARTBEAT_WIRE_SIZE),
+                    tx.open_channel(name, "power", "cmd", POWER_WIRE_SIZE),
+                ) {
+                    (Ok(hb_ch), Ok(pw_ch)) => {
+                        vm.heartbeat = Some(HeartbeatDevice::new(hb_ch));
+                        vm.power = Some(PowerCommandDevice::new(pw_ch));
+                    }
+                    (hb_res, pw_res) => {
+                        if let Err(e) = hb_res { tracing::warn!("VM {name}: heartbeat channel open failed: {e}"); }
+                        if let Err(e) = pw_res { tracing::warn!("VM {name}: power channel open failed: {e}"); }
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "VM {name}: health device declared but no device_transport configured \
+                     — heartbeat unavailable"
+                );
             }
         }
 
@@ -313,6 +331,18 @@ impl VmManager {
             }
             vm.runner.cleanup();
             vm.handle = None;
+
+            // Drop the device channels — the VM process is gone, so any
+            // libhyp Region handles bound to it are stale. Order matters:
+            // ManagedVm holds Arcs, so its references must drop before
+            // the transport's `release_vm` for the underlying Region to
+            // fully release. Both clears are needed.
+            vm.heartbeat = None;
+            vm.power = None;
+            if let Some(ref tx) = self.device_transport {
+                tx.release_vm(name);
+            }
+
             tracing::info!("stopped VM {name}");
         }
     }

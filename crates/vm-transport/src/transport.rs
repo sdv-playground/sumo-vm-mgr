@@ -147,6 +147,17 @@ pub trait DeviceTransport: Send + Sync {
             "this transport does not provide stream-shaped channels",
         ))
     }
+
+    /// Release any cached per-VM state (regions, channels). Called by
+    /// VmManager around `start_vm` / `finalize_stop` for transports
+    /// whose substrate is bound to the VM process lifetime — qvm vdev
+    /// shmem regions live and die with the qvm process, so the host
+    /// must drop its handle before the next qvm spawn or it ends up
+    /// reading stale memory from the dead process.
+    ///
+    /// Default is a no-op for transports whose state is independent of
+    /// VM lifecycle (HTTP, in-memory, ivshmem files).
+    fn release_vm(&self, _vm: &str) {}
 }
 
 /// A region of shared memory accessible by both host and guest.

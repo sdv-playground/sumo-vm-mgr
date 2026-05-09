@@ -880,7 +880,13 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// initiated the restart (it does NOT wait for QEMU to fully boot),
     /// so this read is bounded — the orchestrator still polls
     /// activation state separately to know when the guest is healthy.
-    async fn notify_vm_service(addr: &str, vm_name: &str) -> Result<(), String> {
+    ///
+    /// `action` is the URL verb: "restart" when the VM was already running
+    /// (graceful PowerCommand::Shutdown → start), or "start" when the VM
+    /// was offline pre-reset (factory provision, post-crash) so callers
+    /// don't pay for a phantom shutdown step and the GUI doesn't display
+    /// a misleading "Shutting Down vm2" tile for a guest that never ran.
+    async fn notify_vm_service(addr: &str, vm_name: &str, action: &str) -> Result<(), String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut stream = tokio::net::TcpStream::connect(addr)
@@ -888,7 +894,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             .map_err(|e| format!("connect to vm-service: {e}"))?;
 
         let request = format!(
-            "POST /vms/{vm_name}/restart HTTP/1.1\r\n\
+            "POST /vms/{vm_name}/{action} HTTP/1.1\r\n\
              Host: localhost\r\n\
              Content-Length: 0\r\n\
              Connection: close\r\n\
@@ -1999,6 +2005,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             return Ok(None);
         }
 
+        // Pick "restart" vs "start" based on whether the guest was actually
+        // running pre-reset. The baseline_hb_seq probe above already told us
+        // (Some = guest_state==1 = running). For an offline guest (factory
+        // provision, post-crash) the shutdown step is a phantom — vm-service
+        // would handle it (NotRunning → fall through to start_vm) but the
+        // orchestrator-/GUI-visible intent should be "start", not "restart",
+        // so the cluster tile doesn't display "Shutting Down" for a guest
+        // that never ran.
+        let action = if baseline_hb_seq.is_some() { "restart" } else { "start" };
+
         // Flip the `current` symlink so vm-service boots the right bank
         if let (Some(ref images_dir), Some(ref socket_path)) = (&self.images_dir, &self.vm_service_addr) {
             let set_name = match self.bank_set {
@@ -2026,17 +2042,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 tracing::info!("flipped {set_name}/current -> {bank_dir_name}");
             }
 
-            // Signal vm-service to restart the VM
             let id = &self.entity_info.id;
-            match Self::notify_vm_service(socket_path, id).await {
-                Ok(()) => tracing::info!("vm-service restart requested for {id}"),
+            match Self::notify_vm_service(socket_path, id, action).await {
+                Ok(()) => tracing::info!("vm-service {action} requested for {id}"),
                 Err(e) => tracing::warn!("failed to notify vm-service for {id}: {e}"),
             }
         } else if let Some(ref socket_path) = self.vm_service_addr {
-            // No images_dir — just restart without symlink flip
+            // No images_dir — just notify without symlink flip
             let id = &self.entity_info.id;
-            match Self::notify_vm_service(socket_path, id).await {
-                Ok(()) => tracing::info!("vm-service restart requested for {id}"),
+            match Self::notify_vm_service(socket_path, id, action).await {
+                Ok(()) => tracing::info!("vm-service {action} requested for {id}"),
                 Err(e) => tracing::warn!("failed to notify vm-service for {id}: {e}"),
             }
         }

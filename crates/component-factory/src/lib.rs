@@ -37,13 +37,16 @@ pub struct ComponentSpec {
 }
 
 /// Result of building a component — includes the Component trait object,
-/// optionally a SOVD diagnostic backend for wire-level access, and an
+/// optionally a SOVD diagnostic backend for wire-level access, an
 /// optional probe that returns whether a flash session is currently
-/// in flight (used by destructive ops such as factory_reset).
+/// in flight (used by destructive ops such as factory_reset), and an
+/// optional callback to drop any in-flight flash session state
+/// (used by factory_reset before wiping banks).
 pub struct BuiltComponent {
     pub component: Arc<dyn Component>,
     pub diag_backend: Option<Arc<dyn sovd_core::DiagnosticBackend>>,
     pub flash_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    pub flash_clear: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Shared dependencies passed to the factory for all components.
@@ -115,6 +118,10 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 let b = backend_arc.clone();
                 Arc::new(move || b.flash_in_progress())
             };
+            let flash_clear: Arc<dyn Fn() + Send + Sync> = {
+                let b = backend_arc.clone();
+                Arc::new(move || b.clear_flash_session())
+            };
 
             let fallback: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
             let diag = vm_mgr::diag_backend::ComponentDiagBackend::new(
@@ -126,6 +133,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 component,
                 diag_backend: Some(Arc::new(diag)),
                 flash_probe: Some(flash_probe),
+                flash_clear: Some(flash_clear),
             })
         }
         "vm" | "hpc" | "hsm" => {
@@ -175,6 +183,10 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 let b = backend_arc.clone();
                 Arc::new(move || b.flash_in_progress())
             };
+            let flash_clear: Arc<dyn Fn() + Send + Sync> = {
+                let b = backend_arc.clone();
+                Arc::new(move || b.clear_flash_session())
+            };
 
             let fallback: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
             let diag = vm_mgr::diag_backend::ComponentDiagBackend::new(
@@ -186,6 +198,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 component,
                 diag_backend: Some(Arc::new(diag)),
                 flash_probe: Some(flash_probe),
+                flash_clear: Some(flash_clear),
             })
         }
         other => {

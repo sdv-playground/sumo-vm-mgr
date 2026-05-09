@@ -74,12 +74,27 @@ async fn start_vm(
     State(mgr): State<SharedManager>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    // Run the blocking runner operation in a blocking task
-    let mut mgr = mgr.lock().await;
-    match mgr.start_vm(&name) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
-        Err(e) => error_response(e),
-    }
+    // Defer the actual start to a background task and return 200 immediately —
+    // mirrors restart_vm's contract. start_vm internally blocks on
+    // devb-loopback wait (host kernel must register the rootfs.img loopback
+    // before qvm boots), which can take seconds; running it under the
+    // manager lock would block /vms/{name}/health and stall the
+    // orchestrator's activation poll.
+    let mgr_clone = mgr.clone();
+    let name_clone = name.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            let mut mgr = rt.block_on(mgr_clone.lock());
+            mgr.start_vm(&name_clone)
+        }).await;
+        match result {
+            Ok(Ok(()))  => tracing::info!(vm = %name, "start_vm: VM started in background"),
+            Ok(Err(e))  => tracing::error!(vm = %name, error = %e, "start_vm: background start failed"),
+            Err(e)      => tracing::error!(vm = %name, error = %e, "start_vm: background task panicked"),
+        }
+    });
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "queued": true})))
 }
 
 async fn stop_vm(
