@@ -38,6 +38,7 @@
 
 pub mod heartbeat;
 pub mod power;
+pub mod time;
 pub mod transport;
 
 pub use heartbeat::{
@@ -45,6 +46,12 @@ pub use heartbeat::{
     HEARTBEAT_WIRE_SIZE,
 };
 pub use power::{PowerCommand, PowerCommandFrame, POWER_WIRE_SIZE};
+pub use time::{
+    SyncQuality, SyncSource, VtimeCmd, VtimeRegs, VTIME_CMD_ADJUST, VTIME_CMD_OFFSET,
+    VTIME_CMD_SIZE, VTIME_FLAG_RTC_PRESENT, VTIME_FLAG_SYNC_VALID, VTIME_MAGIC, VTIME_REGS_SIZE,
+    VTIME_STATUS_APPLIED, VTIME_STATUS_PENDING, VTIME_STATUS_RATE_LIMITED, VTIME_STATUS_REJECTED,
+    VTIME_STATUS_UNAUTHORIZED, VTIME_VERSION, VTIME_WIRE_SIZE,
+};
 pub use transport::{
     seqcount_write, DeviceChannel, DeviceTransport, Doorbell, SharedMemory, StreamChannel,
     TransportError,

@@ -90,16 +90,51 @@ pub mod health {
     pub const CMD_FREEZE: u32 = 5;
 }
 
-/// Time device registers (vtime_regs.h).
+/// Time device registers — byte offsets for SharedMemory/MMIO access.
+///
+/// Wire-format constants (magic, version, source/quality enum values,
+/// flags, opcodes, statuses) and the VtimeRegs/VtimeCmd structs live in
+/// `vm_transport::time` — single source of truth shared with the guest.
+/// This module only carries the byte offsets that are an artefact of the
+/// MMIO-style layout (TimeSim writes register-by-register through a
+/// SharedMemory implementation; offsets matter there but not in the
+/// byte-stream TimeDevice path which encodes the whole struct at once).
 pub mod time {
-    pub const MAGIC: u32 = 0x54494D45;  // "TIME"
-    pub const VERSION: u32 = 1;
+    // Re-export wire-format constants and types so existing callsites
+    // that did `use crate::regs::time as r;` continue working.
+    pub use vm_transport::{
+        SyncQuality, SyncSource, VtimeCmd, VtimeRegs, VTIME_CMD_ADJUST as CMD_ADJUST,
+        VTIME_FLAG_RTC_PRESENT as FLAG_RTC_PRESENT,
+        VTIME_FLAG_SYNC_VALID as FLAG_SYNC_VALID, VTIME_MAGIC as MAGIC,
+        VTIME_STATUS_APPLIED as STATUS_APPLIED, VTIME_STATUS_PENDING as STATUS_PENDING,
+        VTIME_STATUS_RATE_LIMITED as STATUS_RATE_LIMITED,
+        VTIME_STATUS_REJECTED as STATUS_REJECTED,
+        VTIME_STATUS_UNAUTHORIZED as STATUS_UNAUTHORIZED, VTIME_VERSION as VERSION,
+        VTIME_WIRE_SIZE as REGION_SIZE,
+    };
 
-    // Time registers (64 bytes @ 0x00, host writes)
+    // Sync source codes — kept as u32 aliases for SharedMemory write_u32
+    // call sites in TimeSim.
+    pub const SRC_NONE: u32 = SyncSource::None as u32;
+    pub const SRC_NTP: u32 = SyncSource::Ntp as u32;
+    pub const SRC_SNTP: u32 = SyncSource::Sntp as u32;
+    pub const SRC_GPTP: u32 = SyncSource::Gptp as u32;
+    pub const SRC_ROUGHTIME: u32 = SyncSource::Roughtime as u32;
+    pub const SRC_GPS: u32 = SyncSource::Gps as u32;
+    pub const SRC_CELLULAR: u32 = SyncSource::Cellular as u32;
+    pub const SRC_CAN_TIME: u32 = SyncSource::CanTime as u32;
+    pub const SRC_RTC: u32 = SyncSource::Rtc as u32;
+
+    pub const QUALITY_UNKNOWN: u32 = SyncQuality::Unknown as u32;
+    pub const QUALITY_COARSE: u32 = SyncQuality::Coarse as u32;
+    pub const QUALITY_MEDIUM: u32 = SyncQuality::Medium as u32;
+    pub const QUALITY_FINE: u32 = SyncQuality::Fine as u32;
+
+    // ---- Byte offsets (host-write half, 0x00..0x40) ----
     pub const OFF_MAGIC: usize = 0x00;
     pub const OFF_VERSION: usize = 0x04;
     pub const OFF_MONO_NS: usize = 0x08;
-    pub const OFF_WALL_OFFSET_NS: usize = 0x10;    // i64
+    pub const OFF_WALL_OFFSET_NS: usize = 0x10; // i64
     pub const OFF_LAST_SYNC_MONO_NS: usize = 0x18;
     pub const OFF_SYNC_SOURCE: usize = 0x20;
     pub const OFF_SYNC_QUALITY: usize = 0x24;
@@ -107,49 +142,15 @@ pub mod time {
     pub const OFF_FLAGS: usize = 0x30;
     pub const OFF_UPDATE_SEQ: usize = 0x34;
 
-    // Command region (64 bytes @ 0x40, guest writes)
+    // ---- Byte offsets (cmd region, 0x40..0x80, guest writes) ----
     pub const CMD_BASE: usize = 0x40;
     pub const CMD_OFF_SEQ: usize = CMD_BASE;
-    pub const CMD_OFF_OP: usize = CMD_BASE + 0x04;   // u8
-    pub const CMD_OFF_CORRECTION_NS: usize = CMD_BASE + 0x08;  // i64
+    pub const CMD_OFF_OP: usize = CMD_BASE + 0x04; // u8 in low byte of u32
+    pub const CMD_OFF_CORRECTION_NS: usize = CMD_BASE + 0x08; // i64
     pub const CMD_OFF_SYNC_SOURCE: usize = CMD_BASE + 0x10;
     pub const CMD_OFF_SYNC_QUALITY: usize = CMD_BASE + 0x14;
     pub const CMD_OFF_STATUS: usize = CMD_BASE + 0x18;
     pub const CMD_OFF_GUEST_ID: usize = CMD_BASE + 0x1C;
-
-    // Total size
-    pub const REGION_SIZE: usize = 128;
-
-    // Flags
-    pub const FLAG_SYNC_VALID: u32 = 1 << 0;
-    pub const FLAG_RTC_PRESENT: u32 = 1 << 1;
-
-    // Sync sources
-    pub const SRC_NONE: u32 = 0x00;
-    pub const SRC_NTP: u32 = 0x01;
-    pub const SRC_SNTP: u32 = 0x02;
-    pub const SRC_GPTP: u32 = 0x03;
-    pub const SRC_ROUGHTIME: u32 = 0x04;
-    pub const SRC_GPS: u32 = 0x05;
-    pub const SRC_CELLULAR: u32 = 0x06;
-    pub const SRC_CAN_TIME: u32 = 0x07;
-    pub const SRC_RTC: u32 = 0x08;
-
-    // Quality
-    pub const QUALITY_UNKNOWN: u32 = 0x00;
-    pub const QUALITY_COARSE: u32 = 0x01;  // > 1s
-    pub const QUALITY_MEDIUM: u32 = 0x02;  // 1ms - 1s
-    pub const QUALITY_FINE: u32 = 0x03;    // < 1ms
-
-    // Commands
-    pub const CMD_ADJUST: u8 = 0x01;
-
-    // Command status
-    pub const STATUS_PENDING: u32 = 0x00;
-    pub const STATUS_APPLIED: u32 = 0x01;
-    pub const STATUS_REJECTED: u32 = 0x02;
-    pub const STATUS_UNAUTHORIZED: u32 = 0x03;
-    pub const STATUS_RATE_LIMITED: u32 = 0x04;
 }
 
 /// CAN SPSC ring buffer protocol.

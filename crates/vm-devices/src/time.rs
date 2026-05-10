@@ -248,29 +248,33 @@ fn writer_loop(
     interval: Duration,
     cancel: Arc<AtomicBool>,
 ) {
+    use vm_transport::{SyncQuality, SyncSource, VtimeRegs, VTIME_WIRE_SIZE};
+
     let mut update_seq: u32 = 0;
 
     while !cancel.load(Ordering::Relaxed) {
         update_seq = update_seq.wrapping_add(2); // always even
 
-        let mut buf = [0u8; r::REGION_SIZE];
-        let mono_ns = clock.now_mono_ns();
-        let wall_off = clock.wall_offset_ns();
+        let regs = VtimeRegs {
+            mono_ns: clock.now_mono_ns(),
+            wall_offset_ns: clock.wall_offset_ns(),
+            // last_sync_mono_ns / sync_source / sync_quality / min_wall_ns
+            // stay at defaults until TIME_ADJUST handling fills them in
+            // (separate channel; sync-guest follow-up).
+            last_sync_mono_ns: 0,
+            sync_source: SyncSource::None,
+            sync_quality: SyncQuality::Unknown,
+            min_wall_ns: 0,
+            flags: 0,
+            update_seq,
+        };
 
-        // Host-write half (offsets 0x00..0x40)
-        write_u32(&mut buf, r::OFF_MAGIC, r::MAGIC);
-        write_u32(&mut buf, r::OFF_VERSION, r::VERSION);
-        write_u64(&mut buf, r::OFF_MONO_NS, mono_ns);
-        write_i64(&mut buf, r::OFF_WALL_OFFSET_NS, wall_off);
-        // last_sync_mono_ns / sync_source / sync_quality / min_wall_ns /
-        // flags stay zero — populated by TIME_ADJUST handling once the
-        // sync-guest path lands.
-        write_u32(&mut buf, r::OFF_UPDATE_SEQ, update_seq);
-
-        // Cmd half (offsets 0x40..0x80) is zero — guest doesn't write
-        // anything yet, so leave it untouched. Host doesn't read it
-        // either. When TIME_ADJUST arrives, this region will need a
-        // separate channel (host can't write to a slot the guest owns).
+        // Build the full 128-byte region: regs half (host-written) +
+        // cmd half (guest-written, untouched here). The cmd half stays
+        // zero — when TIME_ADJUST handling lands it'll need its own
+        // channel because qvm-shmem slots are single-owner.
+        let mut buf = [0u8; VTIME_WIRE_SIZE];
+        buf[..r::REGION_SIZE / 2].copy_from_slice(&regs.to_regs_bytes());
 
         if let Err(e) = channel.write(&buf) {
             tracing::warn!("vtime write failed: {e}");
@@ -279,16 +283,6 @@ fn writer_loop(
 
         thread::sleep(interval);
     }
-}
-
-fn write_u32(buf: &mut [u8], off: usize, v: u32) {
-    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-}
-fn write_u64(buf: &mut [u8], off: usize, v: u64) {
-    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
-}
-fn write_i64(buf: &mut [u8], off: usize, v: i64) {
-    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
 #[cfg(test)]
