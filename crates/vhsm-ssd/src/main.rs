@@ -26,7 +26,7 @@ use vhsm_ssd::transport::TcpListener;
 
 use secstore::{FileBackend, KeyMetadata, LinuxSimEncryptor, Secstore};
 
-const DEFAULT_LISTEN: &str = "192.168.99.1:5100";
+const DEFAULT_LISTEN: &str = "10.0.200.1:5100";
 
 fn main() {
     tracing_subscriber::fmt()

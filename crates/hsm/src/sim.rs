@@ -28,6 +28,7 @@
 /// ```
 
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
@@ -39,21 +40,49 @@ pub struct SimHsm {
     daemon_bin: PathBuf,
     /// Keystore directory (e.g. /tmp/vhsm-keys).
     keystore_path: PathBuf,
-    /// TCP port the daemon listens on (always bound to 127.0.0.1 in test mode).
+    /// TCP listen address. Defaults to `127.0.0.1` for tests/dev; in
+    /// production on the CVC host this is the host-side IP of the
+    /// vp2 vdevpeer (e.g. `10.0.200.1`) so the daemon is reachable
+    /// from the guest via the private vHSM link AND from on-host
+    /// software through the same interface, but NOT from any
+    /// externally routed network (vp2 isn't NAT'd / forwarded).
+    bind_ip: IpAddr,
+    /// TCP port the daemon listens on.
     tcp_port: u16,
     /// Running daemon process handle.
     child: Option<Child>,
 }
 
 impl SimHsm {
+    /// Construct with the default `127.0.0.1` bind — suitable for
+    /// tests and dev workstations where the daemon and clients all
+    /// run in the same network namespace.
     pub fn new(
         daemon_bin: PathBuf,
         keystore_path: PathBuf,
         tcp_port: u16,
     ) -> Self {
+        Self::with_bind(
+            daemon_bin,
+            keystore_path,
+            "127.0.0.1".parse().expect("loopback parse"),
+            tcp_port,
+        )
+    }
+
+    /// Construct with an explicit bind IP — used by supernova in
+    /// production to bind to the host-side vp2 endpoint (e.g.
+    /// `10.0.200.1`).
+    pub fn with_bind(
+        daemon_bin: PathBuf,
+        keystore_path: PathBuf,
+        bind_ip: IpAddr,
+        tcp_port: u16,
+    ) -> Self {
         Self {
             daemon_bin,
             keystore_path,
+            bind_ip,
             tcp_port,
             child: None,
         }
@@ -556,16 +585,38 @@ impl HsmProvider for SimHsm {
             "starting vhsm-test-ssd"
         );
 
-        // Test mode: bind 127.0.0.1, allow that source IP as a generic
-        // test VM identity. Production uses a policy file via --policy.
-        let listen = format!("127.0.0.1:{}", self.tcp_port);
+        // Bind on `self.bind_ip` (default 127.0.0.1; production = host
+        // vp2 endpoint such as 10.0.200.1). The matching peer IP is
+        // bind_ip with the lower nibble flipped — guests live on
+        // host_ip + 1 in the /30 vp2 subnets — so allow that source.
+        let listen = format!("{}:{}", self.bind_ip, self.tcp_port);
+        let allow_peer = match self.bind_ip {
+            IpAddr::V4(v4) => {
+                // /30: host=.1, guest=.2 (or any +1 offset). Use the
+                // host's own IP for the test/loopback case.
+                let octets = v4.octets();
+                let peer = if v4.is_loopback() {
+                    "127.0.0.1=test-vm".to_string()
+                } else {
+                    let guest = std::net::Ipv4Addr::new(
+                        octets[0],
+                        octets[1],
+                        octets[2],
+                        octets[3].wrapping_add(1),
+                    );
+                    format!("{guest}=vm-guest")
+                };
+                peer
+            }
+            IpAddr::V6(_) => format!("{}=local", self.bind_ip),
+        };
         let child = Command::new(&self.daemon_bin)
             .arg("--keystore")
             .arg(&self.keystore_path)
             .arg("--listen")
             .arg(&listen)
             .arg("--allow-ip")
-            .arg("127.0.0.1=test-vm")
+            .arg(&allow_peer)
             .spawn()
             .map_err(|e| HsmError::ProcessError(format!("spawn vhsm-test-ssd: {e}")))?;
 
