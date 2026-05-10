@@ -18,8 +18,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use vm_devices::clock::{system::SystemClock, Clock};
 use vm_devices::heartbeat::{GuestState, HeartbeatDevice, HEARTBEAT_WIRE_SIZE};
 use vm_devices::power::{PowerCommand, PowerCommandDevice, POWER_WIRE_SIZE};
+use vm_devices::regs::time as vtime_regs;
+use vm_devices::time::{TimeDevice, TIME_DEFAULT_INTERVAL};
 use vm_devices::transport::DeviceTransport;
 
 use crate::config::{BackendType, VmBankConfig, VmDefinition, VmServiceConfig};
@@ -79,6 +82,10 @@ struct ManagedVm {
     /// Host → guest power command sender (shutdown / reboot / suspend).
     /// Same condition as `heartbeat`.
     power: Option<PowerCommandDevice>,
+    /// Host → guest time-register publisher. Holds a background writer
+    /// thread; dropped when the VM stops. `None` when no transport is
+    /// configured or VM has no `time` device.
+    time: Option<TimeDevice>,
     /// Liveness state for the heartbeat seq counter.
     liveness: HeartbeatLiveness,
 }
@@ -91,6 +98,11 @@ pub struct VmManager {
     /// qvm spawn, otherwise the host reads stale memory from the
     /// previous qvm process.
     device_transport: Option<Arc<dyn DeviceTransport>>,
+    /// Time source published into per-VM TimeDevice channels. Defaults to
+    /// `SystemClock` (host CLOCK_MONOTONIC + CLOCK_REALTIME). Override
+    /// via `with_clock` — supernova selects gPTP / simulation per its
+    /// startup config.
+    clock_source: Arc<dyn Clock>,
 }
 
 /// Returned by `initiate_stop` — carries enough info to wait for exit
@@ -194,11 +206,24 @@ impl VmManager {
                 handle: None,
                 heartbeat: None,
                 power: None,
+                time: None,
                 liveness: HeartbeatLiveness::new(),
             });
         }
 
-        Self { vms, device_transport }
+        Self {
+            vms,
+            device_transport,
+            clock_source: Arc::new(SystemClock::new()),
+        }
+    }
+
+    /// Override the clock source used when publishing vtime registers.
+    /// Default is `SystemClock`. Supernova calls this with `GptpClock`
+    /// or `SimulationClock` based on its startup `time:` config.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock_source = clock;
+        self
     }
 
     pub fn start_vm(&mut self, name: &str) -> Result<(), ManagerError> {
@@ -223,6 +248,7 @@ impl VmManager {
         // (process crashed, started without going through stop_vm).
         vm.heartbeat = None;
         vm.power = None;
+        vm.time = None; // Drop signals the writer thread to exit on next tick.
         if let Some(ref tx) = self.device_transport {
             tx.release_vm(name);
         }
@@ -277,6 +303,36 @@ impl VmManager {
                 tracing::warn!(
                     "VM {name}: health device declared but no device_transport configured \
                      — heartbeat unavailable"
+                );
+            }
+        }
+
+        // Time device — host periodically writes vtime registers into a
+        // shared region; guest's vtime driver reads them and disciplines
+        // local CLOCK_REALTIME. Single channel for the host-write half;
+        // TIME_ADJUST from a sync guest is a follow-up that needs its own
+        // channel (the cmd region is owned by a different shmem slot).
+        let has_time = effective_def.devices.iter()
+            .any(|d| matches!(d, crate::config::DeviceConfig::Time { .. }));
+        if has_time {
+            if let Some(ref tx) = self.device_transport {
+                match tx.open_channel(name, "time", "regs", vtime_regs::REGION_SIZE) {
+                    Ok(ch) => {
+                        vm.time = Some(TimeDevice::new(
+                            ch,
+                            self.clock_source.clone(),
+                            TIME_DEFAULT_INTERVAL,
+                        ));
+                        tracing::info!("VM {name}: vtime publisher started");
+                    }
+                    Err(e) => {
+                        tracing::warn!("VM {name}: time channel open failed: {e}");
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "VM {name}: time device declared but no device_transport configured \
+                     — vtime unavailable"
                 );
             }
         }
@@ -336,9 +392,10 @@ impl VmManager {
             // libhyp Region handles bound to it are stale. Order matters:
             // ManagedVm holds Arcs, so its references must drop before
             // the transport's `release_vm` for the underlying Region to
-            // fully release. Both clears are needed.
+            // fully release. All three clears are needed.
             vm.heartbeat = None;
             vm.power = None;
+            vm.time = None; // Drop signals the writer thread to exit on next tick.
             if let Some(ref tx) = self.device_transport {
                 tx.release_vm(name);
             }

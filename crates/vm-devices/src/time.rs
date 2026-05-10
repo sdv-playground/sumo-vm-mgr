@@ -1,16 +1,30 @@
-//! Time device simulator.
+//! Time device — host writes vtime registers to a shared region; guests
+//! read them and discipline their local CLOCK_REALTIME.
 //!
-//! Updates shared memory time registers at a configurable interval (default 10 Hz)
-//! using the seqcount protocol, and handles TIME_ADJUST commands from the guest.
+//! Two flavors live in this file:
+//!
+//! - [`TimeSim`] — uses the low-level [`SharedMemory`] + [`Doorbell`]
+//!   abstractions for direct register access. Requires a transport that
+//!   exposes raw memory (ivshmem on Linux). Includes full TIME_ADJUST
+//!   command handling (auth, rate limit, anti-rollback, etc.) and is
+//!   well unit-tested.
+//!
+//! - [`TimeDevice`] — uses the higher-level byte-stream [`DeviceChannel`]
+//!   API. Periodic writer task; each tick assembles the full 128-byte
+//!   region and writes it through the channel. No TIME_ADJUST handling
+//!   yet — the guest is read-only in this iteration. Used on QNX with
+//!   the qvm-shmem transport, where channels are byte-level not
+//!   register-level.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use std::sync::Arc;
+use std::thread;
 
 use crate::clock::Clock;
 use crate::regs::time as r;
-use crate::transport::{seqcount_write, Doorbell, SharedMemory};
+use crate::transport::{seqcount_write, DeviceChannel, Doorbell, SharedMemory};
 
 /// Time device simulator.
 pub struct TimeSim<S: SharedMemory, D: Doorbell, C: Clock> {
@@ -166,6 +180,115 @@ impl<S: SharedMemory, D: Doorbell, C: Clock> TimeSim<S, D, C> {
         self.update_time();
         let _ = self.doorbell.notify();
     }
+}
+
+// =============================================================================
+// TimeDevice — DeviceChannel-based variant for byte-stream transports
+// =============================================================================
+
+/// Default writer interval (10 Hz). Most guest discipline loops sample at
+/// 1–10 Hz, so this gives them a fresh value every poll.
+pub const TIME_DEFAULT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Host-side TimeDevice for byte-stream transports (qvm-shmem, http, etc.).
+///
+/// On construction, spawns a background thread that periodically:
+///   1. Reads `mono_ns` and `wall_offset_ns` from the configured [`Clock`].
+///   2. Assembles a full 128-byte vtime region buffer.
+///   3. Writes it through the [`DeviceChannel`].
+///
+/// `update_seq` advances by 2 each tick (always even). The writer never
+/// publishes an odd value, so a guest reader that samples seq before and
+/// after reading data fields will only see a "torn" read if the underlying
+/// transport delivers a mid-flight buffer — which the qvm-shmem channel
+/// API does not (each `write()` lands as a unit). When/if a SharedMemory-
+/// capable transport lands, the proper odd/even seqcount protocol can be
+/// reinstated via `TimeSim` instead.
+///
+/// Drop aborts the writer thread on the next tick (cooperative cancel).
+pub struct TimeDevice {
+    cancel: Arc<AtomicBool>,
+    _writer: thread::JoinHandle<()>,
+}
+
+impl TimeDevice {
+    /// Construct and start the periodic writer. `interval` is wall time
+    /// between writes; `TIME_DEFAULT_INTERVAL` is a sensible default.
+    pub fn new(
+        channel: Arc<dyn DeviceChannel>,
+        clock: Arc<dyn Clock>,
+        interval: Duration,
+    ) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        let writer = thread::Builder::new()
+            .name("vtime-writer".into())
+            .spawn(move || writer_loop(channel, clock, interval, cancel_clone))
+            .expect("spawn vtime-writer thread");
+
+        Self {
+            cancel,
+            _writer: writer,
+        }
+    }
+}
+
+impl Drop for TimeDevice {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        // Writer wakes on the next sleep boundary and exits. We don't
+        // join — a slow writer shouldn't block VM teardown — and the
+        // OS reaps the thread when the process exits.
+    }
+}
+
+fn writer_loop(
+    channel: Arc<dyn DeviceChannel>,
+    clock: Arc<dyn Clock>,
+    interval: Duration,
+    cancel: Arc<AtomicBool>,
+) {
+    let mut update_seq: u32 = 0;
+
+    while !cancel.load(Ordering::Relaxed) {
+        update_seq = update_seq.wrapping_add(2); // always even
+
+        let mut buf = [0u8; r::REGION_SIZE];
+        let mono_ns = clock.now_mono_ns();
+        let wall_off = clock.wall_offset_ns();
+
+        // Host-write half (offsets 0x00..0x40)
+        write_u32(&mut buf, r::OFF_MAGIC, r::MAGIC);
+        write_u32(&mut buf, r::OFF_VERSION, r::VERSION);
+        write_u64(&mut buf, r::OFF_MONO_NS, mono_ns);
+        write_i64(&mut buf, r::OFF_WALL_OFFSET_NS, wall_off);
+        // last_sync_mono_ns / sync_source / sync_quality / min_wall_ns /
+        // flags stay zero — populated by TIME_ADJUST handling once the
+        // sync-guest path lands.
+        write_u32(&mut buf, r::OFF_UPDATE_SEQ, update_seq);
+
+        // Cmd half (offsets 0x40..0x80) is zero — guest doesn't write
+        // anything yet, so leave it untouched. Host doesn't read it
+        // either. When TIME_ADJUST arrives, this region will need a
+        // separate channel (host can't write to a slot the guest owns).
+
+        if let Err(e) = channel.write(&buf) {
+            tracing::warn!("vtime write failed: {e}");
+        }
+        let _ = channel.notify();
+
+        thread::sleep(interval);
+    }
+}
+
+fn write_u32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn write_u64(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+fn write_i64(buf: &mut [u8], off: usize, v: i64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
 #[cfg(test)]
