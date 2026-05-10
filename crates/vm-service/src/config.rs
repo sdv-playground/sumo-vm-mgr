@@ -69,11 +69,17 @@ pub enum DeviceTransportConfig {
         /// 16 — full GUEST_SHM_MAX_CLIENTS capacity.
         #[serde(default = "default_qvm_region_pages")]
         region_pages: u32,
-        /// Per-VM slot assignment. `peer_idx[vm_name] = N` makes the
-        /// guest's slot index N. Defaults to 1 for any VM not listed
-        /// (matches the common host=0 / guest=1 layout).
+        /// Per-VM strict slot assignment. Both peers' slot indices are
+        /// pinned per VM and applied to ALL regions for that VM.
+        /// Missing entries default to `{ host_slot: 0, peer_slot: 1 }`.
+        ///
+        /// On Region::open, if libhyp gives the host a slot index that
+        /// doesn't match `host_slot`, the channel construction fails
+        /// loud — typically caused by a leaked slot from a previously-
+        /// crashed peer in the same region; reboot to clear libhyp
+        /// factory state and redeploy.
         #[serde(default)]
-        peer_idx: HashMap<String, u32>,
+        vm_slots: HashMap<String, VmSlots>,
         /// Channel triples that should be read-only on the host side
         /// (host doesn't write — e.g. heartbeat is guest-published).
         /// Format: `"{vm}-{device}-{channel}"`.
@@ -81,6 +87,30 @@ pub enum DeviceTransportConfig {
         read_only_channels: Vec<String>,
     },
 }
+
+/// Per-VM slot pair for qvm-shmem regions. Mirrors
+/// `qnx_devices::qvm_transport::VmSlots` shape so the supernova-mm
+/// translation is field-for-field.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct VmSlots {
+    /// Slot index the host pins itself to (own slot for paired
+    /// channels). Verified against `region.idx()` after libhyp
+    /// allocation; mismatch errors loud.
+    #[serde(default = "default_host_slot")]
+    pub host_slot: u32,
+    /// Slot index the guest is pinned to (host's read target).
+    #[serde(default = "default_peer_slot")]
+    pub peer_slot: u32,
+}
+
+impl Default for VmSlots {
+    fn default() -> Self {
+        Self { host_slot: 0, peer_slot: 1 }
+    }
+}
+
+fn default_host_slot() -> u32 { 0 }
+fn default_peer_slot() -> u32 { 1 }
 
 fn default_ivshmem_dir() -> PathBuf {
     PathBuf::from("/dev/shm")
