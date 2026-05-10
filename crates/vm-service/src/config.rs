@@ -105,12 +105,16 @@ pub struct VmSlots {
 
 impl Default for VmSlots {
     fn default() -> Self {
-        Self { host_slot: 0, peer_slot: 1 }
+        // host=0, peer=2 because qvm reserves slot 1 for itself (the
+        // creator/factory). Empirically the guest's first attach lands
+        // on slot 2 every time, on both fresh boot and after deploys.
+        // Override per VM only if you actually know better.
+        Self { host_slot: 0, peer_slot: 2 }
     }
 }
 
 fn default_host_slot() -> u32 { 0 }
-fn default_peer_slot() -> u32 { 1 }
+fn default_peer_slot() -> u32 { 2 }
 
 fn default_ivshmem_dir() -> PathBuf {
     PathBuf::from("/dev/shm")
