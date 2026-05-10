@@ -111,13 +111,16 @@ fn main() {
         listen_addr.port(),
     );
 
+    // Daemon stays up even on an unprovisioned keystore so the listener is
+    // always reachable. Key operations against an empty keystore will fail
+    // naturally with KeyNotFound until provisioning lands; the host then
+    // restarts us (stop+start in vm-mgr's HSM provision path) so we reload
+    // with the freshly-written keystore.
     if !hsm.is_provisioned().unwrap_or(false) {
-        eprintln!(
-            "error: keystore at {} is not provisioned",
-            keystore_path.display()
+        tracing::info!(
+            keystore = %keystore_path.display(),
+            "keystore not yet provisioned — accepting connections, key ops will fail until provisioned"
         );
-        eprintln!("       Run HSM provisioning first (sumo-campaign flash hsm ...)");
-        std::process::exit(1);
     }
 
     let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(hsm);

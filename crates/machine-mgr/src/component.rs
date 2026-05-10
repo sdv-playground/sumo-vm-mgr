@@ -122,6 +122,20 @@ pub trait Component: Send + Sync {
     // Lifecycle
     // ------------------------------------------------------------------
 
+    /// Boot-time bring-up. Called once by the host after the registry is
+    /// built. Implementations must be idempotent (the host may also call
+    /// this after live reconfiguration). Default is a no-op.
+    ///
+    /// For HSM components: spawn the underlying HSM service so guests can
+    /// reach it. The service must come up even before provisioning — guests
+    /// need the listener to exist; key ops fail naturally on an empty
+    /// keystore until provisioning completes.
+    /// For VMs: no-op today (vm-service handles VM auto-start separately).
+    /// For HSE / always-on hardware backends: no-op.
+    async fn start(&self) -> MachineResult<()> {
+        Ok(())
+    }
+
     /// Restart the component. For the host this means reboot; for a guest VM
     /// it means stop+start through the VM lifecycle service; for HSM it may
     /// be a no-op or a daemon restart.

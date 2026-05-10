@@ -414,6 +414,46 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         self.hsm_provider.is_some()
     }
 
+    /// Bring up the HSM service (if this backend wraps one). No-op when
+    /// no provider is attached or when the backend's HsmProvider impl
+    /// reports the service was already running. Errors are surfaced so
+    /// the caller can log them; they should generally not be fatal.
+    pub fn start_hsm_service(&self) -> Result<(), String> {
+        let Some(ref hsm) = self.hsm_provider else {
+            return Ok(());
+        };
+        let mut h = hsm.lock().map_err(|_| "HSM lock poisoned".to_string())?;
+        match h.start_service() {
+            Ok(port) => {
+                tracing::info!(port, "HSM service started");
+                Ok(())
+            }
+            Err(hsm::HsmError::AlreadyRunning) => Ok(()),
+            Err(e) => Err(format!("start HSM service: {e}")),
+        }
+    }
+
+    /// Stop and re-spawn the HSM service. Used after provisioning so the
+    /// daemon picks up the freshly-written keystore. NotRunning on stop
+    /// is benign (we just spawn fresh).
+    pub fn restart_hsm_service(&self) -> Result<(), String> {
+        let Some(ref hsm) = self.hsm_provider else {
+            return Ok(());
+        };
+        let mut h = hsm.lock().map_err(|_| "HSM lock poisoned".to_string())?;
+        match h.stop_service() {
+            Ok(()) | Err(hsm::HsmError::NotRunning) => {}
+            Err(e) => tracing::warn!("stop HSM service before restart: {e}"),
+        }
+        match h.start_service() {
+            Ok(port) => {
+                tracing::info!(port, "HSM service restarted");
+                Ok(())
+            }
+            Err(e) => Err(format!("restart HSM service: {e}")),
+        }
+    }
+
     pub fn running_bank(&self) -> Result<Bank, std::sync::PoisonError<std::sync::MutexGuard<'_, Bank>>> {
         self.running_bank.lock().map(|g| *g)
     }
@@ -598,7 +638,13 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 "processing payload"
             );
 
-            let (size, _hash) = crate::streaming::process_raw_payload(
+            // `size` is the input file (compressed); the function returns the
+            // uncompressed/written size. Cheap fs::metadata for context.
+            let compressed = std::fs::metadata(&stored_payload.path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let process_started = std::time::Instant::now();
+            let (image_size, _hash) = crate::streaming::process_raw_payload(
                 &stored_payload.path,
                 &manifest.raw_bytes,
                 comp_idx,
@@ -608,8 +654,19 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             ).map_err(|e| BackendError::Internal(format!(
                 "payload processing ({uri}): {e}"
             )))?;
+            let process_elapsed = process_started.elapsed();
 
-            tracing::info!(uri = %uri, size, "payload written: {}", output_path.display());
+            let compressed_mb = compressed as f64 / 1_048_576.0;
+            let uncompressed_mb = image_size as f64 / 1_048_576.0;
+            let secs = process_elapsed.as_secs_f64();
+            let mb_per_sec = if secs > 0.0 { uncompressed_mb / secs } else { 0.0 };
+            tracing::info!(
+                uri = %uri,
+                elapsed_ms = process_elapsed.as_millis() as u64,
+                "payload written: {} ({:.2} MB compressed → {:.2} MB at {:.2} MB/s)",
+                output_path.display(),
+                compressed_mb, uncompressed_mb, mb_per_sec,
+            );
         }
 
         // Create a validated result for the OTA install
@@ -801,6 +858,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         );
 
         // Decrypt → decompress → verify → write
+        let process_started = std::time::Instant::now();
         let (image_size, _image_hash) = crate::streaming::process_raw_payload(
             &raw_path,
             &manifest_bytes,
@@ -809,15 +867,24 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             &expected_digest,
             &output_path,
         ).map_err(|e| BackendError::Internal(format!("payload processing: {e}")))?;
+        let process_elapsed = process_started.elapsed();
 
         // Clean up temp upload
         let _ = std::fs::remove_file(&raw_path);
 
+        let compressed_mb = size as f64 / 1_048_576.0;
+        let uncompressed_mb = image_size as f64 / 1_048_576.0;
+        let secs = process_elapsed.as_secs_f64();
+        // Throughput is uncompressed bytes per second — the sustained
+        // decrypt+decompress+write rate, which is what determines wall time.
+        let mb_per_sec = if secs > 0.0 { uncompressed_mb / secs } else { 0.0 };
         tracing::info!(
             component = comp_idx,
-            image_size,
-            "payload written: {}",
+            uri = %uri,
+            elapsed_ms = process_elapsed.as_millis() as u64,
+            "payload written: {} ({:.2} MB compressed → {:.2} MB at {:.2} MB/s)",
             output_path.display(),
+            compressed_mb, uncompressed_mb, mb_per_sec,
         );
 
         // Advance session state
@@ -1724,6 +1791,21 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                                 .map_err(|_| BackendError::Internal("HSM lock".into()))?;
                             hsm_guard.provision(envelope)
                                 .map_err(|e| BackendError::Internal(format!("HSM provision: {e}")))?;
+
+                            // Restart the HSM service so it reloads with the
+                            // freshly-written keystore. The daemon was already
+                            // running (Component::start brought it up at boot)
+                            // but holds the old/empty keystore in memory until
+                            // re-spawned. Backend-agnostic — no-op for HSE.
+                            match hsm_guard.stop_service() {
+                                Ok(()) | Err(hsm::HsmError::NotRunning) => {}
+                                Err(e) => tracing::warn!("stop HSM service post-provision: {e}"),
+                            }
+                            match hsm_guard.start_service() {
+                                Ok(port) => tracing::info!(port, "HSM service restarted post-provision"),
+                                Err(hsm::HsmError::AlreadyRunning) => {}
+                                Err(e) => tracing::warn!("start HSM service post-provision: {e}"),
+                            }
 
                             // Load keys from HSM into manifest provider
                             let ka = hsm_guard.get_public_key(hsm::KeyRole::KeyAuthority).ok();

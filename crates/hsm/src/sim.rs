@@ -574,9 +574,10 @@ impl HsmProvider for SimHsm {
             return Err(HsmError::AlreadyRunning);
         }
 
-        if !self.is_provisioned()? {
-            return Err(HsmError::NotProvisioned);
-        }
+        // Spawn the daemon regardless of provisioning state — the listener
+        // must be reachable on a factory device too. vhsm-test-ssd will log
+        // "not yet provisioned" and fail key ops until the keystore is
+        // populated; the post-provision restart in vm-mgr reloads it.
 
         tracing::info!(
             bin = %self.daemon_bin.display(),

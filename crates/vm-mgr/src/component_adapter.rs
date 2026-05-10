@@ -103,6 +103,15 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for VmBackendComponent<D>
         &self.capabilities
     }
 
+    async fn start(&self) -> MachineResult<()> {
+        // For HSM-bearing components this spawns vhsm-test-ssd (Sim) or
+        // is a no-op (HSE / hardware backends). For VMs without an HSM
+        // provider attached this is a no-op. Idempotent.
+        self.inner
+            .start_hsm_service()
+            .map_err(MachineError::Internal)
+    }
+
     async fn list_dids(&self, _filter: &DidFilter) -> MachineResult<Vec<DidEntry>> {
         let has_health = self.inner.has_vm_service();
         let mut entries: Vec<DidEntry> = DID_REGISTRY
