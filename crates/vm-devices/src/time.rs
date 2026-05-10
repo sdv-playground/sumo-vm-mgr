@@ -190,6 +190,17 @@ impl<S: SharedMemory, D: Doorbell, C: Clock> TimeSim<S, D, C> {
 /// 1–10 Hz, so this gives them a fresh value every poll.
 pub const TIME_DEFAULT_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Default sync-guest identity allowed to issue TIME_ADJUST. Matches
+/// the convention used by the vtime spec; configurable per-deployment
+/// once policy lands. `0` means "any guest".
+pub const TIME_DEFAULT_SYNC_GUEST_ID: u32 = 1;
+
+/// Default minimum interval between accepted TIME_ADJUST commands.
+pub const TIME_DEFAULT_MIN_ADJUST_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Default maximum magnitude of a single TIME_ADJUST correction (1 hour).
+pub const TIME_DEFAULT_MAX_CORRECTION_NS: i64 = 3_600_000_000_000;
+
 /// Host-side TimeDevice for byte-stream transports (qvm-shmem, http, etc.).
 ///
 /// On construction, spawns a background thread that periodically:
@@ -242,39 +253,100 @@ impl Drop for TimeDevice {
     }
 }
 
+/// Per-tick state of the TimeDevice writer. Tracks accumulated wall
+/// offset corrections from TIME_ADJUST commands, plus the seqcount of
+/// the last cmd we processed (for ack reply + dedup).
+struct WriterState {
+    update_seq: u32,
+    /// Accumulated correction from TIME_ADJUST commands. Added on top
+    /// of `clock.wall_offset_ns()` when publishing regs.
+    wall_correction_ns: i64,
+    /// Most-recent cmd seq we processed (0 = none yet). The reply
+    /// status echoes this seq so the guest can correlate.
+    last_cmd_seq: u32,
+    /// Status code for the last processed cmd. Published in the cmd
+    /// region of host's slot so the guest can read it back.
+    last_cmd_status: u32,
+    /// Sync source / quality from the last APPLIED cmd. Persists across
+    /// regs writes so the guest's --query consistently reports them.
+    sync_source: vm_transport::SyncSource,
+    sync_quality: vm_transport::SyncQuality,
+    last_sync_mono_ns: u64,
+    flags: u32,
+    /// Wall-time of the last accepted adjust. Drives the rate-limit gate.
+    last_adjust: Option<Instant>,
+}
+
+impl WriterState {
+    fn new() -> Self {
+        Self {
+            update_seq: 0,
+            wall_correction_ns: 0,
+            last_cmd_seq: 0,
+            last_cmd_status: vm_transport::VTIME_STATUS_PENDING,
+            sync_source: vm_transport::SyncSource::None,
+            sync_quality: vm_transport::SyncQuality::Unknown,
+            last_sync_mono_ns: 0,
+            flags: 0,
+            last_adjust: None,
+        }
+    }
+}
+
 fn writer_loop(
     channel: Arc<dyn DeviceChannel>,
     clock: Arc<dyn Clock>,
     interval: Duration,
     cancel: Arc<AtomicBool>,
 ) {
-    use vm_transport::{SyncQuality, SyncSource, VtimeRegs, VTIME_WIRE_SIZE};
+    use vm_transport::{VtimeCmd, VtimeRegs, VTIME_REGS_SIZE, VTIME_WIRE_SIZE};
 
-    let mut update_seq: u32 = 0;
+    let mut st = WriterState::new();
 
     while !cancel.load(Ordering::Relaxed) {
-        update_seq = update_seq.wrapping_add(2); // always even
+        // 1. Poll guest's slot for a new TIME_ADJUST cmd. The paired
+        //    DeviceChannel's read() returns the peer's slot — the
+        //    guest's writes. The cmd half lives at offsets 0x40..0x80
+        //    of that buffer.
+        if let Ok(peer_buf) = channel.read() {
+            if peer_buf.len() >= VTIME_WIRE_SIZE {
+                if let Some(cmd) = VtimeCmd::from_cmd_bytes(&peer_buf[VTIME_REGS_SIZE..]) {
+                    if cmd.seq != 0 && cmd.seq != st.last_cmd_seq {
+                        process_adjust(&cmd, &mut st, &clock);
+                    }
+                }
+            }
+        }
+
+        // 2. Build host's slot: regs in the top 64 bytes, status reply
+        //    in the bottom 64 bytes. The bottom-64 layout matches
+        //    VtimeCmd so the guest can decode it as a status reply
+        //    (status field at the same offset as in a request).
+        st.update_seq = st.update_seq.wrapping_add(2);
 
         let regs = VtimeRegs {
             mono_ns: clock.now_mono_ns(),
-            wall_offset_ns: clock.wall_offset_ns(),
-            // last_sync_mono_ns / sync_source / sync_quality / min_wall_ns
-            // stay at defaults until TIME_ADJUST handling fills them in
-            // (separate channel; sync-guest follow-up).
-            last_sync_mono_ns: 0,
-            sync_source: SyncSource::None,
-            sync_quality: SyncQuality::Unknown,
+            wall_offset_ns: clock.wall_offset_ns().saturating_add(st.wall_correction_ns),
+            last_sync_mono_ns: st.last_sync_mono_ns,
+            sync_source: st.sync_source,
+            sync_quality: st.sync_quality,
             min_wall_ns: 0,
-            flags: 0,
-            update_seq,
+            flags: st.flags,
+            update_seq: st.update_seq,
+        };
+        let reply = VtimeCmd {
+            seq: st.last_cmd_seq,
+            op: 0,
+            correction_ns: 0,
+            sync_source: st.sync_source,
+            sync_quality: st.sync_quality,
+            status: st.last_cmd_status,
+            guest_id: 0,
         };
 
-        // Build the full 128-byte region: regs half (host-written) +
-        // cmd half (guest-written, untouched here). The cmd half stays
-        // zero — when TIME_ADJUST handling lands it'll need its own
-        // channel because qvm-shmem slots are single-owner.
         let mut buf = [0u8; VTIME_WIRE_SIZE];
-        buf[..r::REGION_SIZE / 2].copy_from_slice(&regs.to_regs_bytes());
+        buf[..VTIME_REGS_SIZE].copy_from_slice(&regs.to_regs_bytes());
+        buf[VTIME_REGS_SIZE..].copy_from_slice(&reply.to_cmd_bytes());
 
         if let Err(e) = channel.write(&buf) {
             tracing::warn!("vtime write failed: {e}");
@@ -283,6 +355,69 @@ fn writer_loop(
 
         thread::sleep(interval);
     }
+}
+
+/// Validate + apply a TIME_ADJUST cmd. Updates `st` with the new
+/// status code so the next regs write publishes the ack.
+fn process_adjust(cmd: &vm_transport::VtimeCmd, st: &mut WriterState, clock: &Arc<dyn Clock>) {
+    use vm_transport::{
+        VTIME_CMD_ADJUST, VTIME_FLAG_SYNC_VALID, VTIME_STATUS_APPLIED, VTIME_STATUS_RATE_LIMITED,
+        VTIME_STATUS_REJECTED, VTIME_STATUS_UNAUTHORIZED,
+    };
+
+    // Always claim ownership of this seq so we never re-process it on
+    // the next tick — even on rejection. Guest must bump seq for retry.
+    st.last_cmd_seq = cmd.seq;
+
+    if cmd.op != VTIME_CMD_ADJUST {
+        // Unknown op — silently mark applied=false. Treat as rejected.
+        st.last_cmd_status = VTIME_STATUS_REJECTED;
+        return;
+    }
+
+    if TIME_DEFAULT_SYNC_GUEST_ID != 0 && cmd.guest_id != TIME_DEFAULT_SYNC_GUEST_ID {
+        tracing::warn!(
+            guest_id = cmd.guest_id,
+            "TIME_ADJUST rejected: unauthorized guest"
+        );
+        st.last_cmd_status = VTIME_STATUS_UNAUTHORIZED;
+        return;
+    }
+
+    if let Some(prev) = st.last_adjust {
+        if prev.elapsed() < TIME_DEFAULT_MIN_ADJUST_INTERVAL {
+            tracing::debug!("TIME_ADJUST rate-limited");
+            st.last_cmd_status = VTIME_STATUS_RATE_LIMITED;
+            return;
+        }
+    }
+
+    if cmd.correction_ns.abs() > TIME_DEFAULT_MAX_CORRECTION_NS {
+        tracing::warn!(
+            correction_ns = cmd.correction_ns,
+            max = TIME_DEFAULT_MAX_CORRECTION_NS,
+            "TIME_ADJUST rejected: correction exceeds magnitude bound"
+        );
+        st.last_cmd_status = VTIME_STATUS_REJECTED;
+        return;
+    }
+
+    // Accept.
+    st.wall_correction_ns = st.wall_correction_ns.saturating_add(cmd.correction_ns);
+    st.sync_source = cmd.sync_source;
+    st.sync_quality = cmd.sync_quality;
+    st.last_sync_mono_ns = clock.now_mono_ns();
+    st.flags |= VTIME_FLAG_SYNC_VALID;
+    st.last_adjust = Some(Instant::now());
+    st.last_cmd_status = VTIME_STATUS_APPLIED;
+
+    tracing::info!(
+        correction_ns = cmd.correction_ns,
+        new_wall_correction_ns = st.wall_correction_ns,
+        source = ?cmd.sync_source,
+        quality = ?cmd.sync_quality,
+        "TIME_ADJUST applied"
+    );
 }
 
 #[cfg(test)]
