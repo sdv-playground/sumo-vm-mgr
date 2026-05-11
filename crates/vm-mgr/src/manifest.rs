@@ -172,18 +172,18 @@ mod tests {
     #[test]
     fn manifest_parse_full() {
         let yaml = r#"
-component_id: ["os1"]
+component_id: ["vm1"]
 vendor_id: "fa6b4a53-d5ad-5fdf-be9d-e4e97d85cd2b"
 class_id: "1492af14-2569-5e48-bf42-9b2d51f2ab45"
 sequence_number: 3
 version: "1.2.0"
 image_size: 67108864
-spare_part_number: "SP-OS1"
+spare_part_number: "SP-VM1"
 ecu_sw_number: "ECU-SW-001"
-system_name: "OS1-Linux"
+system_name: "VM1-Linux"
 "#;
         let m = FirmwareManifest::from_yaml(yaml).unwrap();
-        assert_eq!(m.component_id, vec!["os1"]);
+        assert_eq!(m.component_id, vec!["vm1"]);
         assert_eq!(m.sequence_number, 3);
         assert_eq!(m.version, "1.2.0");
         assert_eq!(m.resolve_bank_set(), Some(BankSet::Vm1));
@@ -204,7 +204,7 @@ version: "1.0.0"
     #[test]
     fn manifest_to_image_meta() {
         let yaml = r#"
-component_id: ["os1"]
+component_id: ["vm1"]
 sequence_number: 5
 version: "2.0.0"
 spare_part_number: "SP-001"

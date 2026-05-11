@@ -247,17 +247,17 @@ fn empty_device_returns_none() {
 fn bank_sets_are_isolated() {
     let mut store = make_store();
 
-    // Write to OS1 Bank A
+    // Write to VM1 Bank A
     let mut meta1 = NvFwMeta::default();
     meta1.fw_version[..3].copy_from_slice(b"1.0");
     store.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta1).unwrap();
 
-    // Write to OS2 Bank A
+    // Write to VM2 Bank A
     let mut meta2 = NvFwMeta::default();
     meta2.fw_version[..3].copy_from_slice(b"2.0");
     store.write_fw_meta(BankSet::Vm2, Bank::A, &mut meta2).unwrap();
 
-    // Write to OS1 Bank B
+    // Write to VM1 Bank B
     let mut meta3 = NvFwMeta::default();
     meta3.fw_version[..3].copy_from_slice(b"1.1");
     store.write_fw_meta(BankSet::Vm1, Bank::B, &mut meta3).unwrap();
@@ -282,7 +282,7 @@ fn bank_sets_are_isolated() {
 fn copy_runtime_clones_dids() {
     let mut store = make_store();
 
-    // Write runtime to OS1 Bank A
+    // Write runtime to VM1 Bank A
     let mut runtime = NvRuntime::default();
     runtime.did_count = 1;
     runtime.dids[0] = DidEntry {
@@ -335,7 +335,7 @@ fn copy_runtime_from_empty_writes_default() {
 fn trial_boot_increment() {
     let mut store = make_store();
 
-    // Initial state: OS1 in trial mode
+    // Initial state: VM1 in trial mode
     let mut state = NvBootState::default();
     state.banks[1].committed = false;
     state.banks[1].boot_count = 0;

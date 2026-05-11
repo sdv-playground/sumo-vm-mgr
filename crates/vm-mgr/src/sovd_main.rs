@@ -45,6 +45,7 @@ async fn main() {
         eprintln!("  --hsm-port <port>          HSM TCP port (default: 5100)");
         eprintln!("  --boot-device <path>       Boot partition block device for IFS activation (e.g. /dev/hd0t177)");
         eprintln!("  --boot-mount <path>        Boot partition mount point (default: /mnt/boot)");
+        eprintln!("  --sw-authority <path>      Software authority COSE_Key file (bypasses HSM, dev/test only)");
         eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
         eprintln!();
         eprintln!("Provisioning authority: built-in factory signing key (P-256 generator G).");
@@ -66,6 +67,7 @@ async fn main() {
     let mut hsm_port: u16 = 5100;
     let mut boot_device: Option<String> = None;
     let mut boot_mount = PathBuf::from("/mnt/boot");
+    let mut sw_authority_path: Option<PathBuf> = None;
     let mut bind_addr = "0.0.0.0:4000";
     let mut i = 2;
     while i < args.len() {
@@ -92,6 +94,9 @@ async fn main() {
             i += 2;
         } else if args[i] == "--boot-mount" && i + 1 < args.len() {
             boot_mount = PathBuf::from(&args[i + 1]);
+            i += 2;
+        } else if args[i] == "--sw-authority" && i + 1 < args.len() {
+            sw_authority_path = Some(PathBuf::from(&args[i + 1]));
             i += 2;
         } else {
             bind_addr = &args[i];
@@ -175,6 +180,17 @@ async fn main() {
 
         Some(Arc::new(Mutex::new(provider)))
     };
+
+    // --sw-authority override: directly set software authority from file,
+    // bypassing HSM provisioning. For dev/test when HSM is not available.
+    if let Some(ref sw_path) = sw_authority_path {
+        let sw_key = std::fs::read(sw_path).unwrap_or_else(|e| {
+            eprintln!("failed to read --sw-authority {}: {e}", sw_path.display());
+            std::process::exit(1);
+        });
+        manifest_provider.update_keys(sw_key, None);
+        tracing::info!("loaded software authority from --sw-authority {}", sw_path.display());
+    }
 
     // Create one backend per bank set
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
