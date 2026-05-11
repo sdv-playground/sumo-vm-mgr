@@ -299,6 +299,39 @@ fn writer_loop(
     interval: Duration,
     cancel: Arc<AtomicBool>,
 ) {
+    // Wrap the iteration loop in catch_unwind so a panic inside the
+    // body (channel.write, clock.now_mono_ns, …) doesn't silently
+    // kill the writer with no diagnostic. On the CVC we hit a freeze
+    // where mono_ns stopped advancing with zero supernova-side
+    // evidence; this surfaces the cause next time. Thread still
+    // exits on panic — vm-service has to rebuild the TimeDevice
+    // (stop_vm + start_vm) to recover. We deliberately don't
+    // auto-restart the loop until we know what's panicking.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        writer_loop_inner(channel, clock, interval, cancel);
+    }));
+    if let Err(payload) = result {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        tracing::error!(
+            target: "vtime",
+            "vtime-writer thread panicked, exiting: {msg}\n\
+             host will stop publishing VtimeRegs; guest /dev/vtime snapshot \
+             will freeze at the last good values. Recover by restarting the \
+             VM (vm-service stop_vm + start_vm rebuilds the TimeDevice)."
+        );
+    }
+}
+
+fn writer_loop_inner(
+    channel: Arc<dyn DeviceChannel>,
+    clock: Arc<dyn Clock>,
+    interval: Duration,
+    cancel: Arc<AtomicBool>,
+) {
     use vm_transport::{VtimeCmd, VtimeRegs, VTIME_REGS_SIZE, VTIME_WIRE_SIZE};
 
     let mut st = WriterState::new();
