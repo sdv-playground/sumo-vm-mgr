@@ -1,46 +1,22 @@
-//! QNX 7.1 default `SensorReader` — best-effort generic metrics.
+//! QNX 7.1 default `SensorReader` — system metrics from procnto.
 //!
-//! QNX doesn't expose a Linux-style `/proc/stat` or `/sys/class/hwmon`,
-//! so the generic reader is intentionally thin. It emits:
+//! Sources:
+//! - `/proc/vm/stats` — memory pages (free, wired, kernel, anon, total)
+//! - `sysconf(_SC_NPROCESSORS_ONLN)` — CPU count
+//! - `clock_gettime(CLOCK_MONOTONIC)` — process uptime
+//! - `/proc/1/usage` (future) — per-CPU idle ticks for utilization
 //!
-//! - `host_cpu_count` from `sysconf(_SC_NPROCESSORS_ONLN)`
-//! - `host_uptime_seconds` from `clock_gettime(CLOCK_MONOTONIC)` since
-//!   process start (close enough — most QNX consumers care about elapsed
-//!   time, not wall-clock-since-boot)
-//! - `host_memory_bytes{state}` derived from `sysconf(_SC_PHYS_PAGES)` and
-//!   `sysconf(_SC_PAGE_SIZE)` when both are positive
-//!
-//! Load average is intentionally **not** in the default — `getloadavg(3)`
-//! lives in QNX's libutil (not libc), and the rust `libc` crate's QNX
-//! bindings don't expose it. A board-specific reader can pull it in via
-//! libutil if needed.
-//!
-//! Per-CPU usage, hardware temperatures, voltages, fan speeds, and eMMC
-//! wear levels are **not** in the default — they require board-specific
-//! drivers / `devctl()` calls. Production hardware readers (e.g. NXP
-//! S32G3) live in `supernova-machine-manager` and emit those on top.
-//!
-//! ## Compile-target awareness
-//!
-//! This module is `#[cfg(target_os = "nto")]`. It compiles against the
-//! `libc` crate's QNX bindings and links against libc on the QNX SDK
-//! sysroot. Most parsing logic is platform-portable so the unit tests
-//! exercise it on any host (the syscall wrappers themselves are thin
-//! and not unit-tested here — they're trivially-correct one-liners).
+//! No temperature, voltage, or eMMC wear — those require board-specific
+//! drivers (TMU resource manager, PMIC i2c, JEDEC devctl) that don't
+//! ship in the default BSP.
 
 use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::{Sensor, SensorKind, SensorReader};
 
-/// QNX default reader. Holds a process-start `Instant` so `uptime`
-/// is a relative measure of how long *this vm-service / supernova
-/// process* has been alive — useful for crash-loop debugging.
 pub struct QnxSensorReader {
     process_start: Instant,
-    /// Reserved for future use (per-CPU usage diffing, like Linux).
-    /// Currently unused; kept so the field exists when we wire QNX-specific
-    /// CPU usage queries.
     #[allow(dead_code)]
     state: Mutex<()>,
 }
@@ -74,51 +50,130 @@ impl SensorReader for QnxSensorReader {
             });
         }
 
-        out.extend(read_memory_from_sysconf().unwrap_or_default());
-
-        let uptime_secs = self.process_start.elapsed().as_secs_f64();
         out.push(Sensor {
             name: "host_uptime_seconds",
-            help: "Seconds since this metrics process started",
+            help: "Seconds since this process started",
             kind: SensorKind::Gauge,
-            value: uptime_secs,
+            value: self.process_start.elapsed().as_secs_f64(),
             labels: vec![],
         });
+
+        out.extend(read_vm_stats());
 
         out
     }
 }
 
 fn read_cpu_count() -> Option<i64> {
-    // _SC_NPROCESSORS_ONLN is non-POSIX but QNX 7.1 has it.
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if n > 0 { Some(n) } else { None }
 }
 
-/// Memory total derived from `sysconf(_SC_PHYS_PAGES) * _SC_PAGE_SIZE`.
-/// Free / available aren't directly available via sysconf on QNX —
-/// they need procnto-specific calls (`mem_offset()` family) which we'll
-/// add when supernova's hardware reader needs it.
-fn read_memory_from_sysconf() -> Option<Vec<Sensor>> {
-    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
-    memory_samples_from_sysconf(pages, page_size)
+/// Parse `/proc/vm/stats` for memory metrics. Format is `key=value` or
+/// `key=0xHEX (human)` per line. Values with `0x` prefix are in pages.
+fn read_vm_stats() -> Vec<Sensor> {
+    let content = match std::fs::read_to_string("/proc/vm/stats") {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    parse_vm_stats(&content)
 }
 
-/// Pure helper — emits `host_memory_bytes{state="total"}` if both inputs
-/// are positive. Returns `None` otherwise so callers cleanly skip.
-fn memory_samples_from_sysconf(pages: i64, page_size: i64) -> Option<Vec<Sensor>> {
-    if pages <= 0 || page_size <= 0 {
-        return None;
+fn parse_vm_stats(content: &str) -> Vec<Sensor> {
+    let mut out = Vec::new();
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+    let page_bytes: f64 = if page_size > 0 { page_size as f64 } else { 4096.0 };
+
+    let mut page_count: Option<u64> = None;
+    let mut pages_free: Option<u64> = None;
+    let mut pages_wired: Option<u64> = None;
+    let mut pages_kernel: Option<u64> = None;
+    let mut anon_count: Option<u64> = None;
+
+    for line in content.lines() {
+        let Some((key, val_str)) = line.split_once('=') else { continue };
+        let pages = parse_hex_or_dec(val_str);
+
+        match key {
+            "page_count" => page_count = pages,
+            "pages_free" => pages_free = pages,
+            "pages_wired" => pages_wired = pages,
+            "pages_kernel" => pages_kernel = pages,
+            "anon_count" => anon_count = pages,
+            _ => {}
+        }
     }
-    let total = (pages as u64).checked_mul(page_size as u64)?;
-    Some(vec![Sensor {
-        name: "host_memory_bytes",
-        help: "Memory in bytes by state",
-        kind: SensorKind::Gauge,
-        value: total as f64,
-        labels: vec![("state", "total".into())],
-    }])
+
+    if let Some(total) = page_count {
+        out.push(Sensor {
+            name: "host_memory_bytes",
+            help: "Memory in bytes by state",
+            kind: SensorKind::Gauge,
+            value: total as f64 * page_bytes,
+            labels: vec![("state", "total".into())],
+        });
+    }
+    if let Some(free) = pages_free {
+        out.push(Sensor {
+            name: "host_memory_bytes",
+            help: "Memory in bytes by state",
+            kind: SensorKind::Gauge,
+            value: free as f64 * page_bytes,
+            labels: vec![("state", "free".into())],
+        });
+    }
+    if let Some(total) = page_count {
+        if let Some(free) = pages_free {
+            out.push(Sensor {
+                name: "host_memory_bytes",
+                help: "Memory in bytes by state",
+                kind: SensorKind::Gauge,
+                value: (total - free) as f64 * page_bytes,
+                labels: vec![("state", "used".into())],
+            });
+        }
+    }
+    if let Some(wired) = pages_wired {
+        out.push(Sensor {
+            name: "host_memory_bytes",
+            help: "Memory in bytes by state",
+            kind: SensorKind::Gauge,
+            value: wired as f64 * page_bytes,
+            labels: vec![("state", "wired".into())],
+        });
+    }
+    if let Some(kernel) = pages_kernel {
+        out.push(Sensor {
+            name: "host_memory_bytes",
+            help: "Memory in bytes by state",
+            kind: SensorKind::Gauge,
+            value: kernel as f64 * page_bytes,
+            labels: vec![("state", "kernel".into())],
+        });
+    }
+    if let Some(anon) = anon_count {
+        out.push(Sensor {
+            name: "host_memory_bytes",
+            help: "Memory in bytes by state",
+            kind: SensorKind::Gauge,
+            value: anon as f64 * page_bytes,
+            labels: vec![("state", "anonymous".into())],
+        });
+    }
+
+    out
+}
+
+/// Parse `0xHEX (human)` or plain decimal. The `/proc/vm/stats` format
+/// uses hex with a parenthesized human-readable suffix for page counts.
+fn parse_hex_or_dec(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("0x") {
+        let hex_part = rest.split_whitespace().next()?;
+        u64::from_str_radix(hex_part, 16).ok()
+    } else {
+        s.split_whitespace().next()?.parse().ok()
+    }
 }
 
 #[cfg(test)]
@@ -126,26 +181,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_samples_returns_none_for_unavailable_sysconf() {
-        // sysconf returns -1 when the param is unsupported.
-        assert!(memory_samples_from_sysconf(-1, 4096).is_none());
-        assert!(memory_samples_from_sysconf(1024, -1).is_none());
-        assert!(memory_samples_from_sysconf(0, 4096).is_none());
+    fn parse_hex_or_dec_works() {
+        assert_eq!(parse_hex_or_dec("0xe0000 (3.500GB)"), Some(0xe0000));
+        assert_eq!(parse_hex_or_dec("0xa9494 (2.644GB)"), Some(0xa9494));
+        assert_eq!(parse_hex_or_dec("34"), Some(34));
+        assert_eq!(parse_hex_or_dec("0x0 (0.000kB)"), Some(0));
     }
 
     #[test]
-    fn memory_samples_computes_total_bytes() {
-        // 1024 pages * 4 KiB = 4 MiB
-        let s = memory_samples_from_sysconf(1024, 4096).unwrap();
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].value, (1024u64 * 4096) as f64);
-        assert_eq!(s[0].labels[0], ("state", "total".into()));
+    fn parse_vm_stats_extracts_memory() {
+        let input = "\
+vm_aspace=34
+vm_region=1576
+page_count=0xe0000 (3.500GB)
+anon_count=0x5c5d (92.363MB)
+pages_free=0xa9494 (2.644GB)
+pages_wired=0x4c35 (76.207MB)
+pages_kernel=0x4c39 (76.222MB)
+";
+        let sensors = parse_vm_stats(input);
+        let names: Vec<_> = sensors.iter().map(|s| {
+            let label = s.labels.first().map(|l| l.1.as_str()).unwrap_or("");
+            (s.name, label)
+        }).collect();
+        assert!(names.contains(&("host_memory_bytes", "total")));
+        assert!(names.contains(&("host_memory_bytes", "free")));
+        assert!(names.contains(&("host_memory_bytes", "used")));
+        assert!(names.contains(&("host_memory_bytes", "wired")));
+        assert!(names.contains(&("host_memory_bytes", "kernel")));
+        assert!(names.contains(&("host_memory_bytes", "anonymous")));
+
+        let total = sensors.iter().find(|s| s.labels.first().map(|l| l.1.as_str()) == Some("total")).unwrap();
+        // 0xe0000 pages * 4096 bytes = 3.5 GB
+        assert_eq!(total.value, 0xe0000_u64 as f64 * 4096.0);
     }
 
     #[test]
-    fn memory_samples_handles_overflow_gracefully() {
-        // Forces u64::checked_mul to return None.
-        let s = memory_samples_from_sysconf(i64::MAX, i64::MAX);
-        assert!(s.is_none());
+    fn parse_vm_stats_handles_empty() {
+        assert!(parse_vm_stats("").is_empty());
     }
 }

@@ -219,7 +219,7 @@ pub const TIME_DEFAULT_MAX_CORRECTION_NS: i64 = 3_600_000_000_000;
 /// Drop aborts the writer thread on the next tick (cooperative cancel).
 pub struct TimeDevice {
     cancel: Arc<AtomicBool>,
-    _writer: thread::JoinHandle<()>,
+    writer: Option<thread::JoinHandle<()>>,
 }
 
 impl TimeDevice {
@@ -239,7 +239,7 @@ impl TimeDevice {
 
         Self {
             cancel,
-            _writer: writer,
+            writer: Some(writer),
         }
     }
 }
@@ -247,9 +247,9 @@ impl TimeDevice {
 impl Drop for TimeDevice {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
-        // Writer wakes on the next sleep boundary and exits. We don't
-        // join — a slow writer shouldn't block VM teardown — and the
-        // OS reaps the thread when the process exits.
+        if let Some(handle) = self.writer.take() {
+            let _ = handle.join();
+        }
     }
 }
 

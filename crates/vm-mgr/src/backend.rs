@@ -626,6 +626,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 "#kernel" => format!("{set_name}-kernel-staged.img"),
                 "#firmware" => format!("{set_name}-staged.img"),
                 "#config" => format!("{set_name}-config-staged.yaml"),
+                "#qvm-config" => format!("{set_name}-qvm-config-staged.conf"),
                 other => format!("{set_name}-{}-staged.img", other.trim_start_matches('#')),
             };
             let output_path = images_dir.join(&output_suffix);
@@ -836,6 +837,8 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let output_suffix = match uri {
             "#kernel" => format!("{set_name}-kernel-staged.img"),
             "#firmware" => format!("{set_name}-staged.img"),
+            "#config" => format!("{set_name}-config-staged.yaml"),
+            "#qvm-config" => format!("{set_name}-qvm-config-staged.conf"),
             other => format!("{set_name}-{}-staged.img", other.trim_start_matches('#')),
         };
 
@@ -1669,6 +1672,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     ("staged.img", "rootfs.img"),
                     ("kernel-staged.img", kernel_target),
                     ("config-staged.yaml", "vm-config.yaml"),
+                    ("qvm-config-staged.conf", "qnx-guest.conf"),
                 ];
                 for (staged_suffix, target_name) in moves {
                     let staged_path = images_dir.join(format!("{set_name}-{staged_suffix}"));
@@ -1879,6 +1883,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                                 ("kernel-staged.img", kernel_target),
                                 ("config-staged.yaml", "vm-config.yaml"),
                                 ("config-staged.img", "vm-config.yaml"),
+                                ("qvm-config-staged.conf", "qnx-guest.conf"),
                             ];
                             for (staged_suffix, target_name) in moves {
                                 let staged = images_dir.join(format!("{set_name}-{staged_suffix}"));

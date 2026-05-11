@@ -133,6 +133,7 @@ pub async fn process_envelope_stream(
                 "#kernel" => format!("{set_name}-kernel-staged.img"),
                 "#firmware" => format!("{set_name}-staged.img"),
                 "#config" => format!("{set_name}-config-staged.yaml"),
+                "#qvm-config" => format!("{set_name}-qvm-config-staged.conf"),
                 other => format!("{set_name}-{}-staged.img",
                     other.trim_start_matches('#')),
             };

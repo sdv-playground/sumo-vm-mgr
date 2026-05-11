@@ -121,9 +121,16 @@ fn wait_for_device(path: &str, timeout: Duration) -> Result<(), RunnerError> {
 
 impl VmRunner for QnxRunner {
     fn start(&mut self, name: &str, def: &VmDefinition) -> Result<VmHandle, RunnerError> {
-        let qvm_config = def.qvm_config.as_ref().ok_or_else(|| {
+        let raw_path = def.qvm_config.as_ref().ok_or_else(|| {
             RunnerError::Config(format!("VM {name}: qvm_config not set"))
         })?;
+
+        // Relative paths resolve against image_dir (follows active bank symlink)
+        let qvm_config = if raw_path.is_relative() {
+            def.image_dir.join(raw_path)
+        } else {
+            raw_path.clone()
+        };
 
         if !qvm_config.exists() {
             return Err(RunnerError::Config(format!(

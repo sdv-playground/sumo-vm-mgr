@@ -309,9 +309,9 @@ impl VmManager {
 
         // Time device — host periodically writes vtime registers into a
         // shared region; guest's vtime driver reads them and disciplines
-        // local CLOCK_REALTIME. Single channel for the host-write half;
-        // TIME_ADJUST from a sync guest is a follow-up that needs its own
-        // channel (the cmd region is owned by a different shmem slot).
+        // local CLOCK_REALTIME. Single 128-byte bidirectional channel:
+        // host writes regs (0x00-0x3F) + status reply (0x40-0x7F),
+        // guest writes TIME_ADJUST commands via the peer slot.
         let has_time = effective_def.devices.iter()
             .any(|d| matches!(d, crate::config::DeviceConfig::Time { .. }));
         if has_time {
