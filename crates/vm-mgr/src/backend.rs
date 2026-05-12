@@ -1663,16 +1663,20 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 // bootable disk). Symptom: orchestrator times out at 60s
                 // waiting for activation; guest_state stays offline (0xffffffff).
                 let kernel_target = match self.bank_set {
-                    BankSet::Vm1 => "bzImage",
+                    BankSet::Vm1 => "Image",
                     BankSet::Vm2 => "boot.img",
                     _ => "boot.ifs",
+                };
+                let qvm_config_target = match self.bank_set {
+                    BankSet::Vm1 => "linux-guest.conf",
+                    _ => "qnx-guest.conf",
                 };
                 // staged.img → bank_X/rootfs.img, kernel-staged.img → bank_X/<kernel_target>
                 let moves: &[(&str, &str)] = &[
                     ("staged.img", "rootfs.img"),
                     ("kernel-staged.img", kernel_target),
                     ("config-staged.yaml", "vm-config.yaml"),
-                    ("qvm-config-staged.conf", "qnx-guest.conf"),
+                    ("qvm-config-staged.conf", qvm_config_target),
                 ];
                 for (staged_suffix, target_name) in moves {
                     let staged_path = images_dir.join(format!("{set_name}-{staged_suffix}"));

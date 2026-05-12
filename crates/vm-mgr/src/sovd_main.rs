@@ -188,7 +188,7 @@ async fn main() {
             eprintln!("failed to read --sw-authority {}: {e}", sw_path.display());
             std::process::exit(1);
         });
-        manifest_provider.update_keys(sw_key, None);
+        manifest_provider.update_keys(sw_key, None, None);
         tracing::info!("loaded software authority from --sw-authority {}", sw_path.display());
     }
 
