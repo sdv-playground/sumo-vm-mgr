@@ -269,8 +269,8 @@ struct WriterState {
     last_cmd_status: u32,
     /// Sync source / quality from the last APPLIED cmd. Persists across
     /// regs writes so the guest's --query consistently reports them.
-    sync_source: vm_transport::SyncSource,
-    sync_quality: vm_transport::SyncQuality,
+    sync_source: vm_wire::SyncSource,
+    sync_quality: vm_wire::SyncQuality,
     last_sync_mono_ns: u64,
     flags: u32,
     /// Wall-time of the last accepted adjust. Drives the rate-limit gate.
@@ -283,9 +283,9 @@ impl WriterState {
             update_seq: 0,
             wall_correction_ns: 0,
             last_cmd_seq: 0,
-            last_cmd_status: vm_transport::VTIME_STATUS_PENDING,
-            sync_source: vm_transport::SyncSource::None,
-            sync_quality: vm_transport::SyncQuality::Unknown,
+            last_cmd_status: vm_wire::VTIME_STATUS_PENDING,
+            sync_source: vm_wire::SyncSource::None,
+            sync_quality: vm_wire::SyncQuality::Unknown,
             last_sync_mono_ns: 0,
             flags: 0,
             last_adjust: None,
@@ -332,7 +332,7 @@ fn writer_loop_inner(
     interval: Duration,
     cancel: Arc<AtomicBool>,
 ) {
-    use vm_transport::{VtimeCmd, VtimeRegs, VTIME_REGS_SIZE, VTIME_WIRE_SIZE};
+    use vm_wire::{VtimeCmd, VtimeRegs, VTIME_REGS_SIZE, VTIME_WIRE_SIZE};
 
     let mut st = WriterState::new();
 
@@ -392,8 +392,8 @@ fn writer_loop_inner(
 
 /// Validate + apply a TIME_ADJUST cmd. Updates `st` with the new
 /// status code so the next regs write publishes the ack.
-fn process_adjust(cmd: &vm_transport::VtimeCmd, st: &mut WriterState, clock: &Arc<dyn Clock>) {
-    use vm_transport::{
+fn process_adjust(cmd: &vm_wire::VtimeCmd, st: &mut WriterState, clock: &Arc<dyn Clock>) {
+    use vm_wire::{
         VTIME_CMD_ADJUST, VTIME_FLAG_SYNC_VALID, VTIME_STATUS_APPLIED, VTIME_STATUS_RATE_LIMITED,
         VTIME_STATUS_REJECTED, VTIME_STATUS_UNAUTHORIZED,
     };

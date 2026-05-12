@@ -5,11 +5,10 @@ edition = "2021"
 description = "Host-side device simulators for virtual CAN, health, and time"
 
 [dependencies]
-# Contract crate — DeviceChannel/StreamChannel/DeviceTransport traits,
+# Wire-format contract crate — DeviceChannel/StreamChannel/DeviceTransport traits,
 # SharedMemory/Doorbell, TransportError, Heartbeat/PowerCommand wire formats.
-# Both host (this crate) and guest (vm-guest-lib) consume it; kills the
-# previous public-vs-private duplication.
-vm-transport = { path = "../vm-transport" }
+# Both host (this crate) and guest (vm-guest-lib) consume it.
+vm-wire = { path = "../vm-wire" }
 libc = "0.2"
 tracing = "0.1"
 # HTTP transport (optional — only pulled in when the http-transport feature

@@ -16,7 +16,7 @@
 //! - **`qnx-devices`** (libhyp, qvm-shmem host transport — proprietary)
 //! - **`guest-vm-spec/crates/vm-guest-lib`** (portable guest-side: HTTP, TCP)
 //! - **`guest-vm-spec/crates/qvm-shmem`** (Linux-guest qvm-shmem)
-//! - **`guest-vm-qnx/crates/vm-guest-pci`** (QNX-guest MAP_PHYS)
+//! - **`guest-vm-qnx/crates/ivshmem-guest`** (QNX-guest MAP_PHYS)
 //!
 //! ## Wire formats
 //!
@@ -27,7 +27,7 @@
 //! ## Layering
 //!
 //! ```text
-//!     vm-transport (this crate)            ← traits + wire formats
+//!     vm-wire (this crate)                 ← traits + wire formats
 //!         ▲             ▲
 //!         │             │
 //!     ┌───┴────┐    ┌───┴───────────────┐

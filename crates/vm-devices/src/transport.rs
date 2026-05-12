@@ -2,7 +2,7 @@
 //!
 //! The trait surface (`DeviceChannel`, `StreamChannel`, `DeviceTransport`,
 //! `SharedMemory`, `Doorbell`, `TransportError`, `seqcount_write`) lives in
-//! the [`vm_transport`] contract crate so host and guest never duplicate it.
+//! the [`vm_wire`] contract crate so host and guest never duplicate it.
 //! This module re-exports those names so existing host callers
 //! (`use vm_devices::transport::DeviceChannel;`) continue to work.
 //!
@@ -29,7 +29,7 @@ pub mod http;
 
 // Re-export the contract so `use vm_devices::transport::DeviceChannel`
 // keeps working for host-side callers.
-pub use vm_transport::{
+pub use vm_wire::{
     seqcount_write, DeviceChannel, DeviceTransport, Doorbell, SharedMemory, StreamChannel,
     TransportError,
 };
@@ -39,7 +39,7 @@ mod tests {
     use super::*;
     use crate::transport::mem::MemSharedMemory;
 
-    // Trait-display tests live in vm-transport (no SharedMemory impl needed).
+    // Trait-display tests live in vm-wire (no SharedMemory impl needed).
     // Here we keep the seqcount_write tests because they need a real
     // SharedMemory impl that lives in this crate.
 

@@ -1,5 +1,5 @@
 [package]
-name = "vm-transport"
+name = "vm-wire"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
@@ -20,5 +20,5 @@ repository = "https://github.com/sdv-playground/sumo-machine-manager"
 # Intentionally none. Trait methods use std types only.
 
 [lib]
-name = "vm_transport"
+name = "vm_wire"
 path = "src/lib.rs"

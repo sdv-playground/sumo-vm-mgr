@@ -94,7 +94,7 @@ pub mod health {
 ///
 /// Wire-format constants (magic, version, source/quality enum values,
 /// flags, opcodes, statuses) and the VtimeRegs/VtimeCmd structs live in
-/// `vm_transport::time` — single source of truth shared with the guest.
+/// `vm_wire::time` — single source of truth shared with the guest.
 /// This module only carries the byte offsets that are an artefact of the
 /// MMIO-style layout (TimeSim writes register-by-register through a
 /// SharedMemory implementation; offsets matter there but not in the
@@ -102,7 +102,7 @@ pub mod health {
 pub mod time {
     // Re-export wire-format constants and types so existing callsites
     // that did `use crate::regs::time as r;` continue working.
-    pub use vm_transport::{
+    pub use vm_wire::{
         SyncQuality, SyncSource, VtimeCmd, VtimeRegs, VTIME_CMD_ADJUST as CMD_ADJUST,
         VTIME_FLAG_RTC_PRESENT as FLAG_RTC_PRESENT,
         VTIME_FLAG_SYNC_VALID as FLAG_SYNC_VALID, VTIME_MAGIC as MAGIC,

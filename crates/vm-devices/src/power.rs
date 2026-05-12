@@ -1,7 +1,7 @@
 //! Power-command device — host → guest control channel.
 //!
 //! Wire types ([`PowerCommand`], [`PowerCommandFrame`]) live in the
-//! [`vm_transport`] contract crate. This module only carries the
+//! [`vm_wire`] contract crate. This module only carries the
 //! **host-side wrapper** ([`PowerCommandDevice`]) that owns the
 //! monotonic seq counter and writes encoded frames to a `DeviceChannel`.
 //!
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::transport::{DeviceChannel, TransportError};
 
 // Re-export wire types from the contract crate.
-pub use vm_transport::{PowerCommand, PowerCommandFrame, POWER_WIRE_SIZE};
+pub use vm_wire::{PowerCommand, PowerCommandFrame, POWER_WIRE_SIZE};
 
 /// Host → guest power-command channel. Owns the monotonic next_seq.
 pub struct PowerCommandDevice {

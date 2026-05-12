@@ -3,7 +3,7 @@
 //! ## Wire format
 //!
 //! Wire types ([`Heartbeat`], [`GuestState`], the constants) live in the
-//! [`vm_transport`] contract crate. This module only carries the
+//! [`vm_wire`] contract crate. This module only carries the
 //! **host-side wrapper** ([`HeartbeatDevice`]) that ties a `DeviceChannel`
 //! to the wire-format codec. Guests use [`vm_guest_lib::HeartbeatClient`]
 //! against the same wire type.
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use crate::transport::{DeviceChannel, TransportError};
 
 // Re-export wire types from the contract crate.
-pub use vm_transport::{
+pub use vm_wire::{
     GuestState, Heartbeat, HB_FLAG_SERVICES_READY, HEARTBEAT_MAGIC, HEARTBEAT_VERSION,
     HEARTBEAT_WIRE_SIZE,
 };
