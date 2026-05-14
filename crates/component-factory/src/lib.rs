@@ -222,7 +222,14 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 flash_clear: Some(flash_clear),
             })
         }
-        "vm" | "hpc" | "hsm" => {
+        // `bank` is the canonical name for "bank-managed Component, launch
+        // is the deployment's problem" — VMs (vm-service notifies via
+        // `notify_vm_service` based on `vm_service_addr`, not the type
+        // string), RT side, future containers, anything generic. `hpc`
+        // (host OS) and `hsm` get the same VmBackendComponent shape but
+        // with extra hooks attached below (IFS activator / HSM
+        // provisioning).
+        "bank" | "hpc" | "hsm" => {
             let comp_config = ComponentConfig {
                 entity_type: spec.component_type.clone(),
                 supports_rollback: spec.rollback,
