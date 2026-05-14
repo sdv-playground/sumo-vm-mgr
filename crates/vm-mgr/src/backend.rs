@@ -439,17 +439,14 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// sig together; trial flip just exposes the staged bank with
     /// its existing sig intact.
     ///
-    /// Soft-skip policy: if the HSM has no `ivd-signing` slot yet
-    /// (`NotProvisioned`, `KeyNotFound`, `NotSupported` — happens
-    /// during the very first hsm-keys flash, before the IVD key
-    /// exists), log a warning and return Ok. External secure boot
-    /// will refuse to launch the bank in that state, which is the
-    /// safe-by-default outcome — no banks ship with unauthorised
-    /// content, and the operator gets a clear "ivd-signing missing"
-    /// warning in the flash log. Every other error path is hard:
-    /// IO failures, KeystoreError, etc. fail the flash so the
-    /// operator can't end up with banks that are intended to be
-    /// signed but silently aren't.
+    /// `ivd-signing` is generated locally by the HSM at first
+    /// provisioning (see `SimHsm::generate_missing_local_keys`), so
+    /// any provisioned HSM has it. If the sign fails here, that's
+    /// either an unprovisioned HSM or a corrupted keystore — in
+    /// both cases the OTA must fail rather than ship an unsigned
+    /// bank. The only "skip" paths are the test/dev cases where
+    /// either no HSM is attached at all or the component has no
+    /// per-bank images dir.
     fn ivd_sign_staged_bank(&self, target: Bank) -> BackendResult<()> {
         let Some(ref hsm_arc) = self.hsm_provider else {
             tracing::debug!("ivd sign: no hsm provider attached; skipping");
@@ -482,30 +479,14 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let hsm = hsm_arc.lock().map_err(|_| {
             BackendError::Internal("ivd sign: hsm mutex poisoned".into())
         })?;
-        match hsm::ivd::sign_bank(&*hsm, &bank_dir, bank_id.clone()) {
-            Ok(_manifest) => {
-                tracing::info!(
-                    bank_id = %bank_id,
-                    bank_dir = %bank_dir.display(),
-                    "ivd sign OK",
-                );
-                Ok(())
-            }
-            // Bootstrap: HSM has no ivd-signing key yet.
-            Err(hsm::ivd::IvdError::Hsm(hsm::HsmError::NotProvisioned))
-            | Err(hsm::ivd::IvdError::Hsm(hsm::HsmError::KeyNotFound(_)))
-            | Err(hsm::ivd::IvdError::Hsm(hsm::HsmError::NotSupported(_))) => {
-                tracing::warn!(
-                    bank_id = %bank_id,
-                    "ivd sign skipped: no ivd-signing key yet \
-                     (external secure boot will reject this bank)",
-                );
-                Ok(())
-            }
-            Err(e) => Err(BackendError::Internal(format!(
-                "ivd sign {bank_id}: {e}",
-            ))),
-        }
+        let _manifest = hsm::ivd::sign_bank(&*hsm, &bank_dir, &bank_id)
+            .map_err(|e| BackendError::Internal(format!("ivd sign {bank_id}: {e}")))?;
+        tracing::info!(
+            bank_id = %bank_id,
+            bank_dir = %bank_dir.display(),
+            "ivd sign OK",
+        );
+        Ok(())
     }
 
     /// Wipe the target bank dir (frees ~1 image worth of space) and remove any
