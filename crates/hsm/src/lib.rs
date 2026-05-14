@@ -79,11 +79,11 @@ pub trait HsmProvider: Send {
     fn get_public_key(&self, role: KeyRole) -> Result<Vec<u8>, HsmError>;
 
     /// Retrieve a private key by role, as COSE_Key CBOR bytes.
-    /// Only supported for simulation — production HSMs never export privates.
-    fn get_private_key(&self, role: KeyRole) -> Result<Vec<u8>, HsmError> {
-        let _ = role;
-        Err(HsmError::NotSupported("private key export".into()))
-    }
+    // get_private_key intentionally removed — private keys never leave
+    // the HSM. Decrypt via unwrap_cek_a128kw / unwrap_cek_ecdh_es;
+    // sign via HsmCryptoProvider::sign; CSR-gen via generate_csr (key
+    // stays in-HSM). If you reach for "give me the bytes" you're
+    // designing against the HSE model.
 
     /// Get the current provisioning lifecycle state.
     fn provisioning_state(&self) -> Result<ProvisioningState, HsmError>;

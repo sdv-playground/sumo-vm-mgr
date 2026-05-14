@@ -829,29 +829,9 @@ impl HsmProvider for SimHsm {
         Ok(build_public_cose_key_with_alg(&x, &y, alg))
     }
 
-    fn get_private_key(&self, role: KeyRole) -> Result<Vec<u8>, HsmError> {
-        if !self.is_provisioned()? {
-            return Err(HsmError::NotProvisioned);
-        }
-        let priv_path = self.keys_dir().join(format!("{}.priv", role.key_id()));
-        let pub_path = self.keys_dir().join(format!("{}.pub", role.key_id()));
-        if !priv_path.exists() {
-            return Err(HsmError::KeystoreError(format!(
-                "no private key for role {:?} at {}",
-                role,
-                priv_path.display()
-            )));
-        }
-        let priv_pem = std::fs::read_to_string(&priv_path)
-            .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", priv_path.display())))?;
-        let scalar = extract_ec_scalar_from_pem(&priv_pem)?;
-
-        let pub_pem = std::fs::read_to_string(&pub_path)
-            .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", pub_path.display())))?;
-        let (x, y) = extract_ec_public_from_pem(&pub_pem)?;
-
-        Ok(build_private_cose_key(&scalar, &x, &y))
-    }
+    // get_private_key removed from the trait — even SimHsm doesn't
+    // expose its keystore files as bytes. Sign / unwrap_cek go through
+    // operation-based methods so production HSE works the same way.
 
     fn provisioning_state(&self) -> Result<ProvisioningState, HsmError> {
         if self.manifest_path().exists() {
@@ -1156,20 +1136,6 @@ fn build_public_cose_key_with_alg(
     if alg.is_none() {
         key.alg = None;
     }
-    key.to_vec().unwrap()
-}
-
-/// Build a COSE_Key (EC2, P-256, private) as CBOR bytes.
-fn build_private_cose_key(d: &[u8], x: &[u8], y: &[u8]) -> Vec<u8> {
-    use coset::CborSerializable;
-    let mut key = coset::CoseKeyBuilder::new_ec2_priv_key(
-        coset::iana::EllipticCurve::P_256,
-        x.to_vec(),
-        y.to_vec(),
-        d.to_vec(),
-    )
-    .build();
-    key.alg = None;
     key.to_vec().unwrap()
 }
 
