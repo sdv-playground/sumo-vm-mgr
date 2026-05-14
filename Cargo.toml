@@ -9,6 +9,7 @@ members = [
     "crates/machine-mgr",
     "crates/vm-service",
     "crates/hsm",
+    "crates/sumo-verify",
     "crates/vhsm-ssd",
     "crates/vm-wire",
     "crates/vm-devices",

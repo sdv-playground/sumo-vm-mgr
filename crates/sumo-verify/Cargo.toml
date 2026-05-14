@@ -1,0 +1,16 @@
+[package]
+name = "sumo-verify"
+version = "0.1.0"
+edition = "2021"
+description = "CLI that validates a staged bank's IVD signature against the HSM's ivd-signing key. External secure boot invokes this before launching each component; on managed-cvc (no real secure boot) the start script uses it as the launch gate."
+
+[[bin]]
+name = "sumo-verify"
+path = "src/main.rs"
+
+[dependencies]
+# All the IVD wire format + sig verify lives in hsm::ivd. We construct
+# a SimHsm pointing at the same keystore supernova uses and call
+# verify_bank directly — no vhsm-ssd hop needed for the host-side
+# verifier.
+hsm = { path = "../hsm", features = ["crypto"] }
