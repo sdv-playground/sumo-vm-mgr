@@ -35,14 +35,36 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub base_path: Option<PathBuf>,
 
-    /// Override the bank-set this component plugs into. Optional —
-    /// when absent, defaults to whichever `BankSet` matches `id`
-    /// (see [`bank_set_for_id`]). Use this when the component id
-    /// is deployment-specific (e.g. `"rt"`) and shouldn't have an
-    /// alias hardcoded into the generic factory; configure as
-    /// `bank_set: custom` in YAML.
+    /// Override the bank-set name this component plugs into.
+    /// Resolved via `BankSet::from_str`; falls back to the id-based
+    /// mapping in [`bank_set_for_id`]. Use for deployment-specific
+    /// component ids (e.g. `"rt"` → `bank_set: custom`).
     #[serde(default)]
     pub bank_set: Option<String>,
+
+    /// Explicit NV slot index (0..=NUM_BANK_SETS-1). Wins over both
+    /// `bank_set` and id-based resolution when present. Set this
+    /// when a deployment uses more than one custom slot — the slot
+    /// number is the source of truth, the dir name + layout below
+    /// describe what to do with it.
+    #[serde(default)]
+    pub slot: Option<u8>,
+
+    /// On-disk subdirectory under `images_dir`. Defaults to the
+    /// well-known dir for whichever BankSet `bank_set`/`slot`/`id`
+    /// resolves to (`vm1`, `host-os`, `custom`, ...). Override when
+    /// two custom slots need distinct dirs (`rt`, `co-processor`, ...).
+    #[serde(default)]
+    pub storage_subdir: Option<String>,
+
+    /// SUIT payload-URI → filename mapping for this slot. One of:
+    /// - `"vm"`: `#kernel` → `kernel`, `#qvm-config` → `qvm.conf`
+    /// - `"boot-ifs"`: `#kernel` → `boot.ifs`, `#qvm-config` → `qvm.conf`
+    /// - `"generic"`: pass-through (`#foo` → `foo`)
+    ///
+    /// Defaults to the well-known layout for the resolved BankSet.
+    #[serde(default)]
+    pub bank_layout: Option<String>,
 }
 
 /// Result of building a component — includes the Component trait object,
@@ -81,17 +103,54 @@ pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
     }
 }
 
-/// Resolve the bank-set for a `ComponentSpec`. Explicit `bank_set`
-/// field wins; falls back to id-based mapping via [`bank_set_for_id`].
-/// Returns `None` if neither resolves — caller decides whether that's
+/// Resolve the bank-set for a `ComponentSpec`. Priority:
+/// 1. Explicit `slot:` (numeric, deployment-controlled).
+/// 2. Explicit `bank_set:` name (parsed via `BankSet::from_str`).
+/// 3. Id-based fallback via [`bank_set_for_id`].
+///
+/// Returns `None` if none resolve — caller decides whether that's
 /// fatal (most components require a bank-set; pure-runtime ones can
 /// be `None`).
 pub fn resolve_bank_set(spec: &ComponentSpec) -> Option<BankSet> {
-    if let Some(ref s) = spec.bank_set {
-        BankSet::from_str(s)
-    } else {
-        bank_set_for_id(&spec.id)
+    if let Some(slot) = spec.slot {
+        return Some(BankSet(slot));
     }
+    if let Some(ref s) = spec.bank_set {
+        return BankSet::from_str(s);
+    }
+    bank_set_for_id(&spec.id)
+}
+
+/// Resolve both the bank-set slot AND its spec (dir name + layout)
+/// from a `ComponentSpec`. The slot comes from [`resolve_bank_set`];
+/// the dir name and layout are taken from the explicit fields when
+/// present, else defaulted via `BankSetSpec::for_well_known`.
+///
+/// Returns `None` if the slot can't be resolved.
+pub fn resolve_bank_set_spec(
+    spec: &ComponentSpec,
+) -> Option<(BankSet, vm_mgr::bank_spec::BankSetSpec)> {
+    let bank_set = resolve_bank_set(spec)?;
+    let mut bspec = vm_mgr::bank_spec::BankSetSpec::for_well_known(bank_set);
+    if let Some(ref subdir) = spec.storage_subdir {
+        bspec.dir_name = subdir.clone();
+    }
+    if let Some(ref layout) = spec.bank_layout {
+        bspec.layout = match layout.as_str() {
+            "vm" => vm_mgr::bank_spec::BankLayout::Vm,
+            "boot-ifs" | "bootifs" => vm_mgr::bank_spec::BankLayout::BootIfs,
+            "generic" | "custom" => vm_mgr::bank_spec::BankLayout::Generic,
+            other => {
+                tracing::warn!(
+                    component = %spec.id,
+                    bank_layout = %other,
+                    "unknown bank_layout — falling back to default",
+                );
+                bspec.layout
+            }
+        };
+    }
+    Some((bank_set, bspec))
 }
 
 /// Build a single component from its spec and shared dependencies.
@@ -99,10 +158,10 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
     spec: &ComponentSpec,
     deps: &FactoryDeps<D>,
 ) -> Option<BuiltComponent> {
-    let Some(bank_set) = resolve_bank_set(spec) else {
+    let Some((bank_set, bank_spec)) = resolve_bank_set_spec(spec) else {
         tracing::warn!(
-            "no bank-set for component id '{}' (no `bank_set:` override and \
-             id doesn't match a well-known set) — skipping",
+            "no bank-set for component id '{}' (no `slot:`/`bank_set:` \
+             override and id doesn't match a well-known set) — skipping",
             spec.id,
         );
         return None;
@@ -136,7 +195,8 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 comp_config,
                 deps.vm_service_addr.clone(),
                 spec.storage_path.clone().or_else(|| spec.base_path.clone()),
-            );
+            )
+            .with_bank_spec(bank_spec.clone());
             let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);
             let component: Arc<dyn Component> = Arc::new(comp);
 
@@ -180,7 +240,8 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 comp_config,
                 deps.vm_service_addr.clone(),
                 images_dir,
-            );
+            )
+            .with_bank_spec(bank_spec.clone());
 
             if bank_set == BankSet::Hsm {
                 if let Some(ref provider) = deps.hsm_provider {

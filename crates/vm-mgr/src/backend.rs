@@ -154,6 +154,11 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     entity_info: EntityInfo,
     capabilities: Capabilities,
     bank_set: BankSet,
+    /// Per-slot behavioral data (on-disk dir, SUIT-URI → filename
+    /// layout). Constructed by `BankSetSpec::for_well_known(bank_set)`
+    /// in the existing constructors; Phase 3 lets component-factory
+    /// supply a deployment-specific spec via `with_spec`.
+    bank_spec: crate::bank_spec::BankSetSpec,
     config: ComponentConfig,
     nv: Arc<Mutex<NvStore<D>>>,
     manifest_provider: Arc<dyn ManifestProvider>,
@@ -278,6 +283,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 operations: false,
             },
             bank_set,
+            bank_spec: crate::bank_spec::BankSetSpec::for_well_known(bank_set),
             config,
             nv,
             manifest_provider,
@@ -310,6 +316,15 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// Override the component display name (shown in SOVD component listing).
     pub fn with_display_name(mut self, name: String) -> Self {
         self.entity_info.name = name;
+        self
+    }
+
+    /// Override the bank-set spec (on-disk dir + URI→filename layout).
+    /// Constructors default to `BankSetSpec::for_well_known(bank_set)`;
+    /// component-factory uses this to inject deployment-config-driven
+    /// values once Phase 3 wires the ComponentSpec → BankSetSpec path.
+    pub fn with_bank_spec(mut self, spec: crate::bank_spec::BankSetSpec) -> Self {
+        self.bank_spec = spec;
         self
     }
 
@@ -432,7 +447,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// images_dir is configured (tests / in-memory only).
     fn target_bank_dir(&self, target: Bank) -> Option<PathBuf> {
         self.images_dir.as_ref().map(|images_dir| {
-            images_dir.join(bank_set_dir_name(self.bank_set)).join(bank_dir_name(target))
+            images_dir.join(&self.bank_spec.dir_name).join(bank_dir_name(target))
         })
     }
 
@@ -477,7 +492,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         }
         let bank_id = format!(
             "{}/{}",
-            bank_set_dir_name(self.bank_set),
+            &self.bank_spec.dir_name,
             bank_dir_name(target),
         );
 
@@ -500,7 +515,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// space-reclaimed location on the same filesystem as its final home.
     fn prepare_target_bank_dir(&self, target: Bank) -> BackendResult<()> {
         let Some(images_dir) = self.images_dir.as_ref() else { return Ok(()); };
-        let set_name = bank_set_dir_name(self.bank_set);
+        let set_name = &self.bank_spec.dir_name;
         let bank_dir = images_dir.join(set_name).join(bank_dir_name(target));
         std::fs::create_dir_all(&bank_dir)
             .map_err(|e| BackendError::Internal(format!("create bank dir {}: {e}", bank_dir.display())))?;
@@ -751,7 +766,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                     "no digest for component {comp_idx}"
                 )))?;
 
-            let output_path = bank_dir.join(payload_target_name(self.bank_set, uri.as_str()));
+            let output_path = bank_dir.join(
+                crate::bank_spec::payload_target_name(self.bank_spec.layout, uri.as_str()),
+            );
 
             tracing::info!(
                 uri = %uri,
@@ -970,7 +987,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let raw_path = bank_dir.join(format!("upload-{comp_idx}.tmp"));
         let (size, _upload_hash) = crate::streaming::save_raw_payload(stream, &raw_path).await?;
 
-        let target_name = payload_target_name(self.bank_set, uri);
+        let target_name = crate::bank_spec::payload_target_name(self.bank_spec.layout, uri);
         let output_path = bank_dir.join(&target_name);
 
         tracing::info!(
@@ -1543,6 +1560,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             min_security_ver,
             self.images_dir.as_deref(),
             self.bank_set,
+            &self.bank_spec,
             target_bank,
         )
         .await {
@@ -1833,15 +1851,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
             // Write firmware payload to bank directory
             if let Some(ref images_dir) = self.images_dir {
-                let set_name = match self.bank_set {
-                    BankSet::HostOs => "host-os",
-                    BankSet::Vm1 => "vm1",
-                    BankSet::Vm2 => "vm2",
-                    BankSet::Hsm => "hsm",
-                    BankSet::App => "app",
-                    BankSet::Custom => "custom",
-                    _ => "custom",
-                };
+                let set_name = self.bank_spec.dir_name.as_str();
                 let bank_dir_name = match result.target_bank {
                     Bank::A => "bank_a",
                     Bank::B => "bank_b",
@@ -2212,15 +2222,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
         // Flip the `current` symlink so vm-service boots the right bank
         if let (Some(ref images_dir), Some(ref socket_path)) = (&self.images_dir, &self.vm_service_addr) {
-            let set_name = match self.bank_set {
-                BankSet::HostOs => "host-os",
-                BankSet::Vm1 => "vm1",
-                BankSet::Vm2 => "vm2",
-                BankSet::Hsm => "hsm",
-                BankSet::App => "app",
-                BankSet::Custom => "custom",
-                _ => "custom",
-            };
+            let set_name = self.bank_spec.dir_name.as_str();
             let target_bank = *self.running_bank.lock().unwrap();
             let bank_dir_name = match target_bank {
                 Bank::A => "bank_a",
@@ -2564,58 +2566,17 @@ pub(crate) fn did_value_to_json(_did_num: u16, value: &[u8], reg: Option<&DidEnt
     }
 }
 
-/// Per-bank-set on-disk filenames after OTA install. Returns
-/// `(kernel, qvm_config)`. vm-service.yaml's `images.kernel` and `qvm_config`
-/// must match these for each VM; mismatch surfaces as "kernel not found" at
-/// vm-service start. VMs share the qvm-hosted layout regardless of guest OS;
-/// host-os ships a bare IFS for direct boot.
-fn bank_file_names(bank_set: BankSet) -> (&'static str, &'static str) {
-    match bank_set {
-        BankSet::Vm1 | BankSet::Vm2 => ("kernel", "qvm.conf"),
-        BankSet::HostOs | BankSet::Hsm | BankSet::App => ("boot.ifs", "qvm.conf"),
-        // No VM-style assumptions for Custom — the SUIT manifest's
-        // payload URIs are passed through verbatim via the
-        // `payload_target_name` fallback.
-        BankSet::Custom => ("", ""),
-        // Phase 2 will replace this whole helper with a deployment-
-        // supplied `BankLayout` carried on the backend. Until then,
-        // any user-allocated slot gets the same pass-through default
-        // as Custom.
-        _ => ("", ""),
-    }
-}
-
-pub(crate) fn bank_set_dir_name(bank_set: BankSet) -> &'static str {
-    match bank_set {
-        BankSet::HostOs => "host-os",
-        BankSet::Vm1 => "vm1",
-        BankSet::Vm2 => "vm2",
-        BankSet::Hsm => "hsm",
-        BankSet::App => "app",
-        BankSet::Custom => "custom",
-        _ => "custom",
-    }
-}
-
 pub(crate) fn bank_dir_name(bank: Bank) -> &'static str {
     match bank {
         Bank::A => "bank_a",
         Bank::B => "bank_b",
     }
 }
-
-/// Map a SUIT payload URI to the on-disk filename inside the target bank dir.
-/// Stays in lockstep with `bank_file_names()`.
-pub(crate) fn payload_target_name(bank_set: BankSet, uri: &str) -> String {
-    let (kernel_name, qvm_config_name) = bank_file_names(bank_set);
-    match uri {
-        "#kernel" => kernel_name.to_string(),
-        "#firmware" => "rootfs.img".to_string(),
-        "#config" => "vm-config.yaml".to_string(),
-        "#qvm-config" => qvm_config_name.to_string(),
-        other => other.trim_start_matches('#').to_string(),
-    }
-}
+// `bank_set_dir_name` / `bank_file_names` / `payload_target_name`
+// retired in Phase 2 — per-slot behavior lives on `BankSetSpec` in
+// `crate::bank_spec` now and is read off `self.bank_spec` for the
+// backend or passed as `&BankSetSpec` to free functions in
+// `streaming::process_envelope_stream`.
 
 fn map_ota_error(e: ota::OtaError) -> BackendError {
     match e {

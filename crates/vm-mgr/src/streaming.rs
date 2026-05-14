@@ -16,7 +16,8 @@ use sumo_onboard::decryptor::StreamingDecryptor;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
-use crate::backend::{bank_dir_name, bank_set_dir_name, payload_target_name};
+use crate::backend::bank_dir_name;
+use crate::bank_spec::{payload_target_name, BankSetSpec};
 use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware};
 
 use sovd_core::{BackendError, PackageStream};
@@ -44,6 +45,7 @@ pub async fn process_envelope_stream(
     min_security_ver: u32,
     images_dir: Option<&Path>,
     bank_set: BankSet,
+    bank_spec: &BankSetSpec,
     target_bank: Bank,
 ) -> Result<ValidatedFirmware, BackendError> {
     // Convert PackageStream → AsyncRead
@@ -101,9 +103,8 @@ pub async fn process_envelope_stream(
     // no raw device-key bytes flow through this pipeline anymore.
     let suit_key_unwrap = manifest_provider.key_unwrap_for_decryption();
 
-    let set_name = bank_set_dir_name(bank_set);
     let bank_dir = images_dir.map(|dir| {
-        dir.join(set_name).join(bank_dir_name(target_bank))
+        dir.join(&bank_spec.dir_name).join(bank_dir_name(target_bank))
     });
     if let Some(ref bd) = bank_dir {
         std::fs::create_dir_all(bd)
@@ -135,7 +136,7 @@ pub async fn process_envelope_stream(
         // Land payload directly inside the target bank dir under its
         // canonical filename — no rename pass needed downstream.
         let image_path = bank_dir.as_ref().map(|bd| {
-            bd.join(payload_target_name(bank_set, pp.key.as_str()))
+            bd.join(payload_target_name(bank_spec.layout, pp.key.as_str()))
         });
 
         tracing::info!(

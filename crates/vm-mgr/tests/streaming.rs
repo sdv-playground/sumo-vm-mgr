@@ -153,6 +153,7 @@ async fn single_component_unencrypted() {
         0,
         Some(tmp.path()),
         BankSet::Vm1,
+        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -195,6 +196,7 @@ async fn single_component_encrypted() {
         0,
         Some(tmp.path()),
         BankSet::Vm1,
+        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -402,6 +404,7 @@ async fn chunked_delivery() {
         0,
         Some(tmp.path()),
         BankSet::Vm1,
+        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -447,6 +450,7 @@ async fn corrupted_payload_digest_mismatch() {
         0,
         Some(tmp.path()),
         BankSet::Vm1,
+        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -488,6 +492,7 @@ async fn truncated_transfer() {
         0,
         Some(tmp.path()),
         BankSet::Vm1,
+        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -526,6 +531,7 @@ async fn wrong_device_key() {
         0,
         Some(tmp.path()),
         BankSet::Vm1,
+        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -564,6 +570,7 @@ async fn anti_rollback_rejects_old_security_version() {
         5, // min_security_ver = 5 — higher than manifest's 1
         Some(tmp.path()),
         BankSet::Vm1,
+        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -613,6 +620,7 @@ async fn stream_error_mid_transfer() {
         0,
         Some(tmp.path()),
         BankSet::Vm1,
+        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
