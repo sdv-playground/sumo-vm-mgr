@@ -44,29 +44,108 @@ impl std::error::Error for HsmError {}
 
 /// Well-known HSM key slot roles.
 ///
-/// These define the standard slot indices for keys used by the SOVD
-/// update pipeline. Slots beyond these are application keys.
+/// Three trust tiers verify code that runs on this device, plus a few
+/// per-device operational keys. Each role lives in a distinct slot and
+/// rotates on its own cadence; the factory-floor anchor is `KeyAuthority`
+/// (rarely rotated) and everything else can be replaced via SUIT
+/// envelopes signed by the appropriate authority above it.
+///
+/// Slot count is fixed — see [`KeyRole::mandatory_roles`] for the list
+/// every provisioned device must populate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyRole {
-    /// Software authority (EC-P256 public) — verifies firmware SUIT envelopes.
-    SoftwareAuthority,
-    /// Device decryption key (EC-P256 ECDH) — decrypts all encrypted content.
-    DeviceDecryption,
-    /// ECU signing key (EC-P256) with certificate.
-    EcuSigning,
-    /// Key authority (EC-P256 public) — verifies future HSM key envelopes.
-    /// After first provisioning, replaces the factory signing key as trust anchor.
+    // ------------------------- trust anchors ------------------------
+    //
+    /// Verifies future HSM key envelopes. Trust anchor; after first
+    /// provisioning replaces the factory signing key. Rotation: almost
+    /// never (the floor of the trust chain).
     KeyAuthority,
+
+    /// Verifies host-side firmware SUIT envelopes (host-os, vm1, vm2,
+    /// hsm bundle). Rotation: rare. Lives above PlatformAuthority and
+    /// ApplicationAuthority in the trust hierarchy.
+    SoftwareAuthority,
+
+    /// Verifies platform-tier container envelopes — load-bearing
+    /// guest services that participate in vehicle infrastructure
+    /// (SOVD gateway, observability, security helpers). Rotation: rare.
+    /// Containers verified with this key get the privileged runtime
+    /// tier (host SOVD access, broader sandbox).
+    PlatformAuthority,
+
+    /// Verifies vehicle-function container envelopes — ADAS,
+    /// infotainment, body control apps. Inherently untrusted in the
+    /// safety sense; sandboxed at runtime. Rotation: frequent. Can be
+    /// delegated wide (partner ecosystems, app developer pipelines).
+    ApplicationAuthority,
+
+    // -------------------- per-device operational --------------------
+    //
+    /// EC-P256 ECDH key — decrypts confidential payloads (firmware
+    /// CEK unwrap, encrypted container layers). Private half stays in
+    /// the HSM; envelopes are encrypted to its public half.
+    DeviceDecryption,
+
+    /// EC-P256 signing key with cert — ECU's outbound signing
+    /// identity for vehicle-bus auth, attestations, etc.
+    EcuSigning,
+
+    /// EC-P256 signing key generated **inside the HSM at provisioning
+    /// time, private NEVER leaves**. Used to self-sign provisioned
+    /// firmware bank dirs after `Validator` succeeds. External
+    /// secure-boot verifies each bank with this key's public half
+    /// before launching the component. Rotation: never on-device
+    /// (regenerated only on HSM reset / device repurpose).
+    IvdSigning,
 }
 
 impl KeyRole {
+    /// Stable lower-case identifier used as the slot's key_id in the
+    /// keystore CBOR schema and on-disk SimHsm filenames.
     pub fn key_id(self) -> &'static str {
         match self {
+            KeyRole::KeyAuthority => "key-authority",
             KeyRole::SoftwareAuthority => "sw-authority",
+            KeyRole::PlatformAuthority => "platform-authority",
+            KeyRole::ApplicationAuthority => "application-authority",
             KeyRole::DeviceDecryption => "device-decrypt",
             KeyRole::EcuSigning => "ecu-signing",
-            KeyRole::KeyAuthority => "key-authority",
+            KeyRole::IvdSigning => "ivd-signing",
         }
+    }
+
+    /// Every role that MUST be populated before the HSM is considered
+    /// fully provisioned. Used by provisioning state-machine checks
+    /// and (eventually) by `Provider::status()` to surface
+    /// half-provisioned devices.
+    pub fn mandatory_roles() -> &'static [KeyRole] {
+        &[
+            KeyRole::KeyAuthority,
+            KeyRole::SoftwareAuthority,
+            KeyRole::PlatformAuthority,
+            KeyRole::ApplicationAuthority,
+            KeyRole::DeviceDecryption,
+            KeyRole::EcuSigning,
+            KeyRole::IvdSigning,
+        ]
+    }
+
+    /// `true` if the private half lives inside the HSM. Such roles
+    /// are generated locally during provisioning and never cross the
+    /// boundary in either direction — the HSM keystore won't accept
+    /// a `private_key: Some(non-empty)` for these roles, and there's
+    /// no `get_private_key` to pull them back out either.
+    ///
+    /// The other roles (`KeyAuthority`, `SoftwareAuthority`,
+    /// `PlatformAuthority`, `ApplicationAuthority`) are trust anchors
+    /// — their private halves live off-device, with the corresponding
+    /// signing infrastructure. The HSM only stores their public halves
+    /// for envelope verification.
+    pub fn is_device_generated(self) -> bool {
+        matches!(
+            self,
+            KeyRole::DeviceDecryption | KeyRole::EcuSigning | KeyRole::IvdSigning,
+        )
     }
 }
 
@@ -182,18 +261,78 @@ mod tests {
     fn keyrole_key_id_is_unique_per_role() {
         use std::collections::HashSet;
         let roles = [
+            KeyRole::KeyAuthority,
             KeyRole::SoftwareAuthority,
+            KeyRole::PlatformAuthority,
+            KeyRole::ApplicationAuthority,
             KeyRole::DeviceDecryption,
             KeyRole::EcuSigning,
-            KeyRole::KeyAuthority,
+            KeyRole::IvdSigning,
         ];
         let ids: HashSet<_> = roles.iter().map(|r| r.key_id()).collect();
         assert_eq!(ids.len(), roles.len(), "key_id() must be unique per role");
 
+        // Pin the exact strings — these are wire-format slot names
+        // baked into provisioning envelopes; drift would silently break
+        // every previously-provisioned device.
+        assert_eq!(KeyRole::KeyAuthority.key_id(), "key-authority");
         assert_eq!(KeyRole::SoftwareAuthority.key_id(), "sw-authority");
+        assert_eq!(KeyRole::PlatformAuthority.key_id(), "platform-authority");
+        assert_eq!(KeyRole::ApplicationAuthority.key_id(), "application-authority");
         assert_eq!(KeyRole::DeviceDecryption.key_id(), "device-decrypt");
         assert_eq!(KeyRole::EcuSigning.key_id(), "ecu-signing");
-        assert_eq!(KeyRole::KeyAuthority.key_id(), "key-authority");
+        assert_eq!(KeyRole::IvdSigning.key_id(), "ivd-signing");
+    }
+
+    #[test]
+    fn mandatory_roles_lists_every_role() {
+        // If a new KeyRole variant lands and isn't added to
+        // mandatory_roles(), this test catches it — every variant
+        // should be either mandatory or explicitly opted out (and
+        // there are no opt-outs today).
+        let mandatory = KeyRole::mandatory_roles();
+        assert_eq!(mandatory.len(), 7);
+
+        // Sanity: every entry is distinct.
+        use std::collections::HashSet;
+        let ids: HashSet<_> = mandatory.iter().collect();
+        assert_eq!(ids.len(), mandatory.len());
+    }
+
+    #[test]
+    fn device_generated_roles_match_private_on_device() {
+        // The split mirrors the trust topology: anything whose
+        // PRIVATE half lives on-device must be generated on-device
+        // (no push, no pull). Trust anchors are public-only.
+        let device_generated = [
+            KeyRole::DeviceDecryption,
+            KeyRole::EcuSigning,
+            KeyRole::IvdSigning,
+        ];
+        let trust_anchors = [
+            KeyRole::KeyAuthority,
+            KeyRole::SoftwareAuthority,
+            KeyRole::PlatformAuthority,
+            KeyRole::ApplicationAuthority,
+        ];
+
+        for &r in &device_generated {
+            assert!(
+                r.is_device_generated(),
+                "{r:?} should be device-generated (private lives in HSM)",
+            );
+        }
+        for &r in &trust_anchors {
+            assert!(
+                !r.is_device_generated(),
+                "{r:?} is a trust anchor (private lives off-device with signing infra)",
+            );
+        }
+        // The union covers every mandatory role.
+        assert_eq!(
+            device_generated.len() + trust_anchors.len(),
+            KeyRole::mandatory_roles().len(),
+        );
     }
 
     #[test]

@@ -38,8 +38,52 @@ use sumo_offboard::ImageManifestBuilder;
 
 use hsm::payload::*;
 
-/// Number of "application" key slots (in addition to 5 well-known + 3 test slots).
-const NUM_APP_SLOTS: usize = 92;
+/// Number of "application" key slots (beyond the 8 well-known + 3 test slots).
+const NUM_APP_SLOTS: usize = 89;
+
+/// Total well-known slots (in `KeyRole::mandatory_roles()` order plus
+/// `jwt-signing` which the dev/test rig needs alongside).
+const NUM_WELL_KNOWN_SLOTS: usize = 8;
+const NUM_TEST_SLOTS: usize = 3;
+
+/// Load an EC-P256 keypair from disk if it exists, else generate a
+/// fresh one and persist it under the same path. Used for trust-anchor
+/// keys (key-authority / platform-authority / application-authority)
+/// and for device-local keys (ivd-signing) so consecutive build runs
+/// reuse the same key material — otherwise re-provisioning would
+/// invalidate every previously-signed envelope and every previously-
+/// signed bank.
+///
+/// On-disk format is a plain 97-byte blob: `priv[32] || pub[65]` (SEC1
+/// uncompressed, leading `0x04`). Internal to this script — clients
+/// receive material via the SUIT envelope or `*.cosekey` exports.
+///
+/// Return type matches [`generate_ec_p256_raw`] so call sites can be
+/// dropped in unchanged.
+fn load_or_generate_ec_keypair(path: &Path, label: &str) -> (Vec<u8>, Vec<u8>) {
+    if path.exists() {
+        let bytes = fs::read(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert_eq!(
+            bytes.len(),
+            97,
+            "expected 97 bytes (32 priv + 65 pub) in {}, got {}",
+            path.display(),
+            bytes.len(),
+        );
+        eprintln!("[hsm-keys] reused {label}: {}", path.display());
+        (bytes[..32].to_vec(), bytes[32..].to_vec())
+    } else {
+        let (priv_vec, pub_vec) = generate_ec_p256_raw();
+        let mut on_disk = Vec::with_capacity(97);
+        on_disk.extend_from_slice(&priv_vec);
+        on_disk.extend_from_slice(&pub_vec);
+        fs::write(path, &on_disk)
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        eprintln!("[hsm-keys] generated {label}: {}", path.display());
+        (priv_vec, pub_vec)
+    }
+}
 
 /// Guest identities that can register with the HSM.
 const GUESTS: &[&str] = &["bali-vm-1", "bali-vm-2", "bali-vm-3"];
@@ -144,23 +188,29 @@ fn main() {
         CoseKey::from_cose_key_bytes(&key.to_vec().unwrap()).unwrap()
     };
 
-    // Software authority key — its public half goes into the HSM keystore
-    // for firmware signature verification. Defaults to factory signing key if not provided.
-    let signing_key = if let Some(ref path) = signing_key_path {
-        let bytes = fs::read(path)
-            .unwrap_or_else(|e| panic!("failed to read signing key {path}: {e}"));
-        CoseKey::from_cose_key_bytes(&bytes).unwrap()
-    } else {
-        eprintln!("[hsm-keys] using factory signing key as software authority (no --signing-key)");
-        let key = coset::CoseKeyBuilder::new_ec2_priv_key(
-            iana::EllipticCurve::P_256,
-            FACTORY_SIGNING_PUBLIC[1..33].to_vec(),
-            FACTORY_SIGNING_PUBLIC[33..65].to_vec(),
-            FACTORY_SIGNING_SCALAR.to_vec(),
-        )
-        .algorithm(iana::Algorithm::ES256)
-        .build();
-        CoseKey::from_cose_key_bytes(&key.to_vec().unwrap()).unwrap()
+    // Software authority key — its public half goes into the HSM
+    // keystore for firmware signature verification. MUST be supplied
+    // explicitly; the previous "default to factory signing key"
+    // fallback collapsed sw-authority into the factory bootstrap
+    // anchor, defeating the trust separation. Generate one with
+    // `sumo-tool keygen --output sw-authority.key`.
+    let signing_key = match signing_key_path.as_ref() {
+        Some(path) => {
+            let bytes = fs::read(path)
+                .unwrap_or_else(|e| panic!("failed to read signing key {path}: {e}"));
+            CoseKey::from_cose_key_bytes(&bytes).unwrap()
+        }
+        None => {
+            usage();
+            eprintln!();
+            eprintln!("Error: --signing-key is required.");
+            eprintln!();
+            eprintln!("sw-authority MUST be a distinct key from the factory bootstrap");
+            eprintln!("(the well-known scalar=1 anchor) and from key-authority. Pass:");
+            eprintln!("  --signing-key <path/to/sw-authority.cosekey>");
+            eprintln!("Create one with `sumo-tool keygen` if you don't have one yet.");
+            std::process::exit(1);
+        }
     };
 
     // Load device public key — from CSR or public key file.
@@ -182,143 +232,194 @@ fn main() {
     };
 
     // ---------------------------------------------------------------
-    // 1. Generate key slots
+    // 1. Load / generate trust-anchor keypairs (off-device, retained
+    //    by the signing infrastructure)
+    //
+    // Persisted under keys_dir so consecutive builds reuse the same
+    // material. Regenerating would invalidate every envelope a
+    // previously-provisioned device is carrying.
+    //
+    // Note: only TRUST ANCHORS are loaded here. Device-side keys
+    // (device-decrypt, ecu-signing, ivd-signing, jwt-signing, ...)
+    // are generated INSIDE the HSM during provisioning — neither
+    // pushed in via the envelope nor pulled back out. The envelope
+    // enumerates those slots with empty material so SimHsm's
+    // `generate_missing_local_keys` knows to create them.
     // ---------------------------------------------------------------
-    println!("[hsm-keys] generating {} key slots...", NUM_APP_SLOTS + 8);
+    let (ka_priv, ka_pub) = load_or_generate_ec_keypair(
+        &keys_dir.join("key-authority.keypair"),
+        "key-authority",
+    );
+    let (_pa_priv, pa_pub) = load_or_generate_ec_keypair(
+        &keys_dir.join("platform-authority.keypair"),
+        "platform-authority",
+    );
+    let (_aa_priv, aa_pub) = load_or_generate_ec_keypair(
+        &keys_dir.join("application-authority.keypair"),
+        "application-authority",
+    );
 
-    let mut slots = Vec::with_capacity(NUM_APP_SLOTS + 8);
+    // ---------------------------------------------------------------
+    // 2. Build key slots — well-known first (KeyRole order), then jwt,
+    //    then test slots, then bulk app slots.
+    // ---------------------------------------------------------------
+    let total = NUM_APP_SLOTS + NUM_WELL_KNOWN_SLOTS + NUM_TEST_SLOTS;
+    println!("[hsm-keys] generating {} key slots...", total);
 
-    // Slot 0: Key Authority (EC-P256) — public key only, verifies subsequent HSM key envelopes.
-    // Private key stays with the backend (never sent to device).
-    let (ka_priv, ka_pub) = generate_ec_p256_raw();
-    slots.push(KeySlotDef {
+    let mut slots = Vec::with_capacity(total);
+
+    // Slot 0: Key Authority — public-key-only trust anchor for
+    // subsequent HSM key envelopes. Private stays with the backend.
+    slots.push(KeySlot {
         key_id: "key-authority".to_string(),
-        key_type: KEY_TYPE_EC_P256,
-        private_key: None,
-        public_key: Some(ka_pub.clone()),
-        certificate: None,
+        key_kind: KEY_TYPE_EC_P256,
+        anchor_public_key: Some(ka_pub.clone()),
         allowed_guests: None,
         allowed_ops: Some(vec![OP_VERIFY]),
     });
 
-    // Slot 1: Software authority — public key only, verifies firmware SUIT envelopes.
-    // Private key stays with the backend (never sent to device).
+    // Slot 1: Software Authority — verifies host-side firmware
+    // envelopes (vm1, vm2, host-os, hsm bundle). Public-key-only.
     let (_sw_auth_priv, sw_auth_pub) = extract_ec_raw(&signing_key);
-    slots.push(KeySlotDef {
+    slots.push(KeySlot {
         key_id: "sw-authority".to_string(),
-        key_type: KEY_TYPE_EC_P256,
-        private_key: None,
-        public_key: Some(sw_auth_pub),
-        certificate: None,
+        key_kind: KEY_TYPE_EC_P256,
+        anchor_public_key: Some(sw_auth_pub),
         allowed_guests: None,
         allowed_ops: Some(vec![OP_VERIFY, OP_GET_PUBKEY]),
     });
 
-    // Slot 2: Device decryption key — public key only.
-    // Private key is generated and held on-device; we only need the public
-    // half to encrypt firmware envelopes to this device.
-    slots.push(KeySlotDef {
+    // Slot 2: Platform Authority — verifies platform-tier container
+    // envelopes (SOVD gateway, observability, security helpers).
+    // Public-key-only; the customer's platform-signing infra owns the
+    // private half.
+    slots.push(KeySlot {
+        key_id: "platform-authority".to_string(),
+        key_kind: KEY_TYPE_EC_P256,
+        anchor_public_key: Some(pa_pub.clone()),
+        allowed_guests: None,
+        allowed_ops: Some(vec![OP_VERIFY, OP_GET_PUBKEY]),
+    });
+
+    // Slot 3: Application Authority — verifies vehicle-function
+    // container envelopes (ADAS, infotainment, body control, third-
+    // party apps). Public-key-only; signing delegated wide.
+    slots.push(KeySlot {
+        key_id: "application-authority".to_string(),
+        key_kind: KEY_TYPE_EC_P256,
+        anchor_public_key: Some(aa_pub.clone()),
+        allowed_guests: None,
+        allowed_ops: Some(vec![OP_VERIFY, OP_GET_PUBKEY]),
+    });
+
+    // Slot 4: Device decryption key — device generates internally
+    // (ensure_device_key on first boot, before the CSR is even
+    // emitted). Factory tool reads the pub from the CSR for
+    // envelope-encryption recipient binding, but the envelope itself
+    // just enumerates the slot — `generate_missing_local_keys` is a
+    // no-op here because the .priv/.pub already exist on disk.
+    slots.push(KeySlot {
         key_id: "device-decrypt".to_string(),
-        key_type: KEY_TYPE_EC_P256,
-        private_key: None,
-        public_key: Some(dk_pub.clone()),
-        certificate: None,
+        key_kind: KEY_TYPE_EC_P256,
+        anchor_public_key: None,
         allowed_guests: None,
         allowed_ops: None,
     });
 
-    // Slot 3: General ECU signing key with certificate
-    let (priv_key, pub_key) = generate_ec_p256_raw();
-    slots.push(KeySlotDef {
+    // Slot 5: ECU signing key — device generates internally during
+    // provisioning. No private bytes pushed; the certificate-issuance
+    // flow (factory tool ↔ device CSR for ecu-signing) is a
+    // follow-up — for now the slot ships with no certificate and the
+    // device-side key is generated by `generate_missing_local_keys`.
+    slots.push(KeySlot {
         key_id: "ecu-signing".to_string(),
-        key_type: KEY_TYPE_EC_P256,
-        private_key: Some(priv_key),
-        public_key: Some(pub_key),
-        certificate: Some(dummy_self_signed_cert(&crypto)),
+        key_kind: KEY_TYPE_EC_P256,
+        anchor_public_key: None,
         allowed_guests: Some(vec!["bali-vm-1".into()]),
-        allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_CERT, OP_GET_PUBKEY]),
+        allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
     });
 
-    // Slot 4: JWT signing key for jwt-mgr
-    let (priv_key, pub_key) = generate_ec_p256_raw();
-    slots.push(KeySlotDef {
+    // Slot 6: IVD signing — device generates internally. Private
+    // never crosses the HSM boundary in either direction. After
+    // provisioning, `sumo-verify` fetches the public half via
+    // `get_public_key("ivd-signing")` to validate bank signatures
+    // for external secure boot.
+    slots.push(KeySlot {
+        key_id: "ivd-signing".to_string(),
+        key_kind: KEY_TYPE_EC_P256,
+        anchor_public_key: None,
+        allowed_guests: None,
+        allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
+    });
+
+    // Slot 7: JWT signing key for jwt-mgr — device-generated. The
+    // guest's jwt-mgr fetches the public half via vHSM OP_GET_PUBKEY
+    // to validate locally-issued tokens.
+    slots.push(KeySlot {
         key_id: "jwt-signing".to_string(),
-        key_type: KEY_TYPE_EC_P256,
-        private_key: Some(priv_key),
-        public_key: Some(pub_key),
-        certificate: None,
+        key_kind: KEY_TYPE_EC_P256,
+        anchor_public_key: None,
         allowed_guests: Some(vec!["bali-vm-1".into()]),
         allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
     });
 
     // ---------------------------------------------------------------
     // Test keys (matching vhsm-test / test_all.sh expectations)
+    //
+    // Same rule as the device-side slots above: no private bytes
+    // pushed. Slot definitions are enumeration-only; SimHsm's
+    // `generate_missing_local_keys` fills in the material at
+    // provision time. Tests exercise these via OP_GET_PUBKEY for
+    // public halves and via OP_ENCRYPT/OP_DECRYPT for AES.
+    //
+    // The previous `dummy_self_signed_cert` for `mykey` is dropped —
+    // a CSR-based cert flow is the right path; for the slot
+    // enumeration only, we can't materialise a cert without knowing
+    // the locally-generated public half.
     // ---------------------------------------------------------------
 
-    // "mykey" — EC-P256 for sign/verify tests
-    let (priv_key, pub_key) = generate_ec_p256_raw();
-    slots.push(KeySlotDef {
+    slots.push(KeySlot {
         key_id: "mykey".to_string(),
-        key_type: KEY_TYPE_EC_P256,
-        private_key: Some(priv_key),
-        public_key: Some(pub_key),
-        certificate: Some(dummy_self_signed_cert(&crypto)),
+        key_kind: KEY_TYPE_EC_P256,
+        anchor_public_key: None,
         allowed_guests: Some(vec!["bali-vm-1".into()]),
-        allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_CERT, OP_GET_PUBKEY]),
+        allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
     });
 
-    // "storage-key" — AES-256 for encrypt/decrypt/derive tests
-    let mut aes_data = vec![0u8; 32];
-    crypto.random_bytes(&mut aes_data).unwrap();
-    slots.push(KeySlotDef {
+    slots.push(KeySlot {
         key_id: "storage-key".to_string(),
-        key_type: KEY_TYPE_AES_256,
-        private_key: Some(aes_data),
-        public_key: None,
-        certificate: None,
+        key_kind: KEY_TYPE_AES_256,
+        anchor_public_key: None,
         allowed_guests: Some(vec!["bali-vm-1".into()]),
         allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT, OP_DERIVE]),
     });
 
-    // "restricted-key" — ACL test: only bali-vm-2 can use it
-    let mut aes_restricted = vec![0u8; 32];
-    crypto.random_bytes(&mut aes_restricted).unwrap();
-    slots.push(KeySlotDef {
+    slots.push(KeySlot {
         key_id: "restricted-key".to_string(),
-        key_type: KEY_TYPE_AES_256,
-        private_key: Some(aes_restricted),
-        public_key: None,
-        certificate: None,
+        key_kind: KEY_TYPE_AES_256,
+        anchor_public_key: None,
         allowed_guests: Some(vec!["bali-vm-2".into()]),
         allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT]),
     });
 
-    // Generate remaining application slots
+    // Bulk application slots — slot enumeration only, no material.
     for i in 0..NUM_APP_SLOTS {
         let slot_num = i + 7;
+        let guest = GUESTS[i % GUESTS.len()].to_string();
         if i % 3 == 0 {
-            let mut key_data = vec![0u8; 32];
-            crypto.random_bytes(&mut key_data).unwrap();
-            let guest = GUESTS[i % GUESTS.len()];
-            slots.push(KeySlotDef {
+            slots.push(KeySlot {
                 key_id: format!("aes-{slot_num:03}"),
-                key_type: KEY_TYPE_AES_256,
-                private_key: Some(key_data),
-                public_key: None,
-                certificate: None,
-                allowed_guests: Some(vec![guest.to_string()]),
+                key_kind: KEY_TYPE_AES_256,
+                anchor_public_key: None,
+                allowed_guests: Some(vec![guest]),
                 allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT, OP_DERIVE]),
             });
         } else {
-            let (priv_key, pub_key) = generate_ec_p256_raw();
-            let guest = GUESTS[i % GUESTS.len()];
-            slots.push(KeySlotDef {
+            slots.push(KeySlot {
                 key_id: format!("ec-{slot_num:03}"),
-                key_type: KEY_TYPE_EC_P256,
-                private_key: Some(priv_key),
-                public_key: Some(pub_key),
-                certificate: None,
-                allowed_guests: Some(vec![guest.to_string()]),
+                key_kind: KEY_TYPE_EC_P256,
+                anchor_public_key: None,
+                allowed_guests: Some(vec![guest]),
                 allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
             });
         }
@@ -326,8 +427,8 @@ fn main() {
 
     println!("[hsm-keys] {} slots: {} EC-P256, {} AES-256",
         slots.len(),
-        slots.iter().filter(|s| s.key_type == KEY_TYPE_EC_P256).count(),
-        slots.iter().filter(|s| s.key_type == KEY_TYPE_AES_256).count(),
+        slots.iter().filter(|s| s.key_kind == KEY_TYPE_EC_P256).count(),
+        slots.iter().filter(|s| s.key_kind == KEY_TYPE_AES_256).count(),
     );
 
     // ---------------------------------------------------------------
@@ -641,15 +742,6 @@ fn generate_ec_p256_raw() -> (Vec<u8>, Vec<u8>) {
     pub_key.extend_from_slice(&y);
 
     (d, pub_key)
-}
-
-/// Generate a dummy self-signed certificate (fake DER for testing).
-fn dummy_self_signed_cert(crypto: &RustCryptoBackend) -> Vec<u8> {
-    let mut cert = vec![0x30, 0x82, 0x01, 0x00];
-    let mut body = vec![0u8; 252];
-    crypto.random_bytes(&mut body).unwrap();
-    cert.extend_from_slice(&body);
-    cert
 }
 
 /// Extract EC-P256 uncompressed public key (65 bytes) from a PKCS#10 CSR DER.

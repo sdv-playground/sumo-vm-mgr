@@ -32,7 +32,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
-use crate::payload::{self, HsmKeystore, KeySlotDef, KEY_TYPE_AES_256, KEY_TYPE_EC_P256};
+use crate::payload::{self, HsmKeystore, KeySlot, KEY_TYPE_AES_256, KEY_TYPE_EC_P256};
 use crate::{HsmError, HsmProvider, HsmStatus, KeyInfo, KeyRole, KeyType, ProvisioningState};
 
 pub struct SimHsm {
@@ -203,100 +203,167 @@ impl SimHsm {
     }
 
     /// Write the keystore files from a parsed CBOR payload.
+    ///
+    /// Two-pass:
+    /// 1. `write_key_files` — accept slot definitions; refuse any
+    ///    pushed private keys; write trust-anchor publics and certs.
+    /// 2. `generate_missing_local_keys` — every slot that still has
+    ///    no private material gets a fresh one generated locally.
+    ///    This is the device-side keygen the no-push-no-pull
+    ///    invariant requires.
     pub fn write_keystore(&self, ks: &HsmKeystore) -> Result<(), HsmError> {
         let keys_dir = self.keys_dir();
         std::fs::create_dir_all(&keys_dir)
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
 
-        // Write key files
         for slot in &ks.slots {
             self.write_key_files(slot, &keys_dir)?;
         }
 
-        // Write manifest (vhsm-test-ssd format)
+        self.generate_missing_local_keys(ks)?;
+
         self.write_manifest(&ks.slots)?;
-
-        // Write identities
         self.write_identities(ks)?;
-
         self.save_state(ks.security_version)?;
 
         Ok(())
     }
 
-    /// Write key material files for a single slot.
-    fn write_key_files(&self, slot: &KeySlotDef, keys_dir: &Path) -> Result<(), HsmError> {
-        match slot.key_type {
-            KEY_TYPE_EC_P256 => {
-                let priv_path = keys_dir.join(format!("{}.priv", slot.key_id));
-                match &slot.private_key {
-                    None => {
-                        // Public-key-only trust anchor (key-authority, sw-authority).
-                        // No private key to write — device only needs public half.
-                        tracing::debug!(key_id = %slot.key_id, "public-key-only slot, no private key");
-                    }
-                    Some(pk) if pk.is_empty() => {
-                        // CSR-based provisioning: device already generated this key.
-                        if !priv_path.exists() {
-                            return Err(HsmError::KeystoreError(format!(
-                                "key bundle has empty private_key for '{}' but no local key exists",
-                                slot.key_id
-                            )));
-                        }
-                        tracing::debug!(key_id = %slot.key_id, "preserving locally-generated private key");
-                    }
-                    Some(pk) => {
-                        write_pem_ec_private(&priv_path, pk)?;
-                    }
-                }
+    /// Write the envelope-visible material for a single slot:
+    ///
+    /// - Trust anchor (`slot.anchor_public_key = Some(...)`): write
+    ///   `{key_id}.pub` (PEM). The HSM stores the public half for
+    ///   envelope verification; the private half lives off-device.
+    /// - Device-generated (`slot.anchor_public_key = None`): no file
+    ///   write here. `generate_missing_local_keys` runs after the
+    ///   slot loop and creates the keypair / AES key locally.
+    ///
+    /// Wire-format invariants are enforced by `payload::decode`
+    /// (AES-256 cannot be a trust anchor; EC anchor pubkey must be
+    /// 65-byte uncompressed SEC1). This function trusts those
+    /// invariants.
+    fn write_key_files(&self, slot: &KeySlot, keys_dir: &Path) -> Result<(), HsmError> {
+        if let Some(ref pub_key) = slot.anchor_public_key {
+            // Trust anchor — write the public half. EC-P256 only
+            // (validated at decode).
+            let pub_path = keys_dir.join(format!("{}.pub", slot.key_id));
+            write_pem_ec_public(&pub_path, pub_key)?;
+        }
+        // Device-generated slots are deliberately a no-op here.
+        // generate_missing_local_keys produces the material.
+        Ok(())
+    }
 
-                // Write public key if available
-                if let Some(ref pub_key) = slot.public_key {
+    /// Generate any device-side key material that wasn't present
+    /// after envelope processing. Called once at the tail of
+    /// [`write_keystore`] so every slot in the keystore manifest
+    /// ends up with usable material — but the device, not the
+    /// envelope, owns every private byte.
+    ///
+    /// For EC-P256 slots the keypair is fresh `(OsRng-derived
+    /// scalar, SEC1-encoded public)`. For AES-256 slots a 32-byte
+    /// `.bin` file is written with OS CSPRNG bytes.
+    ///
+    /// Requires the `crypto` feature for keygen primitives; without
+    /// it (the trait-only build) we leave slots empty — callers in
+    /// crypto-less builds aren't materialising actual key files
+    /// either.
+    #[cfg(feature = "crypto")]
+    fn generate_missing_local_keys(&self, ks: &HsmKeystore) -> Result<(), HsmError> {
+        let keys_dir = self.keys_dir();
+        for slot in &ks.slots {
+            // Trust anchors carry their public bytes; the HSM never
+            // generates a private for them. Skip.
+            if slot.is_anchor() {
+                continue;
+            }
+            match slot.key_kind {
+                KEY_TYPE_EC_P256 => {
+                    let priv_path = keys_dir.join(format!("{}.priv", slot.key_id));
+                    if priv_path.exists() {
+                        // Already-provisioned slot (e.g. re-provision
+                        // envelope with same slot set); leave it.
+                        continue;
+                    }
+                    let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+                    let scalar = sk.to_bytes();
+                    let pk = sk.verifying_key().to_encoded_point(false);
+                    write_pem_ec_private(&priv_path, &scalar).map_err(|e| {
+                        HsmError::KeystoreError(format!(
+                            "generate {} priv: {e}",
+                            slot.key_id,
+                        ))
+                    })?;
                     let pub_path = keys_dir.join(format!("{}.pub", slot.key_id));
-                    write_pem_ec_public(&pub_path, pub_key)?;
+                    write_pem_ec_public(&pub_path, pk.as_bytes()).map_err(|e| {
+                        HsmError::KeystoreError(format!(
+                            "generate {} pub: {e}",
+                            slot.key_id,
+                        ))
+                    })?;
+                    tracing::info!(key_id = %slot.key_id, "generated EC-P256 keypair locally");
                 }
-
-                // Write certificate if available
-                if let Some(ref cert) = slot.certificate {
-                    let cert_path = keys_dir.join(format!("{}.cert", slot.key_id));
-                    write_pem_certificate(&cert_path, cert)?;
-                }
-            }
-            KEY_TYPE_AES_256 => {
-                if let Some(ref key_data) = slot.private_key {
+                KEY_TYPE_AES_256 => {
                     let path = keys_dir.join(format!("{}.bin", slot.key_id));
-                    std::fs::write(&path, key_data)
-                        .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))?;
+                    if path.exists() {
+                        continue;
+                    }
+                    let mut bytes = vec![0u8; 32];
+                    use rand::RngCore;
+                    rand::rngs::OsRng.fill_bytes(&mut bytes);
+                    std::fs::write(&path, &bytes).map_err(|e| {
+                        HsmError::KeystoreError(format!(
+                            "write generated {}: {e}",
+                            path.display(),
+                        ))
+                    })?;
+                    tracing::info!(key_id = %slot.key_id, "generated AES-256 key locally");
                 }
-            }
-            other => {
-                tracing::warn!(key_id = %slot.key_id, key_type = other, "unknown key type, skipping");
+                other => {
+                    tracing::warn!(
+                        key_id = %slot.key_id,
+                        key_kind = other,
+                        "unknown key_kind; cannot generate locally",
+                    );
+                }
             }
         }
+        Ok(())
+    }
+
+    /// No-op stub when the `crypto` feature is off. Callers in
+    /// non-crypto builds (trait-surface-only consumers) don't have
+    /// a working HSM anyway; the build still has to compile.
+    #[cfg(not(feature = "crypto"))]
+    fn generate_missing_local_keys(&self, _ks: &HsmKeystore) -> Result<(), HsmError> {
         Ok(())
     }
 
     /// Generate the vhsm-test-ssd manifest file.
     ///
     /// Format: `key_id type key_path cert_path [allowed_guests=...] [allowed_ops=...]`
-    fn write_manifest(&self, slots: &[KeySlotDef]) -> Result<(), HsmError> {
+    fn write_manifest(&self, slots: &[KeySlot]) -> Result<(), HsmError> {
         let mut f = std::fs::File::create(self.manifest_path())
             .map_err(|e| HsmError::KeystoreError(format!("create manifest: {e}")))?;
 
         for slot in slots {
-            let type_str = match slot.key_type {
+            let type_str = match slot.key_kind {
                 KEY_TYPE_EC_P256 => "EC-P256",
                 KEY_TYPE_AES_256 => "AES-256",
                 _ => continue,
             };
 
-            let key_path = match slot.key_type {
+            let key_path = match slot.key_kind {
                 KEY_TYPE_EC_P256 => format!("keys/{}.priv", slot.key_id),
                 KEY_TYPE_AES_256 => format!("keys/{}.bin", slot.key_id),
                 _ => continue,
             };
 
-            let cert_path = if slot.certificate.is_some() {
+            // Cert path: check whether a {key_id}.cert file landed
+            // on disk via the CSR-issuance flow (v2 envelope never
+            // ships certs). `-` if none.
+            let cert_disk_path = self.keys_dir().join(format!("{}.cert", slot.key_id));
+            let cert_path = if cert_disk_path.exists() {
                 format!("keys/{}.cert", slot.key_id)
             } else {
                 "-".to_string()
@@ -819,11 +886,16 @@ impl HsmProvider for SimHsm {
             .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", pub_path.display())))?;
         let (x, y) = extract_ec_public_from_pem(&pem)?;
 
-        // Signing verification keys need alg=ES256; ECDH keys have no algorithm.
+        // Signing / verification keys carry alg=ES256 so consumers
+        // know to use ECDSA-SHA256. The decrypt key is ECDH-only and
+        // has no COSE algorithm tag.
         let alg = match role {
-            KeyRole::SoftwareAuthority | KeyRole::EcuSigning | KeyRole::KeyAuthority => {
-                Some(coset::iana::Algorithm::ES256)
-            }
+            KeyRole::KeyAuthority
+            | KeyRole::SoftwareAuthority
+            | KeyRole::PlatformAuthority
+            | KeyRole::ApplicationAuthority
+            | KeyRole::EcuSigning
+            | KeyRole::IvdSigning => Some(coset::iana::Algorithm::ES256),
             KeyRole::DeviceDecryption => None,
         };
         Ok(build_public_cose_key_with_alg(&x, &y, alg))
@@ -1095,7 +1167,11 @@ pub(crate) fn write_pem_ec_public(path: &Path, uncompressed: &[u8]) -> Result<()
     write_pem_file(path, "PUBLIC KEY", &der)
 }
 
-/// Write a DER-encoded X.509 certificate as PEM.
+/// Write a DER-encoded X.509 certificate as PEM. Reserved for the
+/// CSR-issuance flow that writes a `{key_id}.cert` file alongside a
+/// device-generated key after a CA returns the signed cert. The v2
+/// envelope schema doesn't carry certs.
+#[allow(dead_code)]
 fn write_pem_certificate(path: &Path, der: &[u8]) -> Result<(), HsmError> {
     write_pem_file(path, "CERTIFICATE", der)
 }
@@ -1174,6 +1250,9 @@ mod tests {
     use super::*;
     use crate::payload::*;
 
+    /// Sample keystore — every slot enumeration-only. The schema
+    /// itself no longer has a `private_key` field, so the keystore
+    /// is incapable of carrying private bytes at all.
     fn sample_keystore() -> HsmKeystore {
         HsmKeystore {
             schema_version: SCHEMA_VERSION,
@@ -1188,26 +1267,17 @@ mod tests {
                 },
             }],
             slots: vec![
-                KeySlotDef {
+                KeySlot {
                     key_id: "mykey".into(),
-                    key_type: KEY_TYPE_EC_P256,
-                    private_key: Some(vec![0xAA; 32]),
-                    public_key: Some({
-                        let mut pk = vec![0x04];
-                        pk.extend_from_slice(&[0xBB; 32]);
-                        pk.extend_from_slice(&[0xCC; 32]);
-                        pk
-                    }),
-                    certificate: Some(vec![0x30, 0x82, 0x01, 0x00, 0xAA, 0xBB]),
+                    key_kind: KEY_TYPE_EC_P256,
+                    anchor_public_key: None,
                     allowed_guests: Some(vec!["bali-vm-1".into()]),
                     allowed_ops: Some(vec![OP_SIGN, OP_VERIFY]),
                 },
-                KeySlotDef {
+                KeySlot {
                     key_id: "storage-key".into(),
-                    key_type: KEY_TYPE_AES_256,
-                    private_key: Some(vec![0xDD; 32]),
-                    public_key: None,
-                    certificate: None,
+                    key_kind: KEY_TYPE_AES_256,
+                    anchor_public_key: None,
                     allowed_guests: Some(vec!["bali-vm-1".into()]),
                     allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT]),
                 },
@@ -1215,7 +1285,14 @@ mod tests {
         }
     }
 
+    // Both provisioning tests below exercise the
+    // generate_missing_local_keys pass, which is only present when
+    // the `crypto` feature is on (it needs p256 + rand). Gate them
+    // accordingly so the trait-only build still runs the rest of the
+    // test surface clean.
+
     #[test]
+    #[cfg(feature = "crypto")]
     fn provision_from_cbor_writes_keystore() {
         let tmp = std::env::temp_dir().join("hsm-test-provision");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1232,26 +1309,28 @@ mod tests {
         // Factory provision with raw CBOR (no SUIT feature needed for this test)
         hsm.write_keystore(&ks).unwrap();
 
-        // Verify manifest file
+        // Manifest still lists every slot — slot enumeration drives
+        // the on-disk layout even when private bytes come from
+        // generate_missing_local_keys instead of the envelope.
         let manifest = std::fs::read_to_string(tmp.join("manifest")).unwrap();
-        assert!(manifest.contains("mykey EC-P256 keys/mykey.priv keys/mykey.cert"));
+        assert!(manifest.contains("mykey EC-P256 keys/mykey.priv"));
         assert!(manifest.contains("allowed_guests=bali-vm-1"));
         assert!(manifest.contains("allowed_ops=SIGN,VERIFY"));
-        assert!(manifest.contains("storage-key AES-256 keys/storage-key.bin -"));
+        assert!(manifest.contains("storage-key AES-256 keys/storage-key.bin"));
         assert!(manifest.contains("allowed_ops=ENCRYPT,DECRYPT"));
 
-        // Verify identities file
         let identities = std::fs::read_to_string(tmp.join("identities")).unwrap();
         assert!(identities.contains("bali-vm-1 keys/bali-vm-1.pub"));
 
-        // Verify key files exist
+        // The key files MUST exist — generated locally by
+        // generate_missing_local_keys since the envelope had no
+        // private bytes.
         assert!(tmp.join("keys/mykey.priv").exists());
         assert!(tmp.join("keys/mykey.pub").exists());
-        assert!(tmp.join("keys/mykey.cert").exists());
         assert!(tmp.join("keys/storage-key.bin").exists());
         assert!(tmp.join("keys/bali-vm-1.pub").exists());
 
-        // Verify PEM format
+        // Verify PEM format of locally-generated key.
         let priv_pem = std::fs::read_to_string(tmp.join("keys/mykey.priv")).unwrap();
         assert!(priv_pem.starts_with("-----BEGIN EC PRIVATE KEY-----\n"));
         assert!(priv_pem.ends_with("-----END EC PRIVATE KEY-----\n"));
@@ -1259,28 +1338,30 @@ mod tests {
         let pub_pem = std::fs::read_to_string(tmp.join("keys/mykey.pub")).unwrap();
         assert!(pub_pem.starts_with("-----BEGIN PUBLIC KEY-----\n"));
 
-        // Verify AES key is raw bytes
+        // AES key is 32 bytes of OS-CSPRNG output now (not a constant).
         let aes_key = std::fs::read(tmp.join("keys/storage-key.bin")).unwrap();
         assert_eq!(aes_key.len(), 32);
-        assert!(aes_key.iter().all(|&b| b == 0xDD));
+        // Sanity: not all-zero (vanishingly unlikely from CSPRNG).
+        assert!(aes_key.iter().any(|&b| b != 0));
 
-        // Verify provision state
+        // Provision state recorded.
         let state = std::fs::read_to_string(tmp.join("provision_state")).unwrap();
-        assert!(state.starts_with("1")); // security_version
+        assert!(state.starts_with("1"));
 
-        // Verify list_keys works
         let keys = hsm.list_keys().unwrap();
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].key_id, "mykey");
         assert_eq!(keys[0].key_type, KeyType::EcP256);
-        assert!(keys[0].has_certificate);
         assert_eq!(keys[1].key_id, "storage-key");
         assert_eq!(keys[1].key_type, KeyType::Aes256);
-        assert!(!keys[1].has_certificate);
 
-        // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    // (The "no-push-private-keys" invariant is now enforced at the
+    // schema level: KeySlot has no `private_key` field. Decode-time
+    // validation lives in `payload::decode`; on-the-wire rejection
+    // tests for v1 envelopes and malformed anchors are in payload.rs.)
 
     #[test]
     fn security_version_roundtrip() {

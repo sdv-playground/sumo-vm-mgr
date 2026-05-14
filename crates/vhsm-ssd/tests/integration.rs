@@ -120,62 +120,56 @@ impl TestFixture {
 
     fn build_keystore(path: &Path) {
         use hsm::payload::*;
-        use p256::ecdsa::SigningKey;
-        use rand::RngCore;
 
         let _ = std::fs::remove_dir_all(path);
         std::fs::create_dir_all(path).unwrap();
 
-        let mykey = SigningKey::random(&mut rand::rngs::OsRng);
-        let mykey_pub = mykey.verifying_key().to_encoded_point(false);
-
-        // Fake certificate DER
-        let fake_cert: Vec<u8> = [0x30, 0x82, 0x01, 0x00, 0x30, 0x81, 0xFC]
-            .iter()
-            .copied()
-            .chain(std::iter::repeat(0xAA).take(252))
-            .collect();
-
-        let mut aes_key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut aes_key);
-
-        let mut restricted_key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut restricted_key);
-
+        // v2 keystore: enumeration-only slots. SimHsm's
+        // generate_missing_local_keys produces the actual key
+        // material on write_keystore.
         let ks = HsmKeystore {
             schema_version: SCHEMA_VERSION,
             security_version: 1,
             identities: vec![],
             slots: vec![
-                KeySlotDef {
+                KeySlot {
                     key_id: "mykey".into(),
-                    key_type: KEY_TYPE_EC_P256,
-                    private_key: Some(mykey.to_bytes().to_vec()),
-                    public_key: Some(mykey_pub.as_bytes().to_vec()),
-                    certificate: Some(fake_cert),
+                    key_kind: KEY_TYPE_EC_P256,
+                    anchor_public_key: None,
                     allowed_guests: None,
-                    allowed_ops: None,
+                    allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
                 },
-                KeySlotDef {
+                KeySlot {
                     key_id: "storage-key".into(),
-                    key_type: KEY_TYPE_AES_256,
-                    private_key: Some(aes_key.to_vec()),
-                    public_key: None,
-                    certificate: None,
+                    key_kind: KEY_TYPE_AES_256,
+                    anchor_public_key: None,
                     allowed_guests: None,
-                    allowed_ops: None,
+                    allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT]),
                 },
-                KeySlotDef {
+                KeySlot {
                     key_id: "restricted-key".into(),
-                    key_type: KEY_TYPE_AES_256,
-                    private_key: Some(restricted_key.to_vec()),
-                    public_key: None,
-                    certificate: None,
+                    key_kind: KEY_TYPE_AES_256,
+                    anchor_public_key: None,
                     allowed_guests: None,
-                    allowed_ops: None,
+                    allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT]),
                 },
             ],
         };
+
+        // Simulate post-CSR cert issuance for `mykey`. In production
+        // a CA signs the device's CSR and the resulting cert lands
+        // on disk as `keys/mykey.cert`. v2 envelopes don't carry
+        // certs, so the test writes a placeholder PEM directly —
+        // and does so BEFORE write_keystore so the manifest writer
+        // picks it up via the on-disk file check.
+        std::fs::create_dir_all(path.join("keys")).unwrap();
+        let cert_pem = "-----BEGIN CERTIFICATE-----\n\
+            MIIBADCB/DCBpaADAgECAhEAhAhAhAhAhAhAhAhAhAhACgYIKoZIzj0EAwIwGzEZ\n\
+            MBcGA1UEAxMQdGVzdC1zZWxmLXNpZ25lZDAeFw0yNTAxMDEwMDAwMDBaFw0zNTAx\n\
+            MDEwMDAwMDBaMBsxGTAXBgNVBAMTEHRlc3Qtc2VsZi1zaWduZWQwWTATBgcqhkjO\n\
+            PQIBBggqhkjOPQMBBwNCAARxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\
+            -----END CERTIFICATE-----\n";
+        std::fs::write(path.join("keys").join("mykey.cert"), cert_pem).unwrap();
 
         let hsm = SimHsm::new(
             PathBuf::from("unused"),

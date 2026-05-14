@@ -1,55 +1,73 @@
-/// HSM key material payload — CBOR schema for SUIT envelope contents.
-///
-/// This defines the binary format carried inside a SUIT envelope with
-/// component ID `["hsm", "keys"]`. The same schema is used by both the
-/// Linux simulation backend and future QNX HSM firmware.
-///
-/// # Wire format (CBOR, integer keys)
-///
-/// ```text
-/// HsmKeystore = {
-///   0: uint,              ; schema_version (1)
-///   1: uint,              ; security_version
-///   2: [* Identity],      ; guest identities
-///   3: [* KeySlot],       ; key slots
-/// }
-///
-/// Identity = {
-///   0: tstr,              ; identity_id
-///   1: bstr,              ; public_key (EC-P256 uncompressed, 65 bytes)
-/// }
-///
-/// KeySlot = {
-///   0: tstr,              ; key_id
-///   1: uint,              ; key_type (0 = EC-P256, 1 = AES-256)
-///   2: ?bstr,             ; private_key (None for trust anchors — public-key-only slots)
-///   3: ?bstr,             ; public_key (EC-P256 only)
-///   4: ?bstr,             ; certificate (X.509 DER)
-///   5: ?[* tstr],         ; allowed_guests
-///   6: ?[* uint],         ; allowed_ops
-/// }
-/// ```
+//! HSM key material payload — CBOR schema for SUIT envelope contents.
+//!
+//! Defines the binary format carried inside a SUIT envelope with
+//! component ID `["hsm", "keys"]`. The same schema is consumed by
+//! every backend (SimHsm in dev/test; HSE-backed providers in
+//! production).
+//!
+//! # Schema v2 — no private keys, ever
+//!
+//! The keystore enumerates the slots a provisioned HSM should expose
+//! and the trust anchors (public halves) used to verify subsequent
+//! envelopes. **Private key material never crosses this boundary.**
+//! Slots whose private half lives on-device (device-decrypt, ecu-
+//! signing, ivd-signing, jwt-signing, application keys, ...) are
+//! enumerated with `anchor_public_key = None`; the HSM generates the
+//! keypair locally during provisioning and exposes the public half
+//! through `HsmCryptoProvider::get_public_key_der` afterwards.
+//!
+//! Removed in v2 vs v1: `private_key` field, `certificate` field
+//! (CSR-flow concern, never an envelope concern). Decoders reject v1
+//! envelopes outright — drop-compatibility was the point.
+//!
+//! # Wire format (CBOR, integer keys)
+//!
+//! ```text
+//! HsmKeystore = {
+//!   0: uint,            ; schema_version (must be 2)
+//!   1: uint,            ; security_version (anti-rollback floor)
+//!   2: [* Identity],
+//!   3: [* KeySlot],
+//! }
+//!
+//! Identity = {
+//!   0: tstr,            ; identity_id
+//!   1: bstr,            ; EC-P256 uncompressed public (65 bytes)
+//! }
+//!
+//! KeySlot = {
+//!   0: tstr,            ; key_id
+//!   1: uint,            ; key_kind: 0 = EC-P256, 1 = AES-256
+//!   2: ?bstr,           ; anchor_public_key — Some only for trust
+//!                       ;   anchors (EC-P256 only); None means
+//!                       ;   "device generates this locally."
+//!   3: ?[* tstr],       ; allowed_guests (None = unrestricted)
+//!   4: ?[* uint],       ; allowed_ops (None = all)
+//! }
+//! ```
 
 use serde::{Deserialize, Serialize};
 
 use crate::KeyType;
 
-/// Current schema version. Bump when breaking changes are made.
-pub const SCHEMA_VERSION: u64 = 1;
+/// Schema version. Bumped to 2 to break compatibility with the v1
+/// shape that allowed pushed private keys + certificates.
+pub const SCHEMA_VERSION: u64 = 2;
 
-/// Well-known factory signing key — verifies the first HSM key provisioning envelope.
+/// Well-known factory signing key — verifies the very first HSM key
+/// provisioning envelope.
 ///
-/// This is NOT real security. The private key is published in the spec.
-/// After first provisioning, the Key Authority (slot 0) verifies subsequent envelopes.
-///
-/// EC-P256 key with private scalar = 1 (public key = generator point G).
+/// This is NOT real security. The private key is published in the
+/// spec (`scalar = 1`, generator point as public). After first
+/// provisioning the Key Authority replaces it as trust anchor.
 pub const FACTORY_SIGNING_SCALAR: [u8; 32] = {
     let mut s = [0u8; 32];
     s[31] = 1;
     s
 };
 
-/// Factory signing key public half (P-256 generator point G, uncompressed).
+/// Factory signing key public half (P-256 generator point G,
+/// uncompressed, leading `0x04`).
 #[rustfmt::skip]
 pub const FACTORY_SIGNING_PUBLIC: [u8; 65] = [
     0x04,
@@ -66,75 +84,87 @@ pub const FACTORY_SIGNING_PUBLIC: [u8; 65] = [
 /// Top-level keystore payload inside the SUIT envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HsmKeystore {
-    /// Schema version (must be 1).
     #[serde(rename = "0")]
     pub schema_version: u64,
 
-    /// Security version — must exceed current value on re-provision.
+    /// Security version — must exceed current value on re-provision
+    /// (anti-rollback floor).
     #[serde(rename = "1")]
     pub security_version: u64,
 
-    /// Guest identities (for challenge-response registration).
+    /// Guest identities for challenge-response registration.
     #[serde(rename = "2")]
     pub identities: Vec<IdentityDef>,
 
-    /// Key slots.
+    /// Key slots — enumerated, not key material.
     #[serde(rename = "3")]
-    pub slots: Vec<KeySlotDef>,
+    pub slots: Vec<KeySlot>,
 }
 
 /// Guest identity for challenge-response registration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityDef {
-    /// Guest identifier (e.g. "bali-vm-1").
     #[serde(rename = "0")]
     pub identity_id: String,
 
-    /// EC-P256 public key (65 bytes, uncompressed: 0x04 || x || y).
+    /// EC-P256 public key (65 bytes uncompressed, leading `0x04`).
     #[serde(rename = "1", with = "serde_bytes")]
     pub public_key: Vec<u8>,
 }
 
-/// A single key slot in the HSM keystore.
+/// A single key slot. Two shapes:
+///
+/// - **Trust anchor**: `anchor_public_key = Some(pub_bytes)`. EC-P256
+///   only. HSM stores the public half for envelope verification; the
+///   private half lives off-device with the signing infrastructure.
+///
+/// - **Device-generated**: `anchor_public_key = None`. HSM generates
+///   the keypair (EC-P256) or symmetric key (AES-256) locally during
+///   provisioning. The private/key bytes never cross the envelope
+///   boundary in either direction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeySlotDef {
-    /// Key identifier (e.g. "jwt-signing", "storage-key").
+pub struct KeySlot {
     #[serde(rename = "0")]
     pub key_id: String,
 
-    /// Key type: 0 = EC-P256, 1 = AES-256.
+    /// `KEY_TYPE_EC_P256` (0) or `KEY_TYPE_AES_256` (1).
     #[serde(rename = "1")]
-    pub key_type: u64,
+    pub key_kind: u64,
 
-    /// Private key material (None for public-key-only trust anchor slots).
-    /// - EC-P256: 32-byte scalar (big-endian).
-    /// - AES-256: 32 random bytes.
-    #[serde(rename = "2", default, skip_serializing_if = "Option::is_none", with = "serde_bytes_opt")]
-    pub private_key: Option<Vec<u8>>,
+    /// `Some(uncompressed_sec1_bytes)` for trust anchors, `None` for
+    /// device-generated slots. AES slots are always device-generated
+    /// and so always have `None` here.
+    #[serde(
+        rename = "2",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes_opt"
+    )]
+    pub anchor_public_key: Option<Vec<u8>>,
 
-    /// Public key (EC-P256 only, 65 bytes uncompressed).
-    #[serde(rename = "3", default, skip_serializing_if = "Option::is_none", with = "serde_bytes_opt")]
-    pub public_key: Option<Vec<u8>>,
-
-    /// X.509 certificate (DER-encoded).
-    #[serde(rename = "4", default, skip_serializing_if = "Option::is_none", with = "serde_bytes_opt")]
-    pub certificate: Option<Vec<u8>>,
-
-    /// Guest identities allowed to use this key.
-    #[serde(rename = "5", default, skip_serializing_if = "Option::is_none")]
+    /// Guest identities allowed to use this key. `None` = unrestricted.
+    #[serde(rename = "3", default, skip_serializing_if = "Option::is_none")]
     pub allowed_guests: Option<Vec<String>>,
 
-    /// Allowed operations (indices into: sign, verify, encrypt, decrypt,
-    /// derive, get_cert, get_pubkey).
-    #[serde(rename = "6", default, skip_serializing_if = "Option::is_none")]
+    /// Permitted operation codes (see `OP_*` constants below). `None`
+    /// = unrestricted (effectively allows what the key type supports).
+    #[serde(rename = "4", default, skip_serializing_if = "Option::is_none")]
     pub allowed_ops: Option<Vec<u64>>,
 }
 
-/// Key type constants for the CBOR wire format.
+/// Key kinds. Single u64 on the wire to keep CBOR compact.
 pub const KEY_TYPE_EC_P256: u64 = 0;
 pub const KEY_TYPE_AES_256: u64 = 1;
 
-/// Operation indices for the `allowed_ops` field.
+/// Operation codes for the `allowed_ops` field. These name the
+/// runtime vHSM wire operations a slot may serve once provisioned;
+/// they do NOT describe what the envelope contains.
+///
+/// `OP_GET_CERT` stays in the list even though v2 envelopes never
+/// deliver certificates — the runtime cert query is fed by the
+/// CSR-issuance flow that issues certs for device-generated keys
+/// (e.g. `ecu-signing`) post-provisioning, and the slot policy must
+/// permit the op.
 pub const OP_SIGN: u64 = 0;
 pub const OP_VERIFY: u64 = 1;
 pub const OP_ENCRYPT: u64 = 2;
@@ -143,17 +173,29 @@ pub const OP_DERIVE: u64 = 4;
 pub const OP_GET_CERT: u64 = 5;
 pub const OP_GET_PUBKEY: u64 = 6;
 
-impl KeySlotDef {
-    /// Convert the wire-format key type to the crate's `KeyType` enum.
+impl KeySlot {
+    /// Convenience: this slot is a trust anchor (envelope ships the
+    /// public half; HSM never sees a private byte for it).
+    pub fn is_anchor(&self) -> bool {
+        self.anchor_public_key.is_some()
+    }
+
+    /// Convenience: this slot is device-generated (HSM generates the
+    /// keypair locally; no envelope-side material).
+    pub fn is_device_generated(&self) -> bool {
+        self.anchor_public_key.is_none()
+    }
+
+    /// Convert the wire-format kind to the typed `KeyType` enum.
     pub fn parsed_key_type(&self) -> Option<KeyType> {
-        match self.key_type {
+        match self.key_kind {
             KEY_TYPE_EC_P256 => Some(KeyType::EcP256),
             KEY_TYPE_AES_256 => Some(KeyType::Aes256),
             _ => None,
         }
     }
 
-    /// Convert `allowed_ops` indices to the vhsm-test-ssd op name strings.
+    /// Convert `allowed_ops` codes to vhsm-ssd op name strings.
     pub fn ops_as_strings(&self) -> Option<Vec<&'static str>> {
         self.allowed_ops.as_ref().map(|ops| {
             ops.iter()
@@ -170,6 +212,26 @@ impl KeySlotDef {
                 .collect()
         })
     }
+
+    /// Sanity-check the slot shape: AES must be device-generated; EC
+    /// trust anchors must carry a 65-byte uncompressed key. Called
+    /// during decode.
+    fn validate(&self) -> Result<(), String> {
+        match (self.key_kind, &self.anchor_public_key) {
+            (KEY_TYPE_AES_256, Some(_)) => Err(format!(
+                "slot '{}': AES keys are device-generated; \
+                 cannot ship an anchor_public_key",
+                self.key_id
+            )),
+            (KEY_TYPE_EC_P256, Some(pk)) if pk.len() != 65 || pk[0] != 0x04 => Err(format!(
+                "slot '{}': EC anchor public must be uncompressed SEC1 \
+                 (65 bytes leading 0x04), got {} bytes",
+                self.key_id,
+                pk.len(),
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Serialize an `HsmKeystore` to CBOR bytes.
@@ -180,15 +242,21 @@ pub fn encode(keystore: &HsmKeystore) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// Deserialize an `HsmKeystore` from CBOR bytes.
+/// Deserialize an `HsmKeystore` from CBOR bytes. Rejects any
+/// `schema_version != SCHEMA_VERSION` (v1 envelopes are dead) and
+/// runs `KeySlot::validate` on each slot.
 pub fn decode(data: &[u8]) -> Result<HsmKeystore, String> {
     let ks: HsmKeystore = ciborium::from_reader(data)
         .map_err(|e| format!("CBOR decode: {e}"))?;
     if ks.schema_version != SCHEMA_VERSION {
         return Err(format!(
-            "unsupported schema version {} (expected {SCHEMA_VERSION})",
+            "unsupported schema version {} (this build only accepts {SCHEMA_VERSION}; \
+             v1 envelopes that pushed private keys are not decoded)",
             ks.schema_version
         ));
+    }
+    for slot in &ks.slots {
+        slot.validate()?;
     }
     Ok(ks)
 }
@@ -221,66 +289,45 @@ mod serde_bytes_opt {
 mod tests {
     use super::*;
 
-    fn sample_keystore(num_slots: usize) -> HsmKeystore {
-        let mut slots = Vec::with_capacity(num_slots);
-
-        // Key Authority slot (public-key-only trust anchor)
-        slots.push(KeySlotDef {
-            key_id: "key-authority".to_string(),
-            key_type: KEY_TYPE_EC_P256,
-            private_key: None,
-            public_key: Some({
-                let mut pk = vec![0x04]; // uncompressed prefix
-                pk.extend_from_slice(&[0xBB; 32]); // x
-                pk.extend_from_slice(&[0xCC; 32]); // y
-                pk
-            }),
-            certificate: None,
+    fn anchor(id: &str, pubkey_byte: u8) -> KeySlot {
+        let mut pk = vec![0x04];
+        pk.extend_from_slice(&[pubkey_byte; 32]);
+        pk.extend_from_slice(&[pubkey_byte.wrapping_add(1); 32]);
+        KeySlot {
+            key_id: id.to_string(),
+            key_kind: KEY_TYPE_EC_P256,
+            anchor_public_key: Some(pk),
             allowed_guests: None,
-            allowed_ops: None,
-        });
-
-        // Generate remaining slots
-        for i in 1..num_slots {
-            if i % 3 == 0 {
-                // AES-256 key
-                slots.push(KeySlotDef {
-                    key_id: format!("aes-key-{i}"),
-                    key_type: KEY_TYPE_AES_256,
-                    private_key: Some(vec![(i & 0xFF) as u8; 32]),
-                    public_key: None,
-                    certificate: None,
-                    allowed_guests: Some(vec!["bali-vm-1".into()]),
-                    allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT]),
-                });
-            } else {
-                // EC-P256 key
-                slots.push(KeySlotDef {
-                    key_id: format!("ec-key-{i}"),
-                    key_type: KEY_TYPE_EC_P256,
-                    private_key: Some(vec![(i & 0xFF) as u8; 32]),
-                    public_key: Some({
-                        let mut pk = vec![0x04];
-                        pk.extend_from_slice(&vec![(i & 0xFF) as u8; 32]);
-                        pk.extend_from_slice(&vec![((i + 1) & 0xFF) as u8; 32]);
-                        pk
-                    }),
-                    certificate: if i % 5 == 0 {
-                        Some(vec![0x30, 0x82, 0x01, 0x00]) // fake DER prefix
-                    } else {
-                        None
-                    },
-                    allowed_guests: Some(vec!["bali-vm-1".into()]),
-                    allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
-                });
-            }
+            allowed_ops: Some(vec![OP_VERIFY]),
         }
+    }
 
+    fn device_generated_ec(id: &str, guest: &str) -> KeySlot {
+        KeySlot {
+            key_id: id.to_string(),
+            key_kind: KEY_TYPE_EC_P256,
+            anchor_public_key: None,
+            allowed_guests: Some(vec![guest.to_string()]),
+            allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
+        }
+    }
+
+    fn device_generated_aes(id: &str, guest: &str) -> KeySlot {
+        KeySlot {
+            key_id: id.to_string(),
+            key_kind: KEY_TYPE_AES_256,
+            anchor_public_key: None,
+            allowed_guests: Some(vec![guest.to_string()]),
+            allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT]),
+        }
+    }
+
+    fn sample_keystore() -> HsmKeystore {
         HsmKeystore {
             schema_version: SCHEMA_VERSION,
             security_version: 1,
             identities: vec![IdentityDef {
-                identity_id: "bali-vm-1".to_string(),
+                identity_id: "bali-vm-1".into(),
                 public_key: {
                     let mut pk = vec![0x04];
                     pk.extend_from_slice(&[0x11; 32]);
@@ -288,90 +335,86 @@ mod tests {
                     pk
                 },
             }],
-            slots,
+            slots: vec![
+                anchor("key-authority", 0xAA),
+                anchor("sw-authority", 0xBB),
+                anchor("platform-authority", 0xCC),
+                anchor("application-authority", 0xDD),
+                device_generated_ec("device-decrypt", "bali-vm-1"),
+                device_generated_ec("ecu-signing", "bali-vm-1"),
+                device_generated_ec("ivd-signing", "bali-vm-1"),
+                device_generated_aes("storage-key", "bali-vm-1"),
+            ],
         }
     }
 
     #[test]
-    fn roundtrip_small() {
-        let ks = sample_keystore(5);
-        let encoded = encode(&ks).unwrap();
-        let decoded = decode(&encoded).unwrap();
-
-        assert_eq!(decoded.schema_version, SCHEMA_VERSION);
-        assert_eq!(decoded.security_version, 1);
-        assert_eq!(decoded.slots.len(), 5);
-        assert_eq!(decoded.identities.len(), 1);
-        assert_eq!(decoded.slots[0].key_id, "key-authority");
-        assert!(decoded.slots[0].private_key.is_none());
-        assert_eq!(decoded.slots[0].public_key.as_ref().unwrap().len(), 65);
+    fn roundtrip_mandatory_slots() {
+        let ks = sample_keystore();
+        let bytes = encode(&ks).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.schema_version, SCHEMA_VERSION);
+        assert_eq!(back.slots.len(), ks.slots.len());
+        assert!(back.slots[0].is_anchor());
+        assert!(back.slots[4].is_device_generated());
     }
 
     #[test]
-    fn roundtrip_100_slots() {
-        let ks = sample_keystore(100);
-        let encoded = encode(&ks).unwrap();
-
-        // ~15KB for 100 slots — verify it's reasonable
-        assert!(encoded.len() < 50_000, "encoded size: {}", encoded.len());
-
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded.slots.len(), 100);
-
-        // Spot check a few slots
-        assert_eq!(decoded.slots[0].key_id, "key-authority");
-        assert_eq!(decoded.slots[0].key_type, KEY_TYPE_EC_P256);
-        assert_eq!(decoded.slots[3].key_id, "aes-key-3");
-        assert_eq!(decoded.slots[3].key_type, KEY_TYPE_AES_256);
-        assert!(decoded.slots[3].public_key.is_none());
+    fn decode_rejects_v1() {
+        let mut ks = sample_keystore();
+        ks.schema_version = 1;
+        let bytes = encode(&ks).unwrap();
+        let err = decode(&bytes).unwrap_err();
+        assert!(err.contains("unsupported schema version 1"));
+        assert!(err.contains("not decoded"));
     }
 
     #[test]
-    fn bad_schema_version() {
-        let mut ks = sample_keystore(1);
-        ks.schema_version = 99;
-        let encoded = encode(&ks).unwrap();
-        let err = decode(&encoded).unwrap_err();
-        assert!(err.contains("unsupported schema version"));
-    }
-
-    #[test]
-    fn ops_as_strings() {
-        let slot = KeySlotDef {
-            key_id: "test".into(),
-            key_type: KEY_TYPE_EC_P256,
-            private_key: Some(vec![0; 32]),
-            public_key: None,
-            certificate: None,
-            allowed_guests: None,
-            allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
-        };
-        let ops = slot.ops_as_strings().unwrap();
-        assert_eq!(ops, vec!["SIGN", "VERIFY", "GET_PUBKEY"]);
-    }
-
-    #[test]
-    fn parsed_key_type() {
-        let ec = KeySlotDef {
-            key_id: "x".into(),
-            key_type: KEY_TYPE_EC_P256,
-            private_key: None,
-            public_key: None,
-            certificate: None,
+    fn decode_rejects_aes_with_anchor_public() {
+        let mut ks = sample_keystore();
+        ks.slots.push(KeySlot {
+            key_id: "evil-aes-anchor".into(),
+            key_kind: KEY_TYPE_AES_256,
+            anchor_public_key: Some(vec![0u8; 65]),
             allowed_guests: None,
             allowed_ops: None,
-        };
+        });
+        let bytes = encode(&ks).unwrap();
+        let err = decode(&bytes).unwrap_err();
+        assert!(err.contains("evil-aes-anchor"));
+        assert!(err.contains("AES keys are device-generated"));
+    }
+
+    #[test]
+    fn decode_rejects_malformed_anchor_public() {
+        let mut ks = sample_keystore();
+        ks.slots.push(KeySlot {
+            key_id: "malformed-anchor".into(),
+            key_kind: KEY_TYPE_EC_P256,
+            anchor_public_key: Some(vec![0x05; 65]), // wrong leading byte
+            allowed_guests: None,
+            allowed_ops: Some(vec![OP_VERIFY]),
+        });
+        let bytes = encode(&ks).unwrap();
+        let err = decode(&bytes).unwrap_err();
+        assert!(err.contains("malformed-anchor"));
+        assert!(err.contains("uncompressed SEC1"));
+    }
+
+    #[test]
+    fn ops_as_strings_translates() {
+        let slot = device_generated_ec("test", "bali-vm-1");
+        assert_eq!(
+            slot.ops_as_strings().unwrap(),
+            vec!["SIGN", "VERIFY", "GET_PUBKEY"],
+        );
+    }
+
+    #[test]
+    fn parsed_key_type_round_trip() {
+        let ec = device_generated_ec("ec", "g");
         assert_eq!(ec.parsed_key_type(), Some(KeyType::EcP256));
-
-        let aes = KeySlotDef {
-            key_id: "y".into(),
-            key_type: KEY_TYPE_AES_256,
-            private_key: None,
-            public_key: None,
-            certificate: None,
-            allowed_guests: None,
-            allowed_ops: None,
-        };
+        let aes = device_generated_aes("aes", "g");
         assert_eq!(aes.parsed_key_type(), Some(KeyType::Aes256));
     }
 }
