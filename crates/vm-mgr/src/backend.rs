@@ -2312,23 +2312,31 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         let status = ota::status(&*nv, self.bank_set)
             .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
 
-        // Priority: upload phase > flash transfer > NV state
+        // Use running_bank for versions (not NV active_bank which may be staged)
+        let rb = *self.running_bank.lock().unwrap();
+        let active_meta = nv.read_fw_meta(self.bank_set, rb);
+        let previous_meta = nv.read_fw_meta(self.bank_set, rb.other());
+
+        // Priority: upload phase > flash transfer > NV state.
+        // A component with no fw_meta on either bank has never been
+        // OTA-written — report Initial regardless of the committed flag
+        // (defends against stale NV layouts that may show !committed for
+        // never-touched slots).
         let state = match upload_state {
             Some(s) => s, // Transferring during firmware download
             None => match flash_state {
                 Some(s) => s,
+                None if active_meta.is_none() && previous_meta.is_none() => FlashState::Initial,
                 None if !status.committed => FlashState::Activated, // trial without transfer (e.g. after restart)
                 None => FlashState::Complete, // idle — no active update
             },
         };
 
-        // Use running_bank for versions (not NV active_bank which may be staged)
-        let rb = *self.running_bank.lock().unwrap();
-        let active_version = nv
-            .read_fw_meta(self.bank_set, rb)
+        let active_version = active_meta
+            .as_ref()
             .map(|m| Self::nv_bytes_to_string(&m.fw_version));
-        let previous_version = nv
-            .read_fw_meta(self.bank_set, rb.other())
+        let previous_version = previous_meta
+            .as_ref()
             .map(|m| Self::nv_bytes_to_string(&m.fw_version));
 
         Ok(ActivationState {

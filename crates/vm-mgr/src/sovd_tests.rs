@@ -394,10 +394,12 @@ async fn flash_full_suit_flow() {
     let (status, _) = post_empty(&router, "/vehicle/v1/components/vm1/flash/commit").await;
     assert_eq!(status, StatusCode::OK);
 
-    // 6. Verify idle after commit (flash_transfer cleared → Complete)
+    // 6. Verify idle after commit. start_flash clears the packages map, so
+    // this contrived flow never reaches install(); fw_meta stays empty on
+    // both banks → "initial" (never-OTA'd) is the truthful end state.
     let (status, json) = get(&router, "/vehicle/v1/components/vm1/flash/activation").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["state"], "complete");
+    assert_eq!(json["state"], "initial");
 }
 
 // ============================================================

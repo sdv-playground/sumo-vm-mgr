@@ -255,14 +255,15 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
         let nv = self.nv.lock().unwrap();
         let boot_state = nv.read_boot_state();
         let active_bank = self.active_bank();
-        let fw_meta = nv.read_fw_meta(BankSet::App, active_bank);
+        let active_meta = nv.read_fw_meta(BankSet::App, active_bank);
+        let previous_meta = nv.read_fw_meta(BankSet::App, active_bank.other());
 
         let committed = boot_state
             .as_ref()
             .map(|s| s.banks[BankSet::App.as_index()].committed)
             .unwrap_or(true);
 
-        let version = fw_meta
+        let version = active_meta
             .as_ref()
             .map(|m| {
                 String::from_utf8_lossy(&m.fw_version)
@@ -271,14 +272,17 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             })
             .unwrap_or_default();
 
-        let flash_state = if committed {
+        // No fw_meta on either bank → never OTA'd → factory-fresh.
+        let flash_state = if active_meta.is_none() && previous_meta.is_none() {
+            FlashState::Initial
+        } else if committed {
             FlashState::Committed
         } else {
             FlashState::Activated
         };
 
         Ok(Some(ActivationState {
-            supports_rollback: !committed,
+            supports_rollback: !committed && flash_state != FlashState::Initial,
             state: flash_state,
             active_version: if version.is_empty() {
                 None
