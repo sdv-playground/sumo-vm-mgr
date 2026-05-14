@@ -33,6 +33,13 @@ impl Bank {
 }
 
 /// Identifies which bank set.
+///
+/// `Custom` is the deployment-specific slot — used when a component
+/// doesn't fit any of the well-known categories above (today: the
+/// realtime side on managed-cvc, via `rt-s32g3`). The on-disk dir
+/// name is the generic `custom`; the component id (e.g. "rt") and
+/// its launch semantics are owned by the deployment, not by this
+/// crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum BankSet {
@@ -41,11 +48,19 @@ pub enum BankSet {
     Vm2 = 2,
     Hsm = 3,
     App = 4,
+    Custom = 5,
 }
 
 impl BankSet {
     pub fn all() -> [BankSet; NUM_BANK_SETS] {
-        [BankSet::HostOs, BankSet::Vm1, BankSet::Vm2, BankSet::Hsm, BankSet::App]
+        [
+            BankSet::HostOs,
+            BankSet::Vm1,
+            BankSet::Vm2,
+            BankSet::Hsm,
+            BankSet::App,
+            BankSet::Custom,
+        ]
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
@@ -55,12 +70,13 @@ impl BankSet {
             "os2" | "vm2" => Some(BankSet::Vm2),
             "hsm" => Some(BankSet::Hsm),
             "app" | "supernova" => Some(BankSet::App),
+            "custom" => Some(BankSet::Custom),
             _ => None,
         }
     }
 }
 
-pub const NUM_BANK_SETS: usize = 5;
+pub const NUM_BANK_SETS: usize = 6;
 pub const MAX_TRIAL_BOOTS: u8 = 10;
 
 // NV partition magic numbers (sector validation)

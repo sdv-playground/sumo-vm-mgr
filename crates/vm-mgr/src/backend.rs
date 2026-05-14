@@ -237,6 +237,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             BankSet::Vm2 => ("vm2", "VM2", "Virtual machine slot 2"),
             BankSet::Hsm => ("hsm", "HSM Key Store", "Hardware Security Module"),
             BankSet::App => ("app", "App", "Self-updating application component"),
+            BankSet::Custom => ("custom", "Custom", "Deployment-specific bank slot"),
         };
 
         // Read the current active bank at startup — this is what we're running on.
@@ -1834,6 +1835,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     BankSet::Vm2 => "vm2",
                     BankSet::Hsm => "hsm",
                     BankSet::App => "app",
+                    BankSet::Custom => "custom",
                 };
                 let bank_dir_name = match result.target_bank {
                     Bank::A => "bank_a",
@@ -2211,6 +2213,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 BankSet::Vm2 => "vm2",
                 BankSet::Hsm => "hsm",
                 BankSet::App => "app",
+                BankSet::Custom => "custom",
             };
             let target_bank = *self.running_bank.lock().unwrap();
             let bank_dir_name = match target_bank {
@@ -2564,6 +2567,10 @@ fn bank_file_names(bank_set: BankSet) -> (&'static str, &'static str) {
     match bank_set {
         BankSet::Vm1 | BankSet::Vm2 => ("kernel", "qvm.conf"),
         BankSet::HostOs | BankSet::Hsm | BankSet::App => ("boot.ifs", "qvm.conf"),
+        // No VM-style assumptions for Custom — the SUIT manifest's
+        // payload URIs are passed through verbatim via the
+        // `payload_target_name` fallback.
+        BankSet::Custom => ("", ""),
     }
 }
 
@@ -2574,6 +2581,7 @@ pub(crate) fn bank_set_dir_name(bank_set: BankSet) -> &'static str {
         BankSet::Vm2 => "vm2",
         BankSet::Hsm => "hsm",
         BankSet::App => "app",
+        BankSet::Custom => "custom",
     }
 }
 

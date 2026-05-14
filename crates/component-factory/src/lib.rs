@@ -34,6 +34,15 @@ pub struct ComponentSpec {
     /// Base path for app-type components (A/B bank root with `current` symlink).
     #[serde(default)]
     pub base_path: Option<PathBuf>,
+
+    /// Override the bank-set this component plugs into. Optional —
+    /// when absent, defaults to whichever `BankSet` matches `id`
+    /// (see [`bank_set_for_id`]). Use this when the component id
+    /// is deployment-specific (e.g. `"rt"`) and shouldn't have an
+    /// alias hardcoded into the generic factory; configure as
+    /// `bank_set: custom` in YAML.
+    #[serde(default)]
+    pub bank_set: Option<String>,
 }
 
 /// Result of building a component — includes the Component trait object,
@@ -72,13 +81,30 @@ pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
     }
 }
 
+/// Resolve the bank-set for a `ComponentSpec`. Explicit `bank_set`
+/// field wins; falls back to id-based mapping via [`bank_set_for_id`].
+/// Returns `None` if neither resolves — caller decides whether that's
+/// fatal (most components require a bank-set; pure-runtime ones can
+/// be `None`).
+pub fn resolve_bank_set(spec: &ComponentSpec) -> Option<BankSet> {
+    if let Some(ref s) = spec.bank_set {
+        BankSet::from_str(s)
+    } else {
+        bank_set_for_id(&spec.id)
+    }
+}
+
 /// Build a single component from its spec and shared dependencies.
 pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
     spec: &ComponentSpec,
     deps: &FactoryDeps<D>,
 ) -> Option<BuiltComponent> {
-    let Some(bank_set) = bank_set_for_id(&spec.id) else {
-        tracing::warn!("unknown component id '{}' — skipping", spec.id);
+    let Some(bank_set) = resolve_bank_set(spec) else {
+        tracing::warn!(
+            "no bank-set for component id '{}' (no `bank_set:` override and \
+             id doesn't match a well-known set) — skipping",
+            spec.id,
+        );
         return None;
     };
 

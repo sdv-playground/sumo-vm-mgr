@@ -19,6 +19,7 @@ fn boot_state_roundtrip() {
             BankBootState { active_bank: Bank::A, committed: true, boot_count: 0 },
             BankBootState::default(),
             BankBootState::default(),
+            BankBootState::default(), // Custom slot — unused by this test
         ],
     };
 
