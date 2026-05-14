@@ -12,6 +12,11 @@ pub enum MachineError {
     InvalidArgument(String),
     /// Operation rejected by policy (security version floor, anti-rollback, etc.).
     PolicyRejected(String),
+    /// Resource is busy / state machine refuses the op right now (e.g. a
+    /// previous OTA is still in trial mode). Distinct from PolicyRejected
+    /// because the underlying condition is transient — the caller can
+    /// commit/rollback and retry.
+    Busy(String),
     /// Manifest validation failed (signature, hash, sequence number, ...).
     ManifestInvalid(String),
     /// A flash session id is unknown or has expired.
@@ -29,6 +34,7 @@ impl fmt::Display for MachineError {
             Self::NotFound(id) => write!(f, "component not found: {id}"),
             Self::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             Self::PolicyRejected(m) => write!(f, "policy rejected: {m}"),
+            Self::Busy(m) => write!(f, "busy: {m}"),
             Self::ManifestInvalid(m) => write!(f, "manifest invalid: {m}"),
             Self::UnknownFlashSession(id) => write!(f, "unknown flash session: {id}"),
             Self::Storage(m) => write!(f, "storage error: {m}"),

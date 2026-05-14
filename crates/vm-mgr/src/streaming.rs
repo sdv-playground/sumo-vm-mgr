@@ -9,13 +9,14 @@ use std::path::Path;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use nv_store::types::BankSet;
+use nv_store::types::{Bank, BankSet};
 use sha2::{Digest, Sha256};
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::decryptor::StreamingDecryptor;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
+use crate::backend::{bank_dir_name, bank_set_dir_name, payload_target_name};
 use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware};
 
 use sovd_core::{BackendError, PackageStream};
@@ -43,6 +44,7 @@ pub async fn process_envelope_stream(
     min_security_ver: u32,
     images_dir: Option<&Path>,
     bank_set: BankSet,
+    target_bank: Bank,
 ) -> Result<ValidatedFirmware, BackendError> {
     // Convert PackageStream → AsyncRead
     let reader = StreamReader::new(
@@ -97,13 +99,14 @@ pub async fn process_envelope_stream(
         ))?;
     let suit_device_key = manifest_provider.device_decryption_key();
 
-    let set_name = match bank_set {
-        BankSet::HostOs => "host-os",
-        BankSet::Vm1 => "vm1",
-        BankSet::Vm2 => "vm2",
-        BankSet::Hsm => "hsm",
-        BankSet::App => "app",
-    };
+    let set_name = bank_set_dir_name(bank_set);
+    let bank_dir = images_dir.map(|dir| {
+        dir.join(set_name).join(bank_dir_name(target_bank))
+    });
+    if let Some(ref bd) = bank_dir {
+        std::fs::create_dir_all(bd)
+            .map_err(|e| BackendError::Internal(format!("create {}: {e}", bd.display())))?;
+    }
 
     // Map payload keys to component indices by matching URIs in the manifest
     let component_count = manifest.component_count();
@@ -127,17 +130,10 @@ pub async fn process_envelope_stream(
 
         let has_encryption = manifest.encryption_info(comp_idx).is_some();
 
-        // Determine output path based on payload key
-        let image_path = images_dir.map(|dir| {
-            let suffix = match pp.key.as_str() {
-                "#kernel" => format!("{set_name}-kernel-staged.img"),
-                "#firmware" => format!("{set_name}-staged.img"),
-                "#config" => format!("{set_name}-config-staged.yaml"),
-                "#qvm-config" => format!("{set_name}-qvm-config-staged.conf"),
-                other => format!("{set_name}-{}-staged.img",
-                    other.trim_start_matches('#')),
-            };
-            dir.join(suffix)
+        // Land payload directly inside the target bank dir under its
+        // canonical filename — no rename pass needed downstream.
+        let image_path = bank_dir.as_ref().map(|bd| {
+            bd.join(payload_target_name(bank_set, pp.key.as_str()))
         });
 
         tracing::info!(

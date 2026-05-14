@@ -410,6 +410,77 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         self.vm_service_addr.is_some()
     }
 
+    /// The bank an OTA upload should write to: the *inactive* bank for dual-bank
+    /// components, or `Bank::A` for single-bank ones (HSM). Cheap NV read.
+    fn determine_target_bank(&self) -> BackendResult<Bank> {
+        if self.config.single_bank {
+            return Ok(Bank::A);
+        }
+        let nv = self.nv.lock().map_err(|_| BackendError::Internal("nv lock".into()))?;
+        let state = nv.read_boot_state()
+            .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+        let idx = self.bank_set as usize;
+        Ok(state.banks[idx].active_bank.other())
+    }
+
+    /// Path of the target bank directory under `images_dir`. `None` if no
+    /// images_dir is configured (tests / in-memory only).
+    fn target_bank_dir(&self, target: Bank) -> Option<PathBuf> {
+        self.images_dir.as_ref().map(|images_dir| {
+            images_dir.join(bank_set_dir_name(self.bank_set)).join(bank_dir_name(target))
+        })
+    }
+
+    /// Wipe the target bank dir (frees ~1 image worth of space) and remove any
+    /// orphaned staged files left in `images_dir` root by previous flashes.
+    /// Called at flash-session start so the incoming payload lands in a clean,
+    /// space-reclaimed location on the same filesystem as its final home.
+    fn prepare_target_bank_dir(&self, target: Bank) -> BackendResult<()> {
+        let Some(images_dir) = self.images_dir.as_ref() else { return Ok(()); };
+        let set_name = bank_set_dir_name(self.bank_set);
+        let bank_dir = images_dir.join(set_name).join(bank_dir_name(target));
+        std::fs::create_dir_all(&bank_dir)
+            .map_err(|e| BackendError::Internal(format!("create bank dir {}: {e}", bank_dir.display())))?;
+        let mut cleared = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&bank_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::warn!("failed to clear {}: {e}", path.display());
+                    } else {
+                        cleared += 1;
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            target = %bank_dir.display(),
+            cleared,
+            "prepared target bank dir for {set_name}"
+        );
+
+        // Wipe legacy staged files in images_dir root (pre-refactor layout).
+        // Free standing here so an upgrade path doesn't leave them squatting
+        // on space the new upload needs.
+        for suffix in &["staged.img", "kernel-staged.img", "config-staged.yaml", "qvm-config-staged.conf"] {
+            let p = images_dir.join(format!("{set_name}-{suffix}"));
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        // And any pre-refactor compressed-input scratch tmps. The component
+        // index is bounded by the SUIT envelope's payload count (currently
+        // <= 4 for VMs); 16 covers any reasonable manifest.
+        for n in 0..16 {
+            let p = images_dir.join(format!("{set_name}-upload-{n}.tmp"));
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        Ok(())
+    }
+
     pub fn has_hsm_provider(&self) -> bool {
         self.hsm_provider.is_some()
     }
@@ -592,16 +663,11 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
         let device_key = self.manifest_provider.device_decryption_key();
 
-        let set_name = match self.bank_set {
-            BankSet::HostOs => "host-os",
-            BankSet::Vm1 => "vm1",
-            BankSet::Vm2 => "vm2",
-            BankSet::Hsm => "hsm",
-            BankSet::App => "app",
-        };
-
-        let images_dir = self.images_dir.as_ref()
+        let target_bank = self.determine_target_bank()?;
+        let bank_dir = self.target_bank_dir(target_bank)
             .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
+        std::fs::create_dir_all(&bank_dir)
+            .map_err(|e| BackendError::Internal(format!("create {}: {e}", bank_dir.display())))?;
 
         // Process each payload
         for (uri, payload_id) in payload_ids {
@@ -622,14 +688,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                     "no digest for component {comp_idx}"
                 )))?;
 
-            let output_suffix = match uri.as_str() {
-                "#kernel" => format!("{set_name}-kernel-staged.img"),
-                "#firmware" => format!("{set_name}-staged.img"),
-                "#config" => format!("{set_name}-config-staged.yaml"),
-                "#qvm-config" => format!("{set_name}-qvm-config-staged.conf"),
-                other => format!("{set_name}-{}-staged.img", other.trim_start_matches('#')),
-            };
-            let output_path = images_dir.join(&output_suffix);
+            let output_path = bank_dir.join(payload_target_name(self.bank_set, uri.as_str()));
 
             tracing::info!(
                 uri = %uri,
@@ -826,30 +885,23 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             )))?;
 
         let uri = manifest.uri(comp_idx).unwrap_or("#firmware");
-        let set_name = match self.bank_set {
-            BankSet::HostOs => "host-os",
-            BankSet::Vm1 => "vm1",
-            BankSet::Vm2 => "vm2",
-            BankSet::Hsm => "hsm",
-            BankSet::App => "app",
-        };
 
-        let output_suffix = match uri {
-            "#kernel" => format!("{set_name}-kernel-staged.img"),
-            "#firmware" => format!("{set_name}-staged.img"),
-            "#config" => format!("{set_name}-config-staged.yaml"),
-            "#qvm-config" => format!("{set_name}-qvm-config-staged.conf"),
-            other => format!("{set_name}-{}-staged.img", other.trim_start_matches('#')),
-        };
-
-        let images_dir = self.images_dir.as_ref()
+        // Target bank dir holds both the final file AND the compressed-input
+        // scratch (so everything lives on the destination partition). Bank
+        // dir was cleared at flash-session start; if process_raw_payload
+        // crashes mid-flight the next session's prepare_target_bank_dir
+        // wipes any survivor.
+        let target_bank = self.determine_target_bank()?;
+        let bank_dir = self.target_bank_dir(target_bank)
             .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
+        std::fs::create_dir_all(&bank_dir)
+            .map_err(|e| BackendError::Internal(format!("create {}: {e}", bank_dir.display())))?;
 
-        // Save raw payload to temp file first (needed for process_raw_payload which reads from file)
-        let raw_path = images_dir.join(format!("{set_name}-upload-{comp_idx}.tmp"));
+        let raw_path = bank_dir.join(format!("upload-{comp_idx}.tmp"));
         let (size, _upload_hash) = crate::streaming::save_raw_payload(stream, &raw_path).await?;
 
-        let output_path = images_dir.join(&output_suffix);
+        let target_name = payload_target_name(self.bank_set, uri);
+        let output_path = bank_dir.join(&target_name);
 
         tracing::info!(
             component = comp_idx,
@@ -1386,6 +1438,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             "streaming package upload (legacy envelope)"
         );
 
+        // Legacy single-POST envelope path doesn't go through start_flash, so
+        // it has to set up the target bank dir itself (clear inactive bank +
+        // wipe orphaned staged files) before streaming the payload.
+        let target_bank = self.determine_target_bank()?;
+        self.prepare_target_bank_dir(target_bank)?;
+
         let transfer_id = self.next_id();
         {
             let mut ft = self.flash_transfer.lock().unwrap();
@@ -1406,6 +1464,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             min_security_ver,
             self.images_dir.as_deref(),
             self.bank_set,
+            target_bank,
         )
         .await {
             Ok(v) => v,
@@ -1501,6 +1560,34 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
     async fn start_flash(&self) -> BackendResult<String> {
         self.require_flash_access()?;
+
+        // Refuse to start a new upgrade while a previous one is still in
+        // trial mode (uncommitted). Otherwise the second OTA would write to
+        // what's currently the inactive bank, but `ota::install_precomputed`
+        // would only catch this after the whole payload has streamed in
+        // (returning InTrial → Busy), and `current/` would be a confusing
+        // mix of "just-written" and "still-trial" depending on which bank
+        // got staged where. The orchestrator must commit or rollback the
+        // pending trial before kicking off a new flash.
+        if !self.config.single_bank {
+            let nv = self.nv.lock().map_err(|_| BackendError::Internal("nv lock".into()))?;
+            let state = nv.read_boot_state()
+                .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+            let idx = self.bank_set as usize;
+            if !state.banks[idx].committed {
+                return Err(BackendError::Busy(format!(
+                    "bank set {:?} is in trial mode (active={:?}, uncommitted) — \
+                     commit or rollback the pending upgrade before starting a new one",
+                    self.bank_set, state.banks[idx].active_bank
+                )));
+            }
+        }
+
+        // Clear the target bank dir (and any orphaned staged files) BEFORE
+        // any payload starts streaming in. Frees ~1 image worth of space on
+        // the partition that's about to receive the new bank.
+        let target_bank = self.determine_target_bank()?;
+        self.prepare_target_bank_dir(target_bank)?;
 
         // Initialize flash session — next upload will be treated as manifest
         {
@@ -1636,67 +1723,14 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             )
             .map_err(map_ota_error)?;
 
-            // Move staged files into the target bank directory
-            if let Some(ref images_dir) = self.images_dir {
-                let set_name = match self.bank_set {
-                    BankSet::HostOs => "host-os",
-                    BankSet::Vm1 => "vm1",
-                    BankSet::Vm2 => "vm2",
-                    BankSet::Hsm => "hsm",
-                    BankSet::App => "app",
-                };
-                let bank_dir_name = match result.target_bank {
-                    Bank::A => "bank_a",
-                    Bank::B => "bank_b",
-                };
-                let bank_dir = images_dir.join(set_name).join(bank_dir_name);
-                let _ = std::fs::create_dir_all(&bank_dir);
-
-                // Kernel rename target depends on what vm-service expects
-                // (per `images.kernel` in vm-service.yaml):
-                //   vm1 (Linux)        → bzImage  — direct kernel boot
-                //   vm2 (QNX BIOS)     → boot.img — IPL+IFS as BIOS disk
-                //   host-os            → boot.ifs — bare IFS for direct boot
-                // The original code hardcoded `boot.ifs` for everything,
-                // which broke vm1 (no bzImage) AND vm2 (no boot.img — VM
-                // fell through to iPXE network boot since BIOS found no
-                // bootable disk). Symptom: orchestrator times out at 60s
-                // waiting for activation; guest_state stays offline (0xffffffff).
-                let kernel_target = match self.bank_set {
-                    BankSet::Vm1 => "Image",
-                    BankSet::Vm2 => "boot.img",
-                    _ => "boot.ifs",
-                };
-                let qvm_config_target = match self.bank_set {
-                    BankSet::Vm1 => "linux-guest.conf",
-                    _ => "qnx-guest.conf",
-                };
-                // staged.img → bank_X/rootfs.img, kernel-staged.img → bank_X/<kernel_target>
-                let moves: &[(&str, &str)] = &[
-                    ("staged.img", "rootfs.img"),
-                    ("kernel-staged.img", kernel_target),
-                    ("config-staged.yaml", "vm-config.yaml"),
-                    ("qvm-config-staged.conf", qvm_config_target),
-                ];
-                for (staged_suffix, target_name) in moves {
-                    let staged_path = images_dir.join(format!("{set_name}-{staged_suffix}"));
-                    if staged_path.exists() {
-                        let target_path = bank_dir.join(target_name);
-                        std::fs::rename(&staged_path, &target_path).map_err(|e| {
-                            BackendError::Internal(format!(
-                                "failed to rename {} → {}: {e}",
-                                staged_path.display(),
-                                target_path.display()
-                            ))
-                        })?;
-                        tracing::info!(
-                            "installed {} → {}",
-                            staged_path.display(),
-                            target_path.display()
-                        );
-                    }
-                }
-            }
+            // Payloads were already streamed directly into the target bank dir
+            // at upload time. install_precomputed flipped NV — nothing else to
+            // do here.
+            tracing::info!(
+                bank_set = ?self.bank_set,
+                target_bank = ?result.target_bank,
+                "OTA install committed (files already in bank dir)"
+            );
         } else {
             // Buffered path — install from memory
             let mut nv = self.nv_write()?;
@@ -1861,46 +1895,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                             self.config.single_bank,
                         );
 
-                        // Rename staged files to target bank
-                        if let Some(ref images_dir) = self.images_dir {
-                            let set_name = match self.bank_set {
-                                BankSet::HostOs => "host-os",
-                                BankSet::Vm1 => "vm1",
-                                BankSet::Vm2 => "vm2",
-                                BankSet::Hsm => "hsm",
-                                BankSet::App => "app",
-                            };
-                            let rb = *self.running_bank.lock().unwrap();
-                            let target_bank = if rb == nv_store::types::Bank::A { "b" } else { "a" };
-
-                            let bank_dir = images_dir.join(set_name).join(format!("bank_{target_bank}"));
-                            let _ = std::fs::create_dir_all(&bank_dir);
-
-                            // Same per-bank-set kernel rename as the install-from-disk path above.
-                            let kernel_target = match self.bank_set {
-                                BankSet::Vm1 => "bzImage",
-                                BankSet::Vm2 => "boot.img",
-                                _ => "boot.ifs",
-                            };
-                            let moves: &[(&str, &str)] = &[
-                                ("staged.img", "rootfs.img"),
-                                ("kernel-staged.img", kernel_target),
-                                ("config-staged.yaml", "vm-config.yaml"),
-                                ("config-staged.img", "vm-config.yaml"),
-                                ("qvm-config-staged.conf", "qnx-guest.conf"),
-                            ];
-                            for (staged_suffix, target_name) in moves {
-                                let staged = images_dir.join(format!("{set_name}-{staged_suffix}"));
-                                if staged.exists() {
-                                    let target = bank_dir.join(target_name);
-                                    if let Err(e) = std::fs::rename(&staged, &target) {
-                                        tracing::warn!("rename {} → {}: {e}", staged.display(), target.display());
-                                    } else {
-                                        tracing::info!("installed {} → {}", staged.display(), target.display());
-                                    }
-                                }
-                            }
-                        }
+                        // Payloads were already streamed directly into the
+                        // target bank dir at upload time; no rename here.
                     }
                 }
             }
@@ -2455,6 +2451,48 @@ pub(crate) fn did_value_to_json(_did_num: u16, value: &[u8], reg: Option<&DidEnt
             let hex: String = value.iter().map(|b| format!("{b:02x}")).collect();
             serde_json::Value::String(format!("0x{hex}"))
         }
+    }
+}
+
+/// Per-bank-set on-disk filenames after OTA install. Returns
+/// `(kernel, qvm_config)`. vm-service.yaml's `images.kernel` and `qvm_config`
+/// must match these for each VM; mismatch surfaces as "kernel not found" at
+/// vm-service start. VMs share the qvm-hosted layout regardless of guest OS;
+/// host-os ships a bare IFS for direct boot.
+fn bank_file_names(bank_set: BankSet) -> (&'static str, &'static str) {
+    match bank_set {
+        BankSet::Vm1 | BankSet::Vm2 => ("kernel", "qvm.conf"),
+        BankSet::HostOs | BankSet::Hsm | BankSet::App => ("boot.ifs", "qvm.conf"),
+    }
+}
+
+pub(crate) fn bank_set_dir_name(bank_set: BankSet) -> &'static str {
+    match bank_set {
+        BankSet::HostOs => "host-os",
+        BankSet::Vm1 => "vm1",
+        BankSet::Vm2 => "vm2",
+        BankSet::Hsm => "hsm",
+        BankSet::App => "app",
+    }
+}
+
+pub(crate) fn bank_dir_name(bank: Bank) -> &'static str {
+    match bank {
+        Bank::A => "bank_a",
+        Bank::B => "bank_b",
+    }
+}
+
+/// Map a SUIT payload URI to the on-disk filename inside the target bank dir.
+/// Stays in lockstep with `bank_file_names()`.
+pub(crate) fn payload_target_name(bank_set: BankSet, uri: &str) -> String {
+    let (kernel_name, qvm_config_name) = bank_file_names(bank_set);
+    match uri {
+        "#kernel" => kernel_name.to_string(),
+        "#firmware" => "rootfs.img".to_string(),
+        "#config" => "vm-config.yaml".to_string(),
+        "#qvm-config" => qvm_config_name.to_string(),
+        other => other.trim_start_matches('#').to_string(),
     }
 }
 

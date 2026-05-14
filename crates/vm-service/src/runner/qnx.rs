@@ -19,15 +19,14 @@ use super::*;
 const LOOPBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct QnxRunner {
-    /// devb-loopback process (maps rootfs file → /dev/qvmdisk-<vm>N).
-    /// The held `Child` is just the spawn parent — devb-loopback
-    /// double-forks. Track the actual daemon pid in `loopback_pid`
-    /// instead and use libc::kill on it at cleanup.
-    loopback_child: Option<Child>,
-    loopback_pid: Option<u32>,
-    /// VM name remembered from start() so cleanup can re-find the
-    /// daemon pid by `prefix=qvmdisk-<vm_name>` if `loopback_pid`
-    /// is None (e.g. find raced ahead of devb-loopback's daemonize).
+    /// devb-loopback spawn parents for rootfs + every extra disk. Each held
+    /// `Child` is just the fork parent — devb-loopback double-forks. The
+    /// real daemons land in `loopback_pids` so cleanup can libc::kill them.
+    loopback_children: Vec<Child>,
+    loopback_pids: Vec<u32>,
+    /// VM name remembered from start() so cleanup can re-find any daemons
+    /// whose pid wasn't captured (find raced ahead of devb-loopback's
+    /// daemonize) — see [`Self::slay_loopbacks_for_vm`].
     vm_name: Option<String>,
     /// qvm process (the guest VM).
     qvm_child: Option<Child>,
@@ -36,8 +35,8 @@ pub struct QnxRunner {
 impl QnxRunner {
     pub fn new() -> Self {
         Self {
-            loopback_child: None,
-            loopback_pid: None,
+            loopback_children: Vec::new(),
+            loopback_pids: Vec::new(),
             vm_name: None,
             qvm_child: None,
         }
@@ -49,30 +48,86 @@ impl QnxRunner {
         let _ = child.wait();
     }
 
-    /// devb-loopback's `prefix` arg becomes the device-node prefix in /dev.
-    /// We bake the VM name in so multi-VM hosts get distinct devices and
-    /// can target each daemon individually for kill — see find_loopback_pid.
-    fn loopback_prefix(vm_name: &str) -> String {
+    /// Prefix the rootfs devb-loopback registers under in `/dev`.
+    fn rootfs_prefix(vm_name: &str) -> String {
         format!("qvmdisk-{vm_name}")
     }
 
-    /// Path of the rootfs device the per-VM devb-loopback exposes.
-    fn loopback_device(vm_name: &str) -> String {
-        format!("/dev/{}0", Self::loopback_prefix(vm_name))
+    /// Prefix an extra-disk devb-loopback registers under in `/dev`. Single
+    /// hyphen — matches the rootfs `qvmdisk-{vm}` pattern. Empirically, two
+    /// hyphens in the prefix made the device node never appear (devb-loopback
+    /// process ran but io-blk silently dropped the registration).
+    fn extra_prefix(vm_name: &str, role: &str) -> String {
+        format!("qvm{role}-{vm_name}")
     }
 
-    /// Find the live devb-loopback daemon pid for this VM, or None.
+    fn extra_device(vm_name: &str, role: &str) -> String {
+        format!("/dev/{}0", Self::extra_prefix(vm_name, role))
+    }
+
+    /// Find every live devb-loopback daemon associated with this VM.
     ///
-    /// `Command::spawn`'s child pid points at the (long-dead) fork
-    /// parent because devb-loopback daemonizes. The actual driver
-    /// shows up with the same argv vector, so scan `pidin` for the
-    /// process whose args contain our VM's prefix.
-    fn find_loopback_pid(vm_name: &str) -> Option<u32> {
-        let needle = format!("prefix={},", Self::loopback_prefix(vm_name));
-        let out = std::process::Command::new("pidin")
-            .args(["-F", "%p %a"])
-            .output()
-            .ok()?;
+    /// `Command::spawn`'s child pid points at the (long-dead) fork parent
+    /// because devb-loopback daemonizes. The actual driver shows up with
+    /// the same argv vector, so scan `pidin` for processes whose prefix
+    /// arg ends with `-{vm_name}` (matches both `qvmdisk-{vm}` and
+    /// `qvm-{role}-{vm}`).
+    fn find_loopback_pids(vm_name: &str) -> Vec<u32> {
+        let needle = format!("-{vm_name},fd=");
+        let mut pids = Vec::new();
+        let Ok(out) = std::process::Command::new("pidin").args(["-F", "%p %a"]).output() else {
+            return pids;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            if line.contains("devb-loopback") && line.contains(&needle) {
+                if let Some(pid_tok) = line.split_whitespace().next() {
+                    if let Ok(pid) = pid_tok.parse::<u32>() {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+        pids
+    }
+
+    /// SIGTERM-then-SIGKILL every devb-loopback for this VM. Used as
+    /// defense-in-depth at start() to clear leftovers from a prior boot
+    /// that didn't go through cleanup() (process crash, hard reset).
+    fn slay_loopbacks_for_vm(vm_name: &str) {
+        for pid in Self::find_loopback_pids(vm_name) {
+            tracing::info!(vm = %vm_name, pid, "killing stale devb-loopback");
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            std::thread::sleep(Duration::from_millis(100));
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+        }
+    }
+
+    /// Spawn a devb-loopback for a backing file with a given prefix, wait
+    /// for `/dev/<prefix>0` to appear, and remember the daemon pid for
+    /// cleanup. Shared by the rootfs + extra-disks paths.
+    fn spawn_loopback(&mut self, prefix: &str, backing: &Path) -> Result<(), RunnerError> {
+        let device = format!("/dev/{prefix}0");
+        tracing::info!("starting devb-loopback: {} → {device}", backing.display());
+        let child = Command::new("devb-loopback")
+            .arg("loopback")
+            .arg(format!("prefix={prefix},fd={}", backing.display()))
+            .spawn()
+            .map_err(|e| RunnerError::ProcessFailed(format!("devb-loopback: {e}")))?;
+        self.loopback_children.push(child);
+        wait_for_device(&device, LOOPBACK_TIMEOUT)?;
+        if let Some(pid) = Self::find_loopback_pid_by_prefix(prefix) {
+            self.loopback_pids.push(pid);
+            tracing::info!("{device} ready (devb-loopback pid: {pid})");
+        } else {
+            tracing::info!("{device} ready (devb-loopback pid: unresolved)");
+        }
+        Ok(())
+    }
+
+    fn find_loopback_pid_by_prefix(prefix: &str) -> Option<u32> {
+        let needle = format!("prefix={prefix},");
+        let out = std::process::Command::new("pidin").args(["-F", "%p %a"]).output().ok()?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         for line in stdout.lines() {
             if line.contains("devb-loopback") && line.contains(&needle) {
@@ -84,23 +139,6 @@ impl QnxRunner {
             }
         }
         None
-    }
-
-    /// Kill the devb-loopback daemon owning this VM's prefix, if any.
-    /// SIGTERM first, brief grace period, then SIGKILL — devb's drivers
-    /// usually exit cleanly on SIGTERM, but we don't want to wait on a
-    /// stuck one.
-    fn slay_loopback_for_vm(vm_name: &str) {
-        if let Some(pid) = Self::find_loopback_pid(vm_name) {
-            tracing::info!(vm = %vm_name, pid, "killing stale devb-loopback");
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
-            std::thread::sleep(Duration::from_millis(100));
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
     }
 }
 
@@ -139,38 +177,37 @@ impl VmRunner for QnxRunner {
             )));
         }
 
-        // Start devb-loopback to map rootfs file → /dev/qvmdisk-<vm>N.
-        // Per-VM prefix lets multiple VMs run concurrently (each with
-        // its own /dev/qvmdisk-vmX0) and lets us pid-target the daemon
-        // at cleanup without slaying every devb-loopback on the host.
+        // Defense in depth — kill any devb-loopback for THIS VM (rootfs +
+        // extras) left over from a stop path that didn't go through
+        // cleanup() (process crash, hard reset). Other VMs untouched.
+        Self::slay_loopbacks_for_vm(name);
+        std::thread::sleep(Duration::from_millis(100));
+        self.vm_name = Some(name.to_string());
+
+        // Rootfs: per-VM prefix lets multiple VMs run concurrently with
+        // distinct /dev/qvmdisk-vmX0 nodes.
         if let Some(rootfs) = def.rootfs_path() {
             if rootfs.exists() {
-                // Defense in depth — kill any devb-loopback for THIS VM
-                // that didn't get cleaned up by a previous stop. Other
-                // VMs' daemons are untouched.
-                Self::slay_loopback_for_vm(name);
-                std::thread::sleep(Duration::from_millis(100));
-
-                let prefix = Self::loopback_prefix(name);
-                let device = Self::loopback_device(name);
-                tracing::info!("starting devb-loopback for {name}: {} → {}", rootfs.display(), device);
-                let child = Command::new("devb-loopback")
-                    .arg("loopback")
-                    .arg(format!("prefix={prefix},fd={}", rootfs.display()))
-                    .spawn()
-                    .map_err(|e| RunnerError::ProcessFailed(format!("devb-loopback: {e}")))?;
-                self.loopback_child = Some(child);
-                self.vm_name = Some(name.to_string());
-
-                wait_for_device(&device, LOOPBACK_TIMEOUT)?;
-                self.loopback_pid = Self::find_loopback_pid(name);
-                tracing::info!(
-                    "{device} ready (devb-loopback pid: {:?})",
-                    self.loopback_pid
-                );
+                let prefix = Self::rootfs_prefix(name);
+                self.spawn_loopback(&prefix, &rootfs)?;
             } else {
                 tracing::warn!("VM {name}: rootfs not found: {} — skipping loopback", rootfs.display());
             }
+        }
+
+        // Extra disks (data, swap, …) from def.disks. Uses a distinct
+        // `qvm-{role}-{vm}` prefix so io-blk doesn't see name-prefix
+        // collisions with the rootfs's `qvmdisk-{vm}` namespace.
+        for disk in &def.disks {
+            if !disk.path.exists() {
+                tracing::warn!("VM {name}: extra disk {role} not found: {path} — skipping",
+                    role = disk.role, path = disk.path.display());
+                continue;
+            }
+            let prefix = Self::extra_prefix(name, &disk.role);
+            self.spawn_loopback(&prefix, &disk.path)?;
+            let device = Self::extra_device(name, &disk.role);
+            tracing::info!(vm = %name, role = %disk.role, device, path = %disk.path.display(), "extra disk attached");
         }
 
         // Launch qvm with the config file
@@ -214,39 +251,35 @@ impl VmRunner for QnxRunner {
     }
 
     fn cleanup(&mut self) {
-        // Kill qvm first so it stops accessing /dev/qvmdisk-<vm>N
-        // before we tear down devb-loopback under it.
+        // Kill qvm first so it stops accessing /dev/<prefix>N before we
+        // tear down devb-loopback under it.
         if let Some(ref mut child) = self.qvm_child {
             Self::kill_child(child);
         }
         self.qvm_child = None;
 
-        // The held Child for devb-loopback only points at the spawn
-        // parent (the daemon double-forks); kill_child on it is a
-        // no-op. Use the pid we resolved from pidin at start time;
-        // re-scan as a fallback if start() raced ahead of the
-        // daemon being visible in pidin.
-        if let Some(ref mut child) = self.loopback_child {
-            Self::kill_child(child);
+        // Held Children point at the spawn-parents (daemons double-fork);
+        // kill_child on them is a no-op but reaps the zombie. The real
+        // daemons live in loopback_pids.
+        for mut child in self.loopback_children.drain(..) {
+            Self::kill_child(&mut child);
         }
-        self.loopback_child = None;
 
-        let pid = self.loopback_pid.take().or_else(|| {
-            self.vm_name.as_deref().and_then(Self::find_loopback_pid)
-        });
-        if let Some(pid) = pid {
-            tracing::info!(
-                vm = ?self.vm_name,
-                pid,
-                "killing devb-loopback daemon"
-            );
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        // Resolve any daemons we missed at start() (find raced with
+        // daemonize) by re-scanning by VM name.
+        let mut pids = std::mem::take(&mut self.loopback_pids);
+        if let Some(ref vm) = self.vm_name {
+            for pid in Self::find_loopback_pids(vm) {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
             }
+        }
+        for pid in pids {
+            tracing::info!(vm = ?self.vm_name, pid, "killing devb-loopback daemon");
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
             std::thread::sleep(Duration::from_millis(100));
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
         }
         self.vm_name = None;
     }

@@ -37,6 +37,15 @@ pub fn handle_request(
     // Policy check: is this caller allowed to perform this op at all?
     if let Some(required) = op.required_perm() {
         if let Err(status) = policy.check(caller.peer_ip, required) {
+            tracing::warn!(
+                peer = %caller.peer_ip,
+                vm = %caller.vm_id,
+                op = ?op,
+                op_code = format!("0x{:08x}", req.op),
+                required_perm = format!("0x{:08x}", required),
+                ?status,
+                "policy.check denied"
+            );
             return Response::err(req.op, req.session_id, status);
         }
     }
@@ -168,6 +177,15 @@ fn handle_crypto_with_handle(
     // Per-handle permission check
     if let Some(required) = op.required_perm() {
         if entry.permitted_ops & required == 0 {
+            tracing::warn!(
+                peer = %caller.peer_ip,
+                vm = %caller.vm_id,
+                op = ?op,
+                handle = format!("0x{:04x}", handle),
+                entry_perms = format!("0x{:04x}", entry.permitted_ops),
+                required_perm = format!("0x{:08x}", required),
+                "per-handle deny: entry.permitted_ops missing required bit"
+            );
             return Response::err(req.op, req.session_id, StatusCode::PermissionDeny);
         }
     }
@@ -255,6 +273,12 @@ fn handle_verify(
     };
 
     if entry.permitted_ops & PERM_VERIFY == 0 {
+        tracing::warn!(
+            peer = %caller.peer_ip, vm = %caller.vm_id,
+            op = "verify",
+            entry_perms = format!("0x{:04x}", entry.permitted_ops),
+            "per-handle deny: PERM_VERIFY missing"
+        );
         return Response::err(req.op, req.session_id, StatusCode::PermissionDeny);
     }
 
@@ -341,6 +365,12 @@ fn handle_get_pubkey(
     };
 
     if entry.permitted_ops & PERM_GET_PUBKEY == 0 {
+        tracing::warn!(
+            peer = %caller.peer_ip, vm = %caller.vm_id,
+            op = "get_pubkey",
+            entry_perms = format!("0x{:04x}", entry.permitted_ops),
+            "per-handle deny: PERM_GET_PUBKEY missing"
+        );
         return Response::err(req.op, req.session_id, StatusCode::PermissionDeny);
     }
 
@@ -384,6 +414,12 @@ fn handle_get_cert(
     };
 
     if entry.permitted_ops & PERM_GET_CERT == 0 {
+        tracing::warn!(
+            peer = %caller.peer_ip, vm = %caller.vm_id,
+            op = "get_cert",
+            entry_perms = format!("0x{:04x}", entry.permitted_ops),
+            "per-handle deny: PERM_GET_CERT missing"
+        );
         return Response::err(req.op, req.session_id, StatusCode::PermissionDeny);
     }
 

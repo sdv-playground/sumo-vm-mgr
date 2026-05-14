@@ -2,9 +2,10 @@
 ///
 /// Routes:
 ///   GET  /vms                → list all VMs + status
-///   POST /vms/{name}/start   → start a VM
+///   POST /vms/{name}/start   → ensure VM is running (idempotent: stops any
+///                              existing instance first, then starts fresh)
 ///   POST /vms/{name}/stop    → stop a VM
-///   POST /vms/{name}/restart → stop + start
+///   POST /vms/{name}/restart → alias for /start (kept for API back-compat)
 ///   GET  /vms/{name}/health  → health status
 
 use std::sync::Arc;
@@ -26,9 +27,9 @@ type SharedManager = Arc<Mutex<VmManager>>;
 pub fn router(manager: SharedManager) -> Router {
     Router::new()
         .route("/vms", get(list_vms))
-        .route("/vms/{name}/start", post(start_vm))
+        .route("/vms/{name}/start", post(ensure_vm_running))
         .route("/vms/{name}/stop", post(stop_vm))
-        .route("/vms/{name}/restart", post(restart_vm))
+        .route("/vms/{name}/restart", post(ensure_vm_running))
         .route("/vms/{name}/health", get(health_vm))
         .layer(axum::middleware::from_fn(log_request))
         .with_state(manager)
@@ -70,33 +71,6 @@ async fn list_vms(State(mgr): State<SharedManager>) -> Json<Vec<VmInfoResponse>>
     Json(vms)
 }
 
-async fn start_vm(
-    State(mgr): State<SharedManager>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    // Defer the actual start to a background task and return 200 immediately —
-    // mirrors restart_vm's contract. start_vm internally blocks on
-    // devb-loopback wait (host kernel must register the rootfs.img loopback
-    // before qvm boots), which can take seconds; running it under the
-    // manager lock would block /vms/{name}/health and stall the
-    // orchestrator's activation poll.
-    let mgr_clone = mgr.clone();
-    let name_clone = name.clone();
-    tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            let mut mgr = rt.block_on(mgr_clone.lock());
-            mgr.start_vm(&name_clone)
-        }).await;
-        match result {
-            Ok(Ok(()))  => tracing::info!(vm = %name, "start_vm: VM started in background"),
-            Ok(Err(e))  => tracing::error!(vm = %name, error = %e, "start_vm: background start failed"),
-            Err(e)      => tracing::error!(vm = %name, error = %e, "start_vm: background task panicked"),
-        }
-    });
-    (StatusCode::OK, Json(serde_json::json!({"ok": true, "queued": true})))
-}
-
 async fn stop_vm(
     State(mgr): State<SharedManager>,
     Path(name): Path<String>,
@@ -128,16 +102,22 @@ async fn stop_vm(
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
-async fn restart_vm(
+/// Idempotent "ensure VM is running with current config". Backs both
+/// POST /vms/{name}/start and POST /vms/{name}/restart so callers don't
+/// have to probe state first — a previously-started but never-healthy
+/// instance (e.g. qvm rejected a config option and exited) gets recycled
+/// instead of returning AlreadyRunning.
+///
+/// `initiate_stop` is synchronous (signal + record pid; or, for an
+/// already-dead handle, cleanup + return no-op handle). The blocking
+/// stages (wait_for_exit, finalize_stop, start_vm) run in a background
+/// task after we've returned 200, matching the documented contract
+/// callers (vm-mgr's notify_vm_service) rely on: "returns 200 the moment
+/// the recycle is initiated (it does NOT wait for QEMU/qvm to fully boot)".
+async fn ensure_vm_running(
     State(mgr): State<SharedManager>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    // Initiate stop synchronously — fast, just sends signal + records pid.
-    // Anything that can block (wait_for_exit, finalize_stop, start_vm) runs
-    // in the background after we've returned 200, matching the documented
-    // contract that callers (vm-mgr's notify_vm_service) rely on:
-    // "restart_vm returns 200 the moment it has initiated the restart (it
-    // does NOT wait for QEMU to fully boot)".
     let stop_handle = {
         let mut mgr = mgr.lock().await;
         match mgr.initiate_stop(&name) {
@@ -150,7 +130,6 @@ async fn restart_vm(
     let mgr_clone = mgr.clone();
     let name_clone = name.clone();
     tokio::spawn(async move {
-        // Wait for previous instance (if any) to exit, then finalize.
         if let Some(sh) = stop_handle {
             if let Some(pid) = sh.pid {
                 let timeout = sh.timeout_secs;
@@ -162,7 +141,6 @@ async fn restart_vm(
             mgr.finalize_stop(&name_clone);
         }
 
-        // Start the new instance (may block on devb-loopback wait).
         let start_name = name_clone.clone();
         let start_mgr = mgr_clone.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -172,9 +150,9 @@ async fn restart_vm(
         }).await;
 
         match result {
-            Ok(Ok(())) => tracing::info!(vm = %name_clone, "restart_vm: VM restarted in background"),
-            Ok(Err(e)) => tracing::error!(vm = %name_clone, error = %e, "restart_vm: background start_vm failed"),
-            Err(e)     => tracing::error!(vm = %name_clone, error = %e, "restart_vm: background start_vm panicked"),
+            Ok(Ok(())) => tracing::info!(vm = %name_clone, "ensure_vm_running: VM is running"),
+            Ok(Err(e)) => tracing::error!(vm = %name_clone, error = %e, "ensure_vm_running: background start_vm failed"),
+            Err(e)     => tracing::error!(vm = %name_clone, error = %e, "ensure_vm_running: background task panicked"),
         }
     });
 

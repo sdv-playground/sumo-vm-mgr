@@ -395,6 +395,7 @@ fn map_machine_error(e: MachineError) -> BackendError {
         MachineError::NotFound(s) => BackendError::EntityNotFound(s),
         MachineError::InvalidArgument(s) => BackendError::InvalidRequest(s),
         MachineError::PolicyRejected(s) => BackendError::InvalidRequest(s),
+        MachineError::Busy(s) => BackendError::Busy(s),
         MachineError::ManifestInvalid(s) => BackendError::InvalidRequest(s),
         MachineError::UnknownFlashSession(s) => BackendError::InvalidRequest(s),
         MachineError::Storage(s) => BackendError::Internal(s),

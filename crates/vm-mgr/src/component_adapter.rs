@@ -345,7 +345,7 @@ fn map_backend_error(e: BackendError) -> MachineError {
         }
         BackendError::NotSupported(_) => MachineError::NotSupported("backend operation"),
         BackendError::InvalidRequest(s) => MachineError::InvalidArgument(s),
-        BackendError::Busy(s) => MachineError::PolicyRejected(format!("busy: {s}")),
+        BackendError::Busy(s) => MachineError::Busy(s),
         BackendError::Timeout => MachineError::Internal("timeout".into()),
         BackendError::Protocol(s)
         | BackendError::Transport(s)

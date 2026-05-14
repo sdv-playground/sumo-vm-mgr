@@ -108,13 +108,24 @@ impl FileBlockDevice {
     }
 
     pub fn create(path: &std::path::Path, size: u64) -> Result<Self, BlockError> {
-        let file = std::fs::OpenOptions::new()
+        use std::io::{Seek, Write};
+        let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(path)?;
         file.set_len(size)?;
+        // QNX qnx6's ftruncate(grow) is a silent no-op — set_len returns OK
+        // but the file stays 0 bytes, and the next read/write OutOfBounds.
+        // Force the file to actually be `size` bytes by writing a sentinel
+        // zero at the last position; sparse holes between are filled on
+        // demand by any FS that supports them.
+        if size > 0 {
+            file.seek(std::io::SeekFrom::Start(size - 1))?;
+            file.write_all(&[0])?;
+            file.flush()?;
+        }
         Ok(Self { file, size })
     }
 }

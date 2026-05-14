@@ -41,12 +41,19 @@ pub struct SimHsm {
     /// Keystore directory (e.g. /tmp/vhsm-keys).
     keystore_path: PathBuf,
     /// TCP listen address. Defaults to `127.0.0.1` for tests/dev; in
-    /// production on the CVC host this is the host-side IP of the
-    /// vp2 vdevpeer (e.g. `10.0.200.1`) so the daemon is reachable
-    /// from the guest via the private vHSM link AND from on-host
-    /// software through the same interface, but NOT from any
-    /// externally routed network (vp2 isn't NAT'd / forwarded).
+    /// production on the CVC host this is the host-side IP of one of
+    /// the vp* vdevpeers (e.g. `10.0.200.1` for VM2), or `0.0.0.0` when
+    /// the daemon serves multiple guests on different /30 subnets and
+    /// `allow_list` enumerates them all.
+    ///
+    /// NOTE: this whole identity scheme is temporary — virtio-vsock on
+    /// QNX 8 will replace TCP-on-private-bridge with CID-based identity,
+    /// at which point `bind_ip` and `allow_list` both go away.
     bind_ip: IpAddr,
+    /// Per-guest allow-list: each `(source-IP, vm-id)` becomes one
+    /// `--allow-ip` arg to vhsm-test-ssd. When empty, falls back to the
+    /// `bind_ip+1` heuristic (the historical single-VM behaviour).
+    allow_list: Vec<(IpAddr, String)>,
     /// TCP port the daemon listens on.
     tcp_port: u16,
     /// Running daemon process handle.
@@ -72,17 +79,39 @@ impl SimHsm {
 
     /// Construct with an explicit bind IP — used by supernova in
     /// production to bind to the host-side vp2 endpoint (e.g.
-    /// `10.0.200.1`).
+    /// `10.0.200.1`). Single-guest path: peer is derived as `bind_ip+1`
+    /// (the /30 convention).
     pub fn with_bind(
         daemon_bin: PathBuf,
         keystore_path: PathBuf,
         bind_ip: IpAddr,
         tcp_port: u16,
     ) -> Self {
+        Self::with_allow_list(daemon_bin, keystore_path, bind_ip, tcp_port, Vec::new())
+    }
+
+    /// Multi-guest constructor. `allow_list` enumerates `(source-IP,
+    /// vm-id)` pairs; when non-empty, `bind_ip` becomes the listen IP
+    /// (typically `0.0.0.0` so both /30 bridges can reach it) and the
+    /// `bind_ip+1` heuristic is bypassed. Each entry generates one
+    /// `--allow-ip` arg to `vhsm-test-ssd`.
+    ///
+    /// vsock note: when QNX 8's virtio-vsock lands on the host, this
+    /// IP-based allow-list goes away — vsock's CID is the identity.
+    /// `Vec<(IpAddr, String)>` becomes `Vec<(VsockCid, String)>` and
+    /// the bind/listen split collapses to a single CID port.
+    pub fn with_allow_list(
+        daemon_bin: PathBuf,
+        keystore_path: PathBuf,
+        bind_ip: IpAddr,
+        tcp_port: u16,
+        allow_list: Vec<(IpAddr, String)>,
+    ) -> Self {
         Self {
             daemon_bin,
             keystore_path,
             bind_ip,
+            allow_list,
             tcp_port,
             child: None,
         }
@@ -377,6 +406,68 @@ impl SimHsm {
         }
     }
 
+    /// Best-effort cleanup of any stale `vhsm-test-ssd` process still
+    /// holding our intended listen port. Run before spawning the real
+    /// daemon to recover from a previous supernova lifetime that was
+    /// `slay`'d (SIGKILL bypasses Rust's Drop, leaving the child
+    /// reparented to init and still bound).
+    ///
+    /// Cross-platform: tries `pkill` (Linux/glibc) then `slay` (QNX
+    /// native). Both are no-ops when no matching process exists. If
+    /// neither tool is available the subsequent `spawn()`'s bind will
+    /// fail loudly — a better outcome than silent staleness.
+    fn kill_stale_daemon_if_port_busy(&self, listen: &str) {
+        use std::process::Stdio;
+
+        // Probe: can we bind ourselves? If yes, no orphan, nothing to do.
+        match std::net::TcpListener::bind(listen) {
+            Ok(l) => { drop(l); return; }
+            Err(e) => {
+                tracing::warn!(
+                    addr = listen, error = %e,
+                    "listen port busy — assuming stale vhsm-test-ssd orphan"
+                );
+            }
+        }
+
+        // Match on the daemon's basename. pkill -f / slay -f match
+        // anywhere in argv0; we don't want to whack random processes,
+        // so use the executable basename which should be uniquely
+        // ours.
+        let bin_name = self.daemon_bin
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("vhsm-test-ssd");
+
+        let attempts: &[(&str, &[&str])] = &[
+            ("pkill", &["-TERM", "-x", bin_name]),
+            ("slay",  &["-T1", bin_name]),
+            // Final fallback if the running daemon ignored SIGTERM.
+            ("pkill", &["-KILL", "-x", bin_name]),
+            ("slay",  &["-9", bin_name]),
+        ];
+        for (cmd, args) in attempts {
+            let _ = Command::new(cmd)
+                .args(*args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            // Poll up to ~500ms for the port to free up.
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if std::net::TcpListener::bind(listen).is_ok() {
+                    tracing::info!(via = %cmd, "stale vhsm-test-ssd killed; port free");
+                    return;
+                }
+            }
+        }
+        tracing::warn!(
+            addr = listen,
+            "could not reclaim listen port — spawn will likely fail"
+        );
+    }
+
     /// Extract the CBOR payload from a SUIT envelope.
     ///
     /// All envelopes are encrypted to the device decryption key (slot 2).
@@ -586,38 +677,54 @@ impl HsmProvider for SimHsm {
             "starting vhsm-test-ssd"
         );
 
-        // Bind on `self.bind_ip` (default 127.0.0.1; production = host
-        // vp2 endpoint such as 10.0.200.1). The matching peer IP is
-        // bind_ip with the lower nibble flipped — guests live on
-        // host_ip + 1 in the /30 vp2 subnets — so allow that source.
+        // Listen address. Single-VM legacy path uses `bind_ip:port`
+        // exactly. Multi-VM path (allow_list non-empty) should bind on
+        // an address reachable from every guest's vhsm bridge — usually
+        // `0.0.0.0` — but we don't override `bind_ip` here: the caller
+        // is expected to set it to whatever it wants the listener on.
         let listen = format!("{}:{}", self.bind_ip, self.tcp_port);
-        let allow_peer = match self.bind_ip {
-            IpAddr::V4(v4) => {
-                // /30: host=.1, guest=.2 (or any +1 offset). Use the
-                // host's own IP for the test/loopback case.
-                let octets = v4.octets();
-                let peer = if v4.is_loopback() {
-                    "127.0.0.1=test-vm".to_string()
-                } else {
-                    let guest = std::net::Ipv4Addr::new(
-                        octets[0],
-                        octets[1],
-                        octets[2],
-                        octets[3].wrapping_add(1),
-                    );
-                    format!("{guest}=vm-guest")
-                };
-                peer
-            }
-            IpAddr::V6(_) => format!("{}=local", self.bind_ip),
+
+        // Defensive: kill any stale orphan from a prior supernova lifetime.
+        // When supernova is `slay`'d (SIGKILL), Rust's Drop chain never
+        // runs and the vhsm-ssd child is reparented to init, keeping the
+        // listen port bound with its old --allow-ip args. A new supernova
+        // then fails to bind silently and the old daemon keeps serving
+        // requests with the stale policy. This probe-bind detects the
+        // case and kills the orphan before we proceed.
+        self.kill_stale_daemon_if_port_busy(&listen);
+
+        // Build the allow-list arg vector. If the caller didn't supply
+        // an explicit list, fall back to the /30 `bind_ip + 1` heuristic
+        // so legacy single-VM callers keep working without code changes.
+        //
+        // vsock note: this whole loop is IP-identity scaffolding. Once
+        // virtio-vsock lands on QNX 8 we'll switch the wire to vsock
+        // and identity becomes the peer CID — `--allow-cid` instead of
+        // `--allow-ip`. Same shape, different addressing.
+        let allow_args: Vec<String> = if self.allow_list.is_empty() {
+            vec![match self.bind_ip {
+                IpAddr::V4(v4) if v4.is_loopback() => "127.0.0.1=test-vm".to_string(),
+                IpAddr::V4(v4) => {
+                    let o = v4.octets();
+                    let g = std::net::Ipv4Addr::new(o[0], o[1], o[2], o[3].wrapping_add(1));
+                    format!("{g}=vm-guest")
+                }
+                IpAddr::V6(_) => format!("{}=local", self.bind_ip),
+            }]
+        } else {
+            self.allow_list
+                .iter()
+                .map(|(ip, vm)| format!("{ip}={vm}"))
+                .collect()
         };
-        let child = Command::new(&self.daemon_bin)
-            .arg("--keystore")
-            .arg(&self.keystore_path)
-            .arg("--listen")
-            .arg(&listen)
-            .arg("--allow-ip")
-            .arg(&allow_peer)
+
+        let mut cmd = Command::new(&self.daemon_bin);
+        cmd.arg("--keystore").arg(&self.keystore_path)
+            .arg("--listen").arg(&listen);
+        for entry in &allow_args {
+            cmd.arg("--allow-ip").arg(entry);
+        }
+        let child = cmd
             .spawn()
             .map_err(|e| HsmError::ProcessError(format!("spawn vhsm-test-ssd: {e}")))?;
 
