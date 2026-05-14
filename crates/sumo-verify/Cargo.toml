@@ -14,3 +14,5 @@ path = "src/main.rs"
 # verify_bank directly — no vhsm-ssd hop needed for the host-side
 # verifier.
 hsm = { path = "../hsm", features = ["crypto"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

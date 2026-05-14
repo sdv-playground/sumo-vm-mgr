@@ -273,15 +273,35 @@ pub fn sign_bank(
     bank_dir: &Path,
     bank_id: impl Into<String>,
 ) -> Result<IvdManifest, IvdError> {
+    let started = std::time::Instant::now();
+
+    // Phase 1: walk the bank dir + hash every file into the manifest.
+    let hash_start = std::time::Instant::now();
     let manifest = build_manifest(bank_dir, bank_id)?;
     let manifest_bytes = encode_manifest(&manifest)?;
+    let hash_us = hash_start.elapsed().as_micros() as u64;
 
+    // Phase 2: sign the manifest bytes.
+    let sig_start = std::time::Instant::now();
     let sig = hsm.sign(IVD_KEY_ID, &manifest_bytes)?;
+    let sig_us = sig_start.elapsed().as_micros() as u64;
 
     fs::write(bank_dir.join(IVD_MANIFEST_FILE), &manifest_bytes)
         .map_err(|e| IvdError::Io(e, bank_dir.join(IVD_MANIFEST_FILE)))?;
     fs::write(bank_dir.join(IVD_SIGNATURE_FILE), &sig)
         .map_err(|e| IvdError::Io(e, bank_dir.join(IVD_SIGNATURE_FILE)))?;
+
+    let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
+    tracing::info!(
+        bank_dir = %bank_dir.display(),
+        bank_id = %manifest.bank_id,
+        files = manifest.files.len(),
+        total_bytes,
+        hash_us,
+        sig_us,
+        total_us = started.elapsed().as_micros() as u64,
+        "ivd sign OK",
+    );
 
     Ok(manifest)
 }
@@ -296,6 +316,30 @@ pub fn verify_bank(
     bank_dir: &Path,
     expected_bank_id: Option<&str>,
 ) -> Result<IvdManifest, IvdError> {
+    let started = std::time::Instant::now();
+    let result = verify_bank_inner(hsm, bank_dir, expected_bank_id, started);
+    if let Err(ref e) = result {
+        // Inner records its own per-phase timings on success; on the
+        // pre-signature error paths (file IO etc.) we still want a
+        // single failure line for the operator log.
+        tracing::error!(
+            bank_dir = %bank_dir.display(),
+            expected_bank_id = ?expected_bank_id,
+            total_us = started.elapsed().as_micros() as u64,
+            error = %e,
+            "ivd verify FAIL",
+        );
+    }
+    result
+}
+
+#[cfg(feature = "crypto")]
+fn verify_bank_inner(
+    hsm: &dyn HsmProvider,
+    bank_dir: &Path,
+    expected_bank_id: Option<&str>,
+    started: std::time::Instant,
+) -> Result<IvdManifest, IvdError> {
     let manifest_path = bank_dir.join(IVD_MANIFEST_FILE);
     let signature_path = bank_dir.join(IVD_SIGNATURE_FILE);
 
@@ -304,9 +348,12 @@ pub fn verify_bank(
     let sig = fs::read(&signature_path)
         .map_err(|e| IvdError::Io(e, signature_path.clone()))?;
 
+    // ---- Phase 1: signature verification ----
+    let sig_start = std::time::Instant::now();
     let ok = hsm
         .verify(IVD_KEY_ID, &manifest_bytes, &sig)
         .map_err(IvdError::Hsm)?;
+    let sig_verify_us = sig_start.elapsed().as_micros() as u64;
     if !ok {
         return Err(IvdError::SignatureInvalid);
     }
@@ -322,7 +369,9 @@ pub fn verify_bank(
         }
     }
 
-    // Re-hash files. Build a map for cross-checking.
+    // ---- Phase 2: re-hash every file the manifest claims ----
+    let hash_start = std::time::Instant::now();
+
     let mut on_disk = std::collections::BTreeSet::new();
     let mut probe = Vec::new();
     collect_files(bank_dir, bank_dir, &mut probe)?;
@@ -344,6 +393,7 @@ pub fn verify_bank(
     // hash/size verification.
     let claimed_map: BTreeMap<&String, &IvdFile> =
         manifest.files.iter().map(|f| (&f.relative_path, f)).collect();
+    let mut total_bytes: u64 = 0;
     for claim in manifest.files.iter() {
         let path = bank_dir.join(&claim.relative_path);
         let bytes = match fs::read(&path) {
@@ -360,6 +410,7 @@ pub fn verify_bank(
                 actual: bytes.len() as u64,
             });
         }
+        total_bytes += bytes.len() as u64;
         let actual = sha256(&bytes);
         if actual != claim.sha256 {
             return Err(IvdError::HashMismatch {
@@ -372,6 +423,20 @@ pub fn verify_bank(
         // when we go through claimed_map for another check later.
         let _ = claimed_map.get(&claim.relative_path);
     }
+
+    let hash_verify_us = hash_start.elapsed().as_micros() as u64;
+    let total_us = started.elapsed().as_micros() as u64;
+
+    tracing::info!(
+        bank_dir = %bank_dir.display(),
+        bank_id = %manifest.bank_id,
+        files = manifest.files.len(),
+        total_bytes,
+        sig_verify_us,
+        hash_verify_us,
+        total_us,
+        "ivd verify OK",
+    );
 
     Ok(manifest)
 }

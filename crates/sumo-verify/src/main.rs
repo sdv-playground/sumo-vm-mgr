@@ -168,6 +168,19 @@ fn run() -> ExitCode {
         Err(code) => return code,
     };
 
+    // Surface hsm::ivd's structured timing events on stderr. Default
+    // filter is "info" so the per-call "ivd verify OK / FAIL" line
+    // shows up automatically without callers needing to set RUST_LOG.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| {
+                    if args.quiet { "warn" } else { "info" }.parse().unwrap()
+                }),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
     if !args.bank.exists() {
         eprintln!(
             "sumo-verify: bank dir missing: {}",
