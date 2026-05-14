@@ -7,7 +7,7 @@
 /// - Session/security mode control
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -479,14 +479,21 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         // Skip components whose content doesn't live under
         // `images_dir/<set>/<bank>` (e.g. HSM single-bank: the
         // keystore is at `keystore_path`, the bank dir is empty
-        // and may not even exist). Those have their own
-        // attestation path — IVD-signing an empty bank dir would
-        // claim an empty bank is authorised, which is worse than
-        // skipping outright.
+        // because `prepare_target_bank_dir` created it but no
+        // payload lands here). Signing a zero-file manifest is
+        // legal but useless; the HSM has its own out-of-band
+        // attestation via the provisioning envelope chain.
         if !bank_dir.exists() {
             tracing::debug!(
                 bank_dir = %bank_dir.display(),
-                "ivd sign: bank dir absent; skipping (single-bank component or pre-streaming path)",
+                "ivd sign: bank dir absent; skipping (pre-streaming path)",
+            );
+            return Ok(());
+        }
+        if bank_dir_is_payload_empty(&bank_dir) {
+            tracing::debug!(
+                bank_dir = %bank_dir.display(),
+                "ivd sign: bank dir has no payload files; skipping (out-of-band attestation)",
             );
             return Ok(());
         }
@@ -2579,6 +2586,30 @@ pub(crate) fn bank_dir_name(bank: Bank) -> &'static str {
         Bank::A => "bank_a",
         Bank::B => "bank_b",
     }
+}
+
+/// `true` if `bank_dir` has no files that IVD signing would attest to.
+/// Skips IVD's own outputs (manifest + signature) so a re-sign doesn't
+/// trip on a previous run's artefacts.
+fn bank_dir_is_payload_empty(bank_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(bank_dir) else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if name == hsm::ivd::IVD_MANIFEST_FILE || name == hsm::ivd::IVD_SIGNATURE_FILE {
+            continue;
+        }
+        return false;
+    }
+    true
 }
 // `bank_set_dir_name` / `bank_file_names` / `payload_target_name`
 // retired in Phase 2 — per-slot behavior lives on `BankSetSpec` in

@@ -149,34 +149,43 @@ impl SimHsm {
         self.keystore_path.join("keys")
     }
 
-    /// Ensure the device key pair exists. Called on first use.
-    /// Generates EC-P256 key pair if `keys/device-decrypt.priv` does not exist.
-    /// This runs regardless of provisioning state — the device key exists before
-    /// any key bundle is installed.
+    /// Ensure the device-side EC-P256 key pairs exist. Called on first use.
+    /// Generates `keys/{key_id}.priv` + `.pub` for every device-generated
+    /// role that's missing. Runs regardless of provisioning state — these
+    /// keys must exist before the first key-bundle flash so the device can
+    /// (a) receive its encrypted factory envelope (device-decrypt) and
+    /// (b) IVD-sign its own pre-provisioning bank dirs (ivd-signing).
+    /// The provisioning envelope is allowed to leave these slots
+    /// device-generated; `generate_missing_local_keys` skips existing files,
+    /// so the factory-bootstrapped material persists across re-provision.
     #[cfg(feature = "crypto")]
-    pub fn ensure_device_key(&self) -> Result<(), HsmError> {
-        let priv_path = self.keys_dir().join("device-decrypt.priv");
-        if priv_path.exists() {
-            return Ok(());
-        }
-
-        // Create keys directory if needed
+    pub fn ensure_device_keys(&self) -> Result<(), HsmError> {
         std::fs::create_dir_all(self.keys_dir())
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
 
-        // Generate EC-P256 key pair
-        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let scalar = sk.to_bytes();
-        let pk = sk.verifying_key().to_encoded_point(false);
+        for role in KeyRole::mandatory_roles() {
+            if !role.is_device_generated() {
+                continue;
+            }
+            let key_id = role.key_id();
+            let priv_path = self.keys_dir().join(format!("{key_id}.priv"));
+            if priv_path.exists() {
+                continue;
+            }
 
-        write_pem_ec_private(&priv_path, &scalar)
-            .map_err(|e| HsmError::KeystoreError(format!("write device key: {e}")))?;
+            let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+            let scalar = sk.to_bytes();
+            let pk = sk.verifying_key().to_encoded_point(false);
 
-        let pub_path = self.keys_dir().join("device-decrypt.pub");
-        write_pem_ec_public(&pub_path, pk.as_bytes())
-            .map_err(|e| HsmError::KeystoreError(format!("write device pubkey: {e}")))?;
+            write_pem_ec_private(&priv_path, &scalar)
+                .map_err(|e| HsmError::KeystoreError(format!("write {key_id} priv: {e}")))?;
 
-        tracing::info!("device key pair generated (first boot)");
+            let pub_path = self.keys_dir().join(format!("{key_id}.pub"));
+            write_pem_ec_public(&pub_path, pk.as_bytes())
+                .map_err(|e| HsmError::KeystoreError(format!("write {key_id} pub: {e}")))?;
+
+            tracing::info!(key_id = %key_id, "device-side key pair generated (first boot)");
+        }
         Ok(())
     }
 
@@ -1263,6 +1272,8 @@ fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::payload::*;
+    #[cfg(feature = "crypto")]
+    use crate::HsmCryptoProvider;
 
     /// Sample keystore — every slot enumeration-only. The schema
     /// itself no longer has a `private_key` field, so the keystore
@@ -1427,6 +1438,58 @@ mod tests {
         assert_eq!(x, vec![0xAA; 32]);
         assert_eq!(y, vec![0xBB; 32]);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    #[cfg(feature = "crypto")]
+    fn ensure_device_keys_bootstraps_all_device_generated_roles() {
+        let tmp = std::env::temp_dir().join("hsm-test-ensure-device-keys");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
+        hsm.ensure_device_keys().unwrap();
+
+        // Every device-generated role must have a {priv, pub} pair on disk
+        // — that's what unblocks IVD self-sign before the provisioning
+        // envelope lands. Trust anchors (KeyAuthority, *Authority) stay
+        // absent until provisioning supplies their public halves.
+        for role in KeyRole::mandatory_roles() {
+            let priv_path = tmp.join("keys").join(format!("{}.priv", role.key_id()));
+            if role.is_device_generated() {
+                assert!(
+                    priv_path.exists(),
+                    "device-generated role {role:?} priv key missing at {}",
+                    priv_path.display()
+                );
+            } else {
+                assert!(
+                    !priv_path.exists(),
+                    "anchor role {role:?} priv key must NOT be bootstrapped",
+                );
+            }
+        }
+
+        // get_key_info MUST resolve ivd-signing via the disk fallback path
+        // — that's the chain that lets sign() work pre-provision.
+        let info = <SimHsm as HsmCryptoProvider>::get_key_info(&hsm, "ivd-signing").unwrap();
+        assert_eq!(info.key_type, KeyType::EcP256);
+
+        // sign() with the bootstrap IVD key must succeed without a
+        // populated manifest. This is the bootstrap escape for the very
+        // first HSM-keys flash: the device must be able to attest its
+        // own banks before any envelope is processed.
+        let sig = <SimHsm as HsmCryptoProvider>::sign(&hsm, "ivd-signing", b"hello").unwrap();
+        assert!(!sig.is_empty(), "signature must be non-empty");
+
+        // Idempotent — calling twice must not regenerate (would invalidate
+        // any IVD manifests already signed with the prior key).
+        let key_path = tmp.join("keys/ivd-signing.priv");
+        let original = std::fs::read(&key_path).unwrap();
+        hsm.ensure_device_keys().unwrap();
+        let after = std::fs::read(&key_path).unwrap();
+        assert_eq!(original, after, "ensure_device_keys must be idempotent");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

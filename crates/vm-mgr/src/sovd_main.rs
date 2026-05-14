@@ -164,9 +164,9 @@ async fn main() {
             None
         };
 
-        // Ensure device key pair exists (generates on first boot)
-        if let Err(e) = provider.ensure_device_key() {
-            tracing::warn!("failed to ensure device key: {e}");
+        // Ensure device-side EC keys exist (device-decrypt, ivd-signing, ecu-signing)
+        if let Err(e) = provider.ensure_device_keys() {
+            tracing::warn!("failed to ensure device keys: {e}");
         }
 
         let hsm_arc = Arc::new(Mutex::new(provider));
