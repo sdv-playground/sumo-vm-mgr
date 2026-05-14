@@ -35,7 +35,7 @@ impl<D: BlockDevice + Send + 'static> AppComponent<D> {
             let nv_guard = nv.lock().unwrap();
             nv_guard
                 .read_boot_state()
-                .map(|s| s.banks[BankSet::App as usize].active_bank)
+                .map(|s| s.banks[BankSet::App.as_index()].active_bank)
                 .unwrap_or(Bank::A)
         };
 
@@ -76,7 +76,7 @@ impl<D: BlockDevice + Send + 'static> AppComponent<D> {
     fn is_trial(&self) -> bool {
         let nv = self.nv.lock().unwrap();
         nv.read_boot_state()
-            .map(|s| !s.banks[BankSet::App as usize].committed)
+            .map(|s| !s.banks[BankSet::App.as_index()].committed)
             .unwrap_or(false)
     }
 
@@ -171,7 +171,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
 
-        let idx = BankSet::App as usize;
+        let idx = BankSet::App.as_index();
         boot_state.banks[idx].active_bank = target_bank;
         boot_state.banks[idx].committed = false;
         boot_state.banks[idx].boot_count = 0;
@@ -188,7 +188,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
 
-        let idx = BankSet::App as usize;
+        let idx = BankSet::App.as_index();
         if state.banks[idx].committed {
             return Err(MachineError::InvalidArgument("already committed".into()));
         }
@@ -217,7 +217,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
 
-        let idx = BankSet::App as usize;
+        let idx = BankSet::App.as_index();
         if boot_state.banks[idx].committed {
             return Err(MachineError::PolicyRejected(
                 "cannot rollback committed boot".into(),
@@ -259,7 +259,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
 
         let committed = boot_state
             .as_ref()
-            .map(|s| s.banks[BankSet::App as usize].committed)
+            .map(|s| s.banks[BankSet::App.as_index()].committed)
             .unwrap_or(true);
 
         let version = fw_meta

@@ -72,7 +72,7 @@ pub fn read_did<D: BlockDevice>(
         Some(s) => s,
         None => return DidValue::NotFound,
     };
-    let active = running_bank.unwrap_or(state.banks[set as usize].active_bank);
+    let active = running_bank.unwrap_or(state.banks[set.as_index()].active_bank);
 
     // 1. Check runtime DIDs (writable, per-bank)
     if let Some(runtime) = nv.read_runtime(set, active) {
@@ -121,7 +121,7 @@ pub fn read_did<D: BlockDevice>(
     }
 
     // 4. Dynamic DIDs (computed)
-    let bs = &state.banks[set as usize];
+    let bs = &state.banks[set.as_index()];
     match did {
         DID_ACTIVE_BANK => {
             // Report the bank we're actually running on, not the staged next-boot bank
@@ -161,7 +161,7 @@ pub fn write_did<D: BlockDevice>(
         Some(s) => s,
         None => return Ok(false),
     };
-    let active = state.banks[set as usize].active_bank;
+    let active = state.banks[set.as_index()].active_bank;
 
     let mut runtime = nv.read_runtime(set, active).unwrap_or_default();
 
@@ -297,7 +297,7 @@ mod tests {
     fn read_did_dynamic_committed_reflects_flag() {
         let mut nv = make_nv();
         let mut state = NvBootState::default();
-        let idx = BankSet::Vm1 as usize;
+        let idx = BankSet::Vm1.as_index();
         state.banks[idx].active_bank = Bank::A;
         state.banks[idx].committed = false;
         state.banks[idx].boot_count = 3;

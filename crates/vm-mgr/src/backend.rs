@@ -238,6 +238,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             BankSet::Hsm => ("hsm", "HSM Key Store", "Hardware Security Module"),
             BankSet::App => ("app", "App", "Self-updating application component"),
             BankSet::Custom => ("custom", "Custom", "Deployment-specific bank slot"),
+            // Phase 2 of the deep refactor will look these up from
+            // deployment config; for now any slot beyond the 6
+            // well-known ones gets a generic stub.
+            _ => ("custom", "Custom", "Deployment-specific bank slot"),
         };
 
         // Read the current active bank at startup — this is what we're running on.
@@ -246,7 +250,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         } else {
             let nv_guard = nv.lock().unwrap();
             nv_guard.read_boot_state()
-                .map(|s| s.banks[bank_set as usize].active_bank)
+                .map(|s| s.banks[bank_set.as_index()].active_bank)
                 .unwrap_or(Bank::A)
         };
 
@@ -420,7 +424,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let nv = self.nv.lock().map_err(|_| BackendError::Internal("nv lock".into()))?;
         let state = nv.read_boot_state()
             .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-        let idx = self.bank_set as usize;
+        let idx = self.bank_set.as_index();
         Ok(state.banks[idx].active_bank.other())
     }
 
@@ -1648,7 +1652,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             let nv = self.nv.lock().map_err(|_| BackendError::Internal("nv lock".into()))?;
             let state = nv.read_boot_state()
                 .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-            let idx = self.bank_set as usize;
+            let idx = self.bank_set.as_index();
             if !state.banks[idx].committed {
                 return Err(BackendError::Busy(format!(
                     "bank set {:?} is in trial mode (active={:?}, uncommitted) — \
@@ -1836,6 +1840,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     BankSet::Hsm => "hsm",
                     BankSet::App => "app",
                     BankSet::Custom => "custom",
+                    _ => "custom",
                 };
                 let bank_dir_name = match result.target_bank {
                     Bank::A => "bank_a",
@@ -2109,7 +2114,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // 4. Reset session and security (ISO 14229)
 
         if !self.config.single_bank {
-            let idx = self.bank_set as usize;
+            let idx = self.bank_set.as_index();
             let mut nv = self.nv_write()?;
             if let Some(mut state) = nv.read_boot_state() {
                 // Switch to the staged bank
@@ -2214,6 +2219,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 BankSet::Hsm => "hsm",
                 BankSet::App => "app",
                 BankSet::Custom => "custom",
+                _ => "custom",
             };
             let target_bank = *self.running_bank.lock().unwrap();
             let bank_dir_name = match target_bank {
@@ -2571,6 +2577,11 @@ fn bank_file_names(bank_set: BankSet) -> (&'static str, &'static str) {
         // payload URIs are passed through verbatim via the
         // `payload_target_name` fallback.
         BankSet::Custom => ("", ""),
+        // Phase 2 will replace this whole helper with a deployment-
+        // supplied `BankLayout` carried on the backend. Until then,
+        // any user-allocated slot gets the same pass-through default
+        // as Custom.
+        _ => ("", ""),
     }
 }
 
@@ -2582,6 +2593,7 @@ pub(crate) fn bank_set_dir_name(bank_set: BankSet) -> &'static str {
         BankSet::Hsm => "hsm",
         BankSet::App => "app",
         BankSet::Custom => "custom",
+        _ => "custom",
     }
 }
 

@@ -419,7 +419,7 @@ async fn faults_and_clear() {
     {
         let mut nv = nv.lock().unwrap();
         let bs = nv.read_boot_state().unwrap();
-        let active = bs.banks[BankSet::Vm1 as usize].active_bank;
+        let active = bs.banks[BankSet::Vm1.as_index()].active_bank;
         let mut runtime = nv.read_runtime(BankSet::Vm1, active).unwrap_or_default();
         runtime.dtc_count = 1;
         runtime.dtcs[0] = DtcEntry { dtc_number: 0x00A301, status: 0x01 };

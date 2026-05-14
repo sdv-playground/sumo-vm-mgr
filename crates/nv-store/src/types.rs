@@ -32,37 +32,48 @@ impl Bank {
     }
 }
 
-/// Identifies which bank set.
+/// Identifies which bank set — a numeric slot index in the NV
+/// partition layout. The well-known names (`HostOs`, `Vm1`, etc.)
+/// are kept as associated constants for back-compat with code that
+/// still references them by name; the type itself is opaque, so any
+/// slot index in `0..NUM_BANK_SETS` is a valid `BankSet`.
 ///
-/// `Custom` is the deployment-specific slot — used when a component
-/// doesn't fit any of the well-known categories above (today: the
-/// realtime side on managed-cvc, via `rt-s32g3`). The on-disk dir
-/// name is the generic `custom`; the component id (e.g. "rt") and
-/// its launch semantics are owned by the deployment, not by this
-/// crate.
+/// Phase 1 of the deep refactor: replace the enum with a newtype.
+/// Phase 2 moves the per-slot behavior (dir name, file-naming
+/// layout) off the type and into a deployment-config-supplied
+/// `BankSetSpec`. Phase 3 makes the slot assignment itself
+/// config-driven so deployments add components without touching
+/// this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum BankSet {
-    HostOs = 0,
-    Vm1 = 1,
-    Vm2 = 2,
-    Hsm = 3,
-    App = 4,
-    Custom = 5,
-}
+pub struct BankSet(pub u8);
 
+#[allow(non_upper_case_globals)]
 impl BankSet {
-    pub fn all() -> [BankSet; NUM_BANK_SETS] {
-        [
-            BankSet::HostOs,
-            BankSet::Vm1,
-            BankSet::Vm2,
-            BankSet::Hsm,
-            BankSet::App,
-            BankSet::Custom,
-        ]
+    // Well-known slot indices. Phase 3 will retire these and let
+    // deployment config carry the (id → slot) mapping; for now they
+    // preserve the call-site names so the refactor is incremental.
+    pub const HostOs: BankSet = BankSet(0);
+    pub const Vm1: BankSet = BankSet(1);
+    pub const Vm2: BankSet = BankSet(2);
+    pub const Hsm: BankSet = BankSet(3);
+    pub const App: BankSet = BankSet(4);
+    pub const Custom: BankSet = BankSet(5);
+
+    /// Iterate every slot the NV-store can address. Replaces the
+    /// old `BankSet::all() -> [BankSet; NUM_BANK_SETS]` array.
+    pub fn all() -> impl Iterator<Item = BankSet> {
+        (0..NUM_BANK_SETS).map(|i| BankSet(i as u8))
     }
 
+    /// Map this slot to its array index in NV records (`banks[i]`).
+    /// Replaces `bank_set as usize`.
+    pub fn as_index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// Parse a config-string name to a well-known slot. Phase 3 will
+    /// remove this entirely — slot assignment moves into the
+    /// component spec, no string-to-slot lookups left.
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "host-os" | "host_os" => Some(BankSet::HostOs),
@@ -76,6 +87,9 @@ impl BankSet {
     }
 }
 
+/// Capacity of the NV `banks` array — how many bank slots the
+/// store can address. Deployments use 0..N of these; slots beyond
+/// what a deployment registers are unused but still allocated.
 pub const NUM_BANK_SETS: usize = 6;
 pub const MAX_TRIAL_BOOTS: u8 = 10;
 

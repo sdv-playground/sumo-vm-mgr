@@ -195,7 +195,7 @@ impl<D: BlockDevice> BootManager<D> {
             None => return Ok(BootAction::FirstBoot),
         };
 
-        let idx = set as usize;
+        let idx = set.as_index();
 
         if state.banks[idx].committed {
             Ok(BootAction::HashFatal { bank: state.banks[idx].active_bank })
@@ -213,13 +213,13 @@ impl<D: BlockDevice> BootManager<D> {
     /// Get the current active bank for a bank set.
     pub fn active_bank(&self, set: BankSet) -> Option<Bank> {
         self.nv.read_boot_state()
-            .map(|s| s.banks[set as usize].active_bank)
+            .map(|s| s.banks[set.as_index()].active_bank)
     }
 
     /// Check if a bank set is in trial mode.
     pub fn is_trial(&self, set: BankSet) -> Option<bool> {
         self.nv.read_boot_state()
-            .map(|s| !s.banks[set as usize].committed)
+            .map(|s| !s.banks[set.as_index()].committed)
     }
 }
 

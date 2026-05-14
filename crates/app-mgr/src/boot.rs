@@ -24,7 +24,7 @@ pub fn process_app_boot<D: BlockDevice>(
         }
     };
 
-    let idx = BankSet::App as usize;
+    let idx = BankSet::App.as_index();
     let bs = &mut boot_state.banks[idx];
 
     if bs.committed {

@@ -519,7 +519,7 @@ fn hsm_install_single_bank() {
 
     // State: committed on bank A, no trial
     let state = nv.read_boot_state().unwrap();
-    let hsm = &state.banks[BankSet::Hsm as usize];
+    let hsm = &state.banks[BankSet::Hsm.as_index()];
     assert!(hsm.committed);
     assert_eq!(hsm.active_bank, Bank::A);
     assert_eq!(hsm.boot_count, 0);
@@ -583,14 +583,14 @@ fn boot_flash_trial_mode() {
 
     // Should be in trial mode
     let state = nv.read_boot_state().unwrap();
-    let boot = &state.banks[BankSet::HostOs as usize];
+    let boot = &state.banks[BankSet::HostOs.as_index()];
     assert!(!boot.committed);
     assert_eq!(boot.active_bank, Bank::B);
 
     // Commit works
     commit(&mut nv, BankSet::HostOs).unwrap();
     let state = nv.read_boot_state().unwrap();
-    assert!(state.banks[BankSet::HostOs as usize].committed);
+    assert!(state.banks[BankSet::HostOs.as_index()].committed);
 }
 
 #[test]
@@ -602,6 +602,6 @@ fn boot_rollback_works() {
     assert_eq!(prev, Bank::A);
 
     let state = nv.read_boot_state().unwrap();
-    assert!(state.banks[BankSet::HostOs as usize].committed);
-    assert_eq!(state.banks[BankSet::HostOs as usize].active_bank, Bank::A);
+    assert!(state.banks[BankSet::HostOs.as_index()].committed);
+    assert_eq!(state.banks[BankSet::HostOs.as_index()].active_bank, Bank::A);
 }

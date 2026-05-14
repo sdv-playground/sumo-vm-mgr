@@ -113,7 +113,7 @@ pub fn install<D: BlockDevice>(
     single_bank: bool,
 ) -> Result<InstallResult, OtaError> {
     let state = nv.read_boot_state().ok_or(OtaError::NoBootState)?;
-    let idx = set as usize;
+    let idx = set.as_index();
 
     // Precondition: must be committed
     if !state.banks[idx].committed {
@@ -149,7 +149,7 @@ pub fn install_precomputed<D: BlockDevice>(
     single_bank: bool,
 ) -> Result<InstallResult, OtaError> {
     let state = nv.read_boot_state().ok_or(OtaError::NoBootState)?;
-    let idx = set as usize;
+    let idx = set.as_index();
 
     if !state.banks[idx].committed {
         return Err(OtaError::InTrial);
@@ -269,7 +269,7 @@ pub fn commit<D: BlockDevice>(
     set: BankSet,
 ) -> Result<(), OtaError> {
     let mut state = nv.read_boot_state().ok_or(OtaError::NoBootState)?;
-    let idx = set as usize;
+    let idx = set.as_index();
 
     if state.banks[idx].committed {
         return Err(OtaError::AlreadyCommitted);
@@ -300,7 +300,7 @@ pub fn rollback<D: BlockDevice>(
     set: BankSet,
 ) -> Result<Bank, OtaError> {
     let mut state = nv.read_boot_state().ok_or(OtaError::NoBootState)?;
-    let idx = set as usize;
+    let idx = set.as_index();
 
     if state.banks[idx].committed {
         return Err(OtaError::NotInTrial);
@@ -331,7 +331,7 @@ pub fn status<D: BlockDevice>(
     set: BankSet,
 ) -> Option<BankStatus> {
     let state = nv.read_boot_state()?;
-    let bs = &state.banks[set as usize];
+    let bs = &state.banks[set.as_index()];
     let meta = nv.read_fw_meta(set, bs.active_bank);
 
     Some(BankStatus {

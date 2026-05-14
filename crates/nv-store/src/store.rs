@@ -32,7 +32,7 @@ pub mod layout {
     pub const RUNTIME_SECTORS: usize = 8;
 
     pub fn bankset_offset(set: super::BankSet) -> u64 {
-        BANKSET_BASE + (set as u64) * BANKSET_STRIDE
+        BANKSET_BASE + (set.as_index() as u64) * BANKSET_STRIDE
     }
 
     pub fn fw_meta_offset(set: super::BankSet, bank: super::Bank) -> u64 {
