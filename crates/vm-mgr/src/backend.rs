@@ -661,7 +661,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
         let suit_manifest = sumo_onboard::manifest::Manifest { envelope };
 
-        let device_key = self.manifest_provider.device_decryption_key();
+        let key_unwrap = self.manifest_provider.key_unwrap_for_decryption();
 
         let target_bank = self.determine_target_bank()?;
         let bank_dir = self.target_bank_dir(target_bank)
@@ -708,7 +708,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 &stored_payload.path,
                 &manifest.raw_bytes,
                 comp_idx,
-                device_key.as_deref(),
+                key_unwrap.as_deref(),
                 &expected_digest,
                 &output_path,
             ).map_err(|e| BackendError::Internal(format!(
@@ -871,7 +871,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             }
         };
 
-        let device_key = self.manifest_provider.device_decryption_key();
+        let key_unwrap = self.manifest_provider.key_unwrap_for_decryption();
 
         // Parse manifest for this component's info
         let envelope = sumo_codec::decode::decode_envelope(&manifest_bytes)
@@ -918,7 +918,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             &raw_path,
             &manifest_bytes,
             comp_idx,
-            device_key.as_deref(),
+            key_unwrap.as_deref(),
             &expected_digest,
             &output_path,
         ).map_err(|e| BackendError::Internal(format!("payload processing: {e}")))?;
@@ -1662,18 +1662,25 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     .provision(envelope)
                     .map_err(|e| BackendError::Internal(format!("HSM provision: {e}")))?;
 
-                // After provisioning, load software authority + device key from HSM
-                match (
-                    hsm_guard.get_public_key(hsm::KeyRole::SoftwareAuthority),
-                    hsm_guard.get_private_key(hsm::KeyRole::DeviceDecryption),
-                ) {
-                    (Ok(sw_key), Ok(dk)) => {
+                // After provisioning, load the public trust anchors and
+                // wire an HSM-backed CEK unwrapper. Device decryption
+                // key bytes never leave the HSM — `HsmKeyUnwrap` calls
+                // `HsmProvider::unwrap_cek_*` for each decryption.
+                match hsm_guard.get_public_key(hsm::KeyRole::SoftwareAuthority) {
+                    Ok(sw_key) => {
                         let ka = hsm_guard.get_public_key(hsm::KeyRole::KeyAuthority).ok();
-                        self.manifest_provider.update_keys(sw_key, Some(dk), ka);
-                        tracing::info!("loaded keys from HSM");
+                        drop(hsm_guard);
+                        let unwrap: std::sync::Arc<
+                            dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync,
+                        > = std::sync::Arc::new(hsm::HsmKeyUnwrap::new(
+                            hsm.clone(),
+                            "device-decrypt",
+                        ));
+                        self.manifest_provider.update_keys(sw_key, Some(unwrap), ka);
+                        tracing::info!("loaded sw-authority + key-authority; CEK unwrap routed through HSM");
                     }
-                    (Err(e), _) | (_, Err(e)) => {
-                        tracing::warn!("HSM provisioned but failed to load keys: {e}");
+                    Err(e) => {
+                        tracing::warn!("HSM provisioned but failed to load sw-authority: {e}");
                     }
                 }
             }
@@ -1849,22 +1856,25 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                                 Err(e) => tracing::warn!("start HSM service post-provision: {e}"),
                             }
 
-                            // Load keys from HSM into manifest provider
+                            // Load keys from HSM into manifest provider.
+                            // Public trust anchors come out as bytes;
+                            // the device decryption key stays inside
+                            // the HSM and is invoked via HsmKeyUnwrap.
                             let ka = hsm_guard.get_public_key(hsm::KeyRole::KeyAuthority).ok();
-                            match (
-                                hsm_guard.get_public_key(hsm::KeyRole::SoftwareAuthority),
-                                hsm_guard.get_private_key(hsm::KeyRole::DeviceDecryption),
-                            ) {
-                                (Ok(sw_key), Ok(dk)) => {
-                                    self.manifest_provider.update_keys(sw_key, Some(dk), ka);
-                                    tracing::info!("HSM keys provisioned, software authority loaded");
+                            match hsm_guard.get_public_key(hsm::KeyRole::SoftwareAuthority) {
+                                Ok(sw_key) => {
+                                    drop(hsm_guard);
+                                    let unwrap: std::sync::Arc<
+                                        dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync,
+                                    > = std::sync::Arc::new(hsm::HsmKeyUnwrap::new(
+                                        hsm.clone(),
+                                        "device-decrypt",
+                                    ));
+                                    self.manifest_provider.update_keys(sw_key, Some(unwrap), ka);
+                                    tracing::info!("HSM keys provisioned; CEK unwrap routed through HSM");
                                 }
-                                (Ok(sw_key), Err(_)) => {
-                                    self.manifest_provider.update_keys(sw_key, None, ka);
-                                    tracing::info!("HSM keys provisioned (no device key)");
-                                }
-                                _ => {
-                                    tracing::warn!("HSM provisioned but failed to load keys");
+                                Err(e) => {
+                                    tracing::warn!("HSM provisioned but failed to load sw-authority: {e}");
                                 }
                             }
                         }

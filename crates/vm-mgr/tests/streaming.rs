@@ -35,16 +35,62 @@ fn test_keys() -> (CoseKey, CoseKey) {
     (signing, device)
 }
 
-/// Helper: create a SuitProvider with test keys.
+/// Helper: create a SuitProvider with test keys. The optional device
+/// key is wrapped in an [`InMemoryKeyUnwrap`] so the decryptor can
+/// route CEK unwrap through the same trait shape used in production
+/// (production wires an HSM-backed `HsmKeyUnwrap` instead).
 fn test_provider(signing_key: &CoseKey, device_key: Option<&CoseKey>) -> SuitProvider {
     let pub_bytes = signing_key.public_key_bytes();
     let provider = SuitProvider::new(pub_bytes);
-    provider.update_keys(
-        signing_key.public_key_bytes(),
-        device_key.map(|k| k.to_cose_key_bytes()),
-        None,
-    );
+    // Owned CoseKey + a static-RustCrypto-backend boxed into an Arc'd
+    // `KeyUnwrap` so it satisfies the trait object's `'static` bound.
+    let unwrap: Option<
+        std::sync::Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>,
+    > = device_key.map(|dk| {
+        std::sync::Arc::new(OwnedInMemoryUnwrap {
+            device_key_cbor: dk.to_cose_key_bytes(),
+        })
+            as std::sync::Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>
+    });
+    provider.update_keys(signing_key.public_key_bytes(), unwrap, None);
     provider
+}
+
+/// Test-only adapter that owns the serialized CoseKey so the trait
+/// object meets `'static` (InMemoryKeyUnwrap takes references). Each
+/// call deserializes — fine for tests, not for production hot paths.
+struct OwnedInMemoryUnwrap {
+    device_key_cbor: Vec<u8>,
+}
+
+impl OwnedInMemoryUnwrap {
+    fn parsed(&self) -> coset::CoseKey {
+        <coset::CoseKey as coset::CborSerializable>::from_slice(&self.device_key_cbor)
+            .expect("test device key cbor")
+    }
+}
+
+impl sumo_onboard::decryptor::KeyUnwrap for OwnedInMemoryUnwrap {
+    fn unwrap_cek_a128kw(
+        &self,
+        wrapped_cek: &[u8],
+    ) -> Result<Vec<u8>, sumo_onboard::error::Sum2Error> {
+        let key = self.parsed();
+        let crypto = sumo_crypto::RustCryptoBackend::new();
+        sumo_onboard::decryptor::InMemoryKeyUnwrap::new(&key, &crypto)
+            .unwrap_cek_a128kw(wrapped_cek)
+    }
+    fn unwrap_cek_ecdh_es(
+        &self,
+        ephem_pub: &[u8],
+        wrapped_cek: &[u8],
+        recipient_protected: &[u8],
+    ) -> Result<Vec<u8>, sumo_onboard::error::Sum2Error> {
+        let key = self.parsed();
+        let crypto = sumo_crypto::RustCryptoBackend::new();
+        sumo_onboard::decryptor::InMemoryKeyUnwrap::new(&key, &crypto)
+            .unwrap_cek_ecdh_es(ephem_pub, wrapped_cek, recipient_protected)
+    }
 }
 
 /// Helper: create a PackageStream from bytes.
@@ -269,7 +315,11 @@ fn multi_component_encrypted_separate() {
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
-    let dk_bytes = device_key.to_cose_key_bytes();
+    // Wrap the device key in a KeyUnwrap impl so process_raw_payload
+    // gets the same shape as production. Test-only — production wires
+    // an HSM-backed HsmKeyUnwrap instead, which keeps the EC scalar
+    // inside the secure element.
+    let dk_unwrap = OwnedInMemoryUnwrap { device_key_cbor: device_key.to_cose_key_bytes() };
 
     // Save encrypted payloads as raw files
     let kernel_path = tmp.path().join("upload-kernel.bin");
@@ -280,14 +330,14 @@ fn multi_component_encrypted_separate() {
     // Process each — decrypt + verify
     let kernel_out = tmp.path().join("vm1-kernel-staged.img");
     let (ksize, _) = process_raw_payload(
-        &kernel_path, &manifest, 0, Some(&dk_bytes), &kernel_digest, &kernel_out,
+        &kernel_path, &manifest, 0, Some(&dk_unwrap as &(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)), &kernel_digest, &kernel_out,
     ).unwrap();
     assert_eq!(ksize, 2048);
     assert_eq!(std::fs::read(&kernel_out).unwrap(), kernel);
 
     let rootfs_out = tmp.path().join("vm1-staged.img");
     let (rsize, _) = process_raw_payload(
-        &rootfs_path, &manifest, 1, Some(&dk_bytes), &rootfs_digest, &rootfs_out,
+        &rootfs_path, &manifest, 1, Some(&dk_unwrap as &(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)), &rootfs_digest, &rootfs_out,
     ).unwrap();
     assert_eq!(rsize, 8192);
     assert_eq!(std::fs::read(&rootfs_out).unwrap(), rootfs);

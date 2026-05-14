@@ -307,6 +307,55 @@ impl HsmCryptoProvider for SimHsm {
 
         build_pkcs10_csr(subject_cn, pub_point.as_bytes(), &signing_key)
     }
+
+    /// CEK unwrap via in-host crypto, using the symmetric key stored
+    /// at `key_id.bin` (raw bytes for AES-KW).
+    fn unwrap_cek_a128kw(&self, key_id: &str, wrapped_cek: &[u8]) -> Result<Vec<u8>, HsmError> {
+        let kek_path = self.keys_dir().join(format!("{key_id}.bin"));
+        if !kek_path.exists() {
+            return Err(HsmError::KeyNotFound(format!(
+                "no symmetric KEK for A128KW unwrap: {key_id} (no {})",
+                kek_path.display()
+            )));
+        }
+        let kek = std::fs::read(&kek_path)
+            .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", kek_path.display())))?;
+        // RustCryptoBackend has aes_kw_unwrap; reuse rather than reimplement.
+        let backend = sumo_crypto::RustCryptoBackend;
+        sumo_crypto::CryptoBackend::aes_kw_unwrap(&backend, &kek, wrapped_cek)
+            .map_err(|e| HsmError::CryptoError(format!("A128KW unwrap: {e:?}")))
+    }
+
+    /// CEK unwrap via in-host crypto, using the EC private scalar
+    /// stored at `key_id.priv` (PEM). On real HSE this op stays inside
+    /// the secure element; here it's RustCrypto + a file read.
+    fn unwrap_cek_ecdh_es(
+        &self,
+        key_id: &str,
+        ephem_pub: &[u8],
+        wrapped_cek: &[u8],
+        recipient_protected: &[u8],
+    ) -> Result<Vec<u8>, HsmError> {
+        let priv_path = self.keys_dir().join(format!("{key_id}.priv"));
+        if !priv_path.exists() {
+            return Err(HsmError::KeyNotFound(format!(
+                "no EC private key for ECDH-ES unwrap: {key_id} (no {})",
+                priv_path.display()
+            )));
+        }
+        let pem = std::fs::read_to_string(&priv_path)
+            .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", priv_path.display())))?;
+        let scalar = extract_ec_scalar_from_pem(&pem)?;
+        let backend = sumo_crypto::RustCryptoBackend;
+        sumo_crypto::ecdh_es::ecdh_es_a128kw_unwrap(
+            &backend,
+            &scalar,
+            ephem_pub,
+            wrapped_cek,
+            recipient_protected,
+        )
+        .map_err(|e| HsmError::CryptoError(format!("ECDH-ES+A128KW unwrap: {e:?}")))
+    }
 }
 
 // --- Internal key loading helpers ---

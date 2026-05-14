@@ -538,7 +538,12 @@ impl SimHsm {
                 HsmError::EnvelopeInvalid("missing integrated payload #hsm-keys".into())
             })?;
 
-        let mut decryptor = StreamingDecryptor::new(&manifest, 0, &device_key, &crypto)
+        // Internal SimHsm flow: extracting the bootstrap device key
+        // here is fine because we own the keystore on disk and the
+        // file IS the key. Outside callers (vm-mgr, supernova) must
+        // use the operation-based unwrap_cek_*() trait methods.
+        let unwrap = sumo_onboard::decryptor::InMemoryKeyUnwrap::new(&device_key, &crypto);
+        let mut decryptor = StreamingDecryptor::new(&manifest, 0, &unwrap, &crypto)
             .map_err(|e| HsmError::DecryptionFailed(format!("{e:?}")))?;
 
         let mut plaintext = vec![0u8; ciphertext.len() + 256];
@@ -854,6 +859,32 @@ impl HsmProvider for SimHsm {
         } else {
             Ok(ProvisioningState::Unprovisioned)
         }
+    }
+
+    /// SimHsm exposes the unwrap ops by delegating to its
+    /// `HsmCryptoProvider` impl (same code, just routed through the
+    /// management trait so the OTA pipeline can call it via
+    /// `Arc<Mutex<dyn HsmProvider>>`).
+    #[cfg(feature = "crypto")]
+    fn unwrap_cek_a128kw(&self, key_id: &str, wrapped_cek: &[u8]) -> Result<Vec<u8>, HsmError> {
+        crate::HsmCryptoProvider::unwrap_cek_a128kw(self, key_id, wrapped_cek)
+    }
+
+    #[cfg(feature = "crypto")]
+    fn unwrap_cek_ecdh_es(
+        &self,
+        key_id: &str,
+        ephem_pub: &[u8],
+        wrapped_cek: &[u8],
+        recipient_protected: &[u8],
+    ) -> Result<Vec<u8>, HsmError> {
+        crate::HsmCryptoProvider::unwrap_cek_ecdh_es(
+            self,
+            key_id,
+            ephem_pub,
+            wrapped_cek,
+            recipient_protected,
+        )
     }
 }
 

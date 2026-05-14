@@ -97,7 +97,9 @@ pub async fn process_envelope_stream(
         .ok_or_else(|| BackendError::Internal(
             "no software authority key for streaming — HSM not yet provisioned".into(),
         ))?;
-    let suit_device_key = manifest_provider.device_decryption_key();
+    // CEK unwrap is delegated to the HSM via the KeyUnwrap trait —
+    // no raw device-key bytes flow through this pipeline anymore.
+    let suit_key_unwrap = manifest_provider.key_unwrap_for_decryption();
 
     let set_name = bank_set_dir_name(bank_set);
     let bank_dir = images_dir.map(|dir| {
@@ -150,7 +152,7 @@ pub async fn process_envelope_stream(
         let header_for_decrypt = header_bytes.clone();
         let image_path_clone = image_path.clone();
         let trust_anchor = suit_trust_anchor.clone();
-        let device_key = suit_device_key.clone();
+        let key_unwrap = suit_key_unwrap.clone();
         let expected_digest_clone = expected_digest.clone();
 
         let process_handle = tokio::task::spawn_blocking(move || {
@@ -161,7 +163,7 @@ pub async fn process_envelope_stream(
                     has_encryption,
                     comp_idx,
                     &trust_anchor,
-                    device_key.as_deref(),
+                    key_unwrap.as_deref(),
                     &expected_digest_clone,
                     image_path_clone.as_deref(),
                 )
@@ -531,7 +533,7 @@ fn process_payload_sync(
     has_encryption: bool,
     component_index: usize,
     _trust_anchor: &[u8],
-    device_key: Option<&[u8]>,
+    key_unwrap: Option<&(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)>,
     expected_digest: &[u8],
     image_path: Option<&Path>,
 ) -> Result<(usize, [u8; 32]), String> {
@@ -548,12 +550,10 @@ fn process_payload_sync(
             .map_err(|e| format!("re-parse envelope: {e:?}"))?;
         let manifest = sumo_onboard::manifest::Manifest { envelope };
 
-        // Get device key
-        let dk_bytes = device_key.ok_or("encrypted payload but no device key")?;
-        let dk = coset::CborSerializable::from_slice(dk_bytes)
-            .map_err(|e| format!("invalid device key: {e:?}"))?;
+        let unwrap = key_unwrap
+            .ok_or("encrypted payload but no CEK unwrapper (HSM not provisioned?)")?;
 
-        let decryptor = StreamingDecryptor::new(&manifest, component_index, &dk, &crypto)
+        let decryptor = StreamingDecryptor::new(&manifest, component_index, unwrap, &crypto)
             .map_err(|e| format!("decryptor setup: {e:?}"))?;
 
         let mut decrypt_reader = DecryptReader::new(channel_reader, decryptor);
@@ -953,7 +953,7 @@ pub fn process_raw_payload(
     payload_path: &Path,
     manifest_bytes: &[u8],
     component_index: usize,
-    device_key: Option<&[u8]>,
+    key_unwrap: Option<&(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)>,
     expected_digest: &[u8],
     output_path: &Path,
 ) -> Result<(usize, [u8; 32]), String> {
@@ -970,11 +970,10 @@ pub fn process_raw_payload(
     let mut reader = std::io::BufReader::new(file);
 
     if has_encryption {
-        let dk_bytes = device_key.ok_or("encrypted payload but no device key")?;
-        let dk = coset::CborSerializable::from_slice(dk_bytes)
-            .map_err(|e| format!("invalid device key: {e:?}"))?;
+        let unwrap = key_unwrap
+            .ok_or("encrypted payload but no CEK unwrapper (HSM not provisioned?)")?;
 
-        let decryptor = StreamingDecryptor::new(&manifest, component_index, &dk, &crypto)
+        let decryptor = StreamingDecryptor::new(&manifest, component_index, unwrap, &crypto)
             .map_err(|e| format!("decryptor setup: {e:?}"))?;
 
         let mut decrypt_reader = DecryptReader::new(reader, decryptor);

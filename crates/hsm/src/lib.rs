@@ -19,8 +19,12 @@ pub mod linux {
 pub mod qnx;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+#[cfg(feature = "suit")]
+pub mod key_unwrap;
 
 pub use types::*;
+#[cfg(feature = "suit")]
+pub use key_unwrap::HsmKeyUnwrap;
 
 /// HSM management provider.
 ///
@@ -83,6 +87,31 @@ pub trait HsmProvider: Send {
 
     /// Get the current provisioning lifecycle state.
     fn provisioning_state(&self) -> Result<ProvisioningState, HsmError>;
+
+    /// AES-KW unwrap delegated to the HSM. Same semantics as
+    /// [`HsmCryptoProvider::unwrap_cek_a128kw`] — exposed on
+    /// `HsmProvider` too so the OTA pipeline (which holds the HSM
+    /// as `Arc<Mutex<dyn HsmProvider>>` for lifecycle ops) can route
+    /// unwrap requests without needing a second trait-object view.
+    ///
+    /// Default impl returns `NotSupported`; concrete providers override.
+    fn unwrap_cek_a128kw(&self, key_id: &str, wrapped_cek: &[u8]) -> Result<Vec<u8>, HsmError> {
+        let _ = (key_id, wrapped_cek);
+        Err(HsmError::NotSupported("HsmProvider::unwrap_cek_a128kw".into()))
+    }
+
+    /// ECDH-ES+A128KW unwrap delegated to the HSM. See
+    /// [`HsmCryptoProvider::unwrap_cek_ecdh_es`] for parameter docs.
+    fn unwrap_cek_ecdh_es(
+        &self,
+        key_id: &str,
+        ephem_pub: &[u8],
+        wrapped_cek: &[u8],
+        recipient_protected: &[u8],
+    ) -> Result<Vec<u8>, HsmError> {
+        let _ = (key_id, ephem_pub, wrapped_cek, recipient_protected);
+        Err(HsmError::NotSupported("HsmProvider::unwrap_cek_ecdh_es".into()))
+    }
 }
 
 /// Crypto operations — keys never leave the HSM.
@@ -147,5 +176,38 @@ pub trait HsmCryptoProvider: Send + Sync {
     fn generate_csr(&self, key_id: &str, subject_cn: &str) -> Result<Vec<u8>, HsmError> {
         let _ = (key_id, subject_cn);
         Err(HsmError::NotSupported("CSR generation".into()))
+    }
+
+    /// AES-KW unwrap a 128-bit Content Encryption Key (CEK) using a
+    /// symmetric key stored in the HSM as `key_id`. Returns the 16-byte
+    /// unwrapped CEK. The KEK never leaves the HSM.
+    ///
+    /// Used by the SUIT decrypt path when the manifest's
+    /// COSE_Encrypt recipient algorithm is `A128KW` and the device
+    /// key is symmetric. See [`HsmProvider::unwrap_cek_ecdh_es`] for
+    /// the more common ECDH-ES+A128KW variant.
+    fn unwrap_cek_a128kw(&self, key_id: &str, wrapped_cek: &[u8]) -> Result<Vec<u8>, HsmError> {
+        let _ = (key_id, wrapped_cek);
+        Err(HsmError::NotSupported("unwrap_cek_a128kw".into()))
+    }
+
+    /// ECDH-ES+A128KW unwrap. The HSM performs ECDH with its EC private
+    /// key (referenced by `key_id`) against the sender's `ephem_pub`
+    /// public key, derives the wrapping key via Concat-KDF as specified
+    /// by COSE (with `recipient_protected` mixed into the KDF context),
+    /// and unwraps the `wrapped_cek` with AES-KW. Returns the 16-byte
+    /// CEK. The EC private key never leaves the HSM.
+    ///
+    /// `ephem_pub` is the sender's ephemeral EC-P256 public key in
+    /// uncompressed SEC1 form (65 bytes, leading 0x04).
+    fn unwrap_cek_ecdh_es(
+        &self,
+        key_id: &str,
+        ephem_pub: &[u8],
+        wrapped_cek: &[u8],
+        recipient_protected: &[u8],
+    ) -> Result<Vec<u8>, HsmError> {
+        let _ = (key_id, ephem_pub, wrapped_cek, recipient_protected);
+        Err(HsmError::NotSupported("unwrap_cek_ecdh_es".into()))
     }
 }

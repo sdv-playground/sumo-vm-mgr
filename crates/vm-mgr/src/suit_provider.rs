@@ -83,8 +83,10 @@ pub struct SuitProvider {
     key_authority: Arc<RwLock<Option<Vec<u8>>>>,
     /// Software authority — validates firmware SUIT envelopes.
     software_authority: Arc<RwLock<Option<Vec<u8>>>>,
-    /// Device decryption key — ECDH for firmware decryption.
-    device_key: Arc<RwLock<Option<Vec<u8>>>>,
+    /// CEK unwrapper bound to the device key — invokes HSM under the
+    /// hood so the EC private scalar never reaches host memory. Old
+    /// design held the raw bytes here; the HSE refactor inverted that.
+    device_unwrap: Arc<RwLock<Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>>>,
 }
 
 impl SuitProvider {
@@ -93,7 +95,7 @@ impl SuitProvider {
             factory_authority,
             key_authority: Arc::new(RwLock::new(None)),
             software_authority: Arc::new(RwLock::new(None)),
-            device_key: Arc::new(RwLock::new(None)),
+            device_unwrap: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -102,11 +104,22 @@ impl SuitProvider {
     }
 
     /// Load all trust keys from HSM after provisioning.
-    pub fn update_keys(&self, sw_authority: Vec<u8>, device_key: Option<Vec<u8>>, key_authority: Option<Vec<u8>>) {
+    ///
+    /// `key_unwrap` is the optional CEK unwrapper bound to the device
+    /// key; typically constructed by the caller as
+    /// `HsmKeyUnwrap::new(hsm_provider, "device-decrypt")` so the
+    /// streaming decryptor can unwrap CEKs without ever seeing the
+    /// device's private key bytes.
+    pub fn update_keys(
+        &self,
+        sw_authority: Vec<u8>,
+        key_unwrap: Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>,
+        key_authority: Option<Vec<u8>>,
+    ) {
         *self.software_authority.write().unwrap() = Some(sw_authority);
-        *self.device_key.write().unwrap() = device_key;
+        *self.device_unwrap.write().unwrap() = key_unwrap;
         *self.key_authority.write().unwrap() = key_authority;
-        tracing::info!("SuitProvider: loaded keys from HSM");
+        tracing::info!("SuitProvider: loaded trust anchors + CEK unwrapper from HSM");
     }
 
     /// Check if software authority keys have been loaded.
@@ -133,9 +146,11 @@ impl SuitProvider {
         }
     }
 
-    /// Get the current device key (if loaded from HSM).
-    fn current_device_key(&self) -> Option<Vec<u8>> {
-        self.device_key.read().unwrap().clone()
+    /// Snapshot the CEK unwrapper for use by the streaming decryptor.
+    fn current_device_unwrap(
+        &self,
+    ) -> Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>> {
+        self.device_unwrap.read().unwrap().clone()
     }
 }
 
@@ -162,14 +177,13 @@ impl SuitProvider {
             "validating envelope"
         );
 
-        let mut validator = Validator::new(&trust_anchor, None);
-        if manifest_type == ManifestType::Firmware {
-            if let Some(dk) = self.current_device_key() {
-                validator.add_device_key(&dk).map_err(|e| {
-                    ManifestError::ParseError(format!("invalid device key: {e:?}"))
-                })?;
-            }
-        }
+        // No `add_device_key` here: in vm-mgr the streaming flow
+        // (validate header + decrypt body separately) doesn't need the
+        // raw device key inside the Validator — decryption uses the
+        // HSM-backed `KeyUnwrap` via `key_unwrap_for_decryption()`.
+        // Only sumo-rs's in-process orchestrator path uses the
+        // Validator-attached device_keys.
+        let validator = Validator::new(&trust_anchor, None);
 
         let manifest = validator
             .validate_envelope(data, &crypto, 0)
@@ -279,14 +293,13 @@ impl ManifestProvider for SuitProvider {
         let manifest_type = peek_manifest_type(data)?;
         let trust_anchor = self.trust_anchor_for(manifest_type)?;
 
-        let mut validator = Validator::new(&trust_anchor, None);
-        if manifest_type == ManifestType::Firmware {
-            if let Some(dk) = self.current_device_key() {
-                validator.add_device_key(&dk).map_err(|e| {
-                    ManifestError::ParseError(format!("invalid device key: {e:?}"))
-                })?;
-            }
-        }
+        // No `add_device_key` here: in vm-mgr the streaming flow
+        // (validate header + decrypt body separately) doesn't need the
+        // raw device key inside the Validator — decryption uses the
+        // HSM-backed `KeyUnwrap` via `key_unwrap_for_decryption()`.
+        // Only sumo-rs's in-process orchestrator path uses the
+        // Validator-attached device_keys.
+        let validator = Validator::new(&trust_anchor, None);
 
         // Validate envelope: signature, digest
         let manifest = validator
@@ -355,12 +368,19 @@ impl ManifestProvider for SuitProvider {
         self.software_authority.read().unwrap().clone()
     }
 
-    fn device_decryption_key(&self) -> Option<Vec<u8>> {
-        self.device_key.read().unwrap().clone()
+    fn key_unwrap_for_decryption(
+        &self,
+    ) -> Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>> {
+        self.current_device_unwrap()
     }
 
-    fn update_keys(&self, sw_authority: Vec<u8>, device_key: Option<Vec<u8>>, key_authority: Option<Vec<u8>>) {
-        SuitProvider::update_keys(self, sw_authority, device_key, key_authority);
+    fn update_keys(
+        &self,
+        sw_authority: Vec<u8>,
+        key_unwrap: Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>,
+        key_authority: Option<Vec<u8>>,
+    ) {
+        SuitProvider::update_keys(self, sw_authority, key_unwrap, key_authority);
     }
 }
 

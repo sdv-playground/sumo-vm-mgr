@@ -3,7 +3,11 @@
 /// Default implementation: [`SuitProvider`](crate::suit_provider::SuitProvider)
 /// using sumo-rs for RFC 9124 SUIT envelope validation.
 
+use std::sync::Arc;
+
 use nv_store::types::BankSet;
+use sumo_onboard::decryptor::KeyUnwrap;
+
 use crate::ota::ImageMeta;
 
 /// Manifest sub-type — determines how the payload is handled after validation.
@@ -86,14 +90,29 @@ pub trait ManifestProvider: Send + Sync {
         None
     }
 
-    /// Snapshot the device decryption key for streaming decryptor setup.
-    /// Returns owned bytes — callers may hold these across async boundaries.
-    fn device_decryption_key(&self) -> Option<Vec<u8>> {
+    /// Snapshot a CEK unwrapper for the streaming decryptor — typically
+    /// an HSM-backed `HsmKeyUnwrap` bound to the device-decrypt key.
+    /// Returns None when no decryption key is wired (the streaming
+    /// path then fails fast on encrypted payloads).
+    ///
+    /// Replaces the prior `device_decryption_key() -> Option<Vec<u8>>`
+    /// which leaked the raw EC private scalar into host memory — fine
+    /// for SimHsm, broken on real HSE where the key never leaves the
+    /// secure element.
+    fn key_unwrap_for_decryption(&self) -> Option<Arc<dyn KeyUnwrap + Send + Sync>> {
         None
     }
 
-    /// Update keys from HSM after provisioning.
-    fn update_keys(&self, _sw_authority: Vec<u8>, _device_key: Option<Vec<u8>>, _key_authority: Option<Vec<u8>>) {}
+    /// Update trust-anchor keys from HSM after provisioning.
+    /// `key_unwrap` is the optional CEK unwrapper bound to the device
+    /// key inside the HSM — replaces the old `device_key: Vec<u8>` arg
+    /// that extracted raw bytes.
+    fn update_keys(
+        &self,
+        _sw_authority: Vec<u8>,
+        _key_unwrap: Option<Arc<dyn KeyUnwrap + Send + Sync>>,
+        _key_authority: Option<Vec<u8>>,
+    ) {}
 }
 
 #[cfg(test)]
@@ -180,13 +199,13 @@ mod tests {
     fn key_accessors_default_to_none() {
         let p = StubProvider;
         assert!(p.software_authority_key().is_none());
-        assert!(p.device_decryption_key().is_none());
+        assert!(p.key_unwrap_for_decryption().is_none());
     }
 
     #[test]
     fn update_keys_default_is_noop() {
         // Just verify it doesn't panic.
         let p = StubProvider;
-        p.update_keys(vec![1, 2, 3], Some(vec![4, 5]), None);
+        p.update_keys(vec![1, 2, 3], None, None);
     }
 }

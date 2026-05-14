@@ -152,33 +152,44 @@ async fn main() {
         }
 
         // If HSM is already provisioned, load keys
-        if provider.is_provisioned().unwrap_or(false) {
-            match (
-                provider.get_public_key(KeyRole::SoftwareAuthority),
-                provider.get_private_key(KeyRole::DeviceDecryption),
-            ) {
-                (Ok(sw_key), Ok(dk)) => {
-                    let ka = provider.get_public_key(KeyRole::KeyAuthority).ok();
-                    manifest_provider.update_keys(sw_key, Some(dk), ka);
-                    tracing::info!("loaded keys from HSM keystore");
-                }
-                (Err(e), _) | (_, Err(e)) => {
-                    tracing::warn!("HSM provisioned but failed to load keys: {e}");
-                    tracing::warn!("firmware flash will be rejected until keys are available");
-                }
-            }
+        let provisioned = provider.is_provisioned().unwrap_or(false);
+        let sw_key = if provisioned {
+            provider.get_public_key(KeyRole::SoftwareAuthority).ok()
         } else {
-            tracing::info!(
-                "HSM not yet provisioned — firmware flash disabled until HSM provisioning"
-            );
-        }
+            None
+        };
+        let ka = if provisioned {
+            provider.get_public_key(KeyRole::KeyAuthority).ok()
+        } else {
+            None
+        };
 
         // Ensure device key pair exists (generates on first boot)
         if let Err(e) = provider.ensure_device_key() {
             tracing::warn!("failed to ensure device key: {e}");
         }
 
-        Some(Arc::new(Mutex::new(provider)))
+        let hsm_arc = Arc::new(Mutex::new(provider));
+
+        if let Some(sw_key) = sw_key {
+            // CEK unwrap routed through the HSM, never extracts the
+            // device decryption private key. Same Arc backs the
+            // lifecycle ops below — no second view of the provider.
+            let unwrap: Arc<
+                dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync,
+            > = Arc::new(hsm::HsmKeyUnwrap::new(hsm_arc.clone(), "device-decrypt"));
+            manifest_provider.update_keys(sw_key, Some(unwrap), ka);
+            tracing::info!("loaded sw-authority from HSM keystore; CEK unwrap routed through HSM");
+        } else if provisioned {
+            tracing::warn!("HSM provisioned but failed to load sw-authority key");
+            tracing::warn!("firmware flash will be rejected until keys are available");
+        } else {
+            tracing::info!(
+                "HSM not yet provisioned — firmware flash disabled until HSM provisioning"
+            );
+        }
+
+        Some(hsm_arc)
     };
 
     // --sw-authority override: directly set software authority from file,
