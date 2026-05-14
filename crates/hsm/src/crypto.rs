@@ -580,10 +580,12 @@ mod tests {
         let spki_via_getter = hsm.get_public_key_der("k-ec").unwrap();
         assert_eq!(spki, spki_via_getter);
 
-        // sign+verify round-trip
+        // sign+verify round-trip. SimHsm impls both HsmProvider and
+        // HsmCryptoProvider, both with `sign`/`verify`; UFCS picks
+        // the crypto trait explicitly.
         let digest = [0xAA_u8; 32];
-        let sig = hsm.sign("k-ec", &digest).unwrap();
-        assert!(hsm.verify("k-ec", &digest, &sig).unwrap());
+        let sig = HsmCryptoProvider::sign(&hsm, "k-ec", &digest).unwrap();
+        assert!(HsmCryptoProvider::verify(&hsm, "k-ec", &digest, &sig).unwrap());
     }
 
     #[test]

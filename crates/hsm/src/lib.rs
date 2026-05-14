@@ -21,6 +21,7 @@ pub mod qnx;
 pub mod crypto;
 #[cfg(feature = "suit")]
 pub mod key_unwrap;
+pub mod ivd;
 
 pub use types::*;
 #[cfg(feature = "suit")]
@@ -111,6 +112,23 @@ pub trait HsmProvider: Send {
     ) -> Result<Vec<u8>, HsmError> {
         let _ = (key_id, ephem_pub, wrapped_cek, recipient_protected);
         Err(HsmError::NotSupported("HsmProvider::unwrap_cek_ecdh_es".into()))
+    }
+
+    /// ECDSA-SHA256 sign delegated to the HSM. Same semantics as
+    /// [`HsmCryptoProvider::sign`] — exposed on `HsmProvider` so the
+    /// OTA pipeline (which holds the HSM as
+    /// `Arc<Mutex<dyn HsmProvider>>`) can self-sign bank dirs via the
+    /// IVD machinery without needing a second trait-object view.
+    fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        let _ = (key_id, data);
+        Err(HsmError::NotSupported("HsmProvider::sign".into()))
+    }
+
+    /// ECDSA-SHA256 verify delegated to the HSM. Mirror of `sign`,
+    /// used by `sumo-verify` on the management path.
+    fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
+        let _ = (key_id, data, signature);
+        Err(HsmError::NotSupported("HsmProvider::verify".into()))
     }
 }
 

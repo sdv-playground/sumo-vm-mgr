@@ -938,6 +938,20 @@ impl HsmProvider for SimHsm {
             recipient_protected,
         )
     }
+
+    /// Same delegation pattern as `unwrap_cek_*` — sign/verify on the
+    /// management trait route through the crypto trait so the OTA
+    /// pipeline can self-sign banks (IVD) without needing two
+    /// trait-object views of the same SimHsm.
+    #[cfg(feature = "crypto")]
+    fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        crate::HsmCryptoProvider::sign(self, key_id, data)
+    }
+
+    #[cfg(feature = "crypto")]
+    fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
+        crate::HsmCryptoProvider::verify(self, key_id, data, signature)
+    }
 }
 
 impl Drop for SimHsm {

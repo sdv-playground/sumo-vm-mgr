@@ -431,6 +431,83 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         })
     }
 
+    /// Self-sign the staged bank with the HSM's `ivd-signing` key so
+    /// external secure boot can validate it before launch. Called at
+    /// each `AwaitingActivation` transition — bank contents are
+    /// final, but the bank pointer hasn't flipped yet, so the sig
+    /// lives WITH the staged bank. Rollback wipes the bank and its
+    /// sig together; trial flip just exposes the staged bank with
+    /// its existing sig intact.
+    ///
+    /// Soft-skip policy: if the HSM has no `ivd-signing` slot yet
+    /// (`NotProvisioned`, `KeyNotFound`, `NotSupported` — happens
+    /// during the very first hsm-keys flash, before the IVD key
+    /// exists), log a warning and return Ok. External secure boot
+    /// will refuse to launch the bank in that state, which is the
+    /// safe-by-default outcome — no banks ship with unauthorised
+    /// content, and the operator gets a clear "ivd-signing missing"
+    /// warning in the flash log. Every other error path is hard:
+    /// IO failures, KeystoreError, etc. fail the flash so the
+    /// operator can't end up with banks that are intended to be
+    /// signed but silently aren't.
+    fn ivd_sign_staged_bank(&self, target: Bank) -> BackendResult<()> {
+        let Some(ref hsm_arc) = self.hsm_provider else {
+            tracing::debug!("ivd sign: no hsm provider attached; skipping");
+            return Ok(());
+        };
+        let Some(bank_dir) = self.target_bank_dir(target) else {
+            tracing::debug!("ivd sign: no images_dir; skipping (in-memory test mode)");
+            return Ok(());
+        };
+        // Skip components whose content doesn't live under
+        // `images_dir/<set>/<bank>` (e.g. HSM single-bank: the
+        // keystore is at `keystore_path`, the bank dir is empty
+        // and may not even exist). Those have their own
+        // attestation path — IVD-signing an empty bank dir would
+        // claim an empty bank is authorised, which is worse than
+        // skipping outright.
+        if !bank_dir.exists() {
+            tracing::debug!(
+                bank_dir = %bank_dir.display(),
+                "ivd sign: bank dir absent; skipping (single-bank component or pre-streaming path)",
+            );
+            return Ok(());
+        }
+        let bank_id = format!(
+            "{}/{}",
+            bank_set_dir_name(self.bank_set),
+            bank_dir_name(target),
+        );
+
+        let hsm = hsm_arc.lock().map_err(|_| {
+            BackendError::Internal("ivd sign: hsm mutex poisoned".into())
+        })?;
+        match hsm::ivd::sign_bank(&*hsm, &bank_dir, bank_id.clone()) {
+            Ok(_manifest) => {
+                tracing::info!(
+                    bank_id = %bank_id,
+                    bank_dir = %bank_dir.display(),
+                    "ivd sign OK",
+                );
+                Ok(())
+            }
+            // Bootstrap: HSM has no ivd-signing key yet.
+            Err(hsm::ivd::IvdError::Hsm(hsm::HsmError::NotProvisioned))
+            | Err(hsm::ivd::IvdError::Hsm(hsm::HsmError::KeyNotFound(_)))
+            | Err(hsm::ivd::IvdError::Hsm(hsm::HsmError::NotSupported(_))) => {
+                tracing::warn!(
+                    bank_id = %bank_id,
+                    "ivd sign skipped: no ivd-signing key yet \
+                     (external secure boot will reject this bank)",
+                );
+                Ok(())
+            }
+            Err(e) => Err(BackendError::Internal(format!(
+                "ivd sign {bank_id}: {e}",
+            ))),
+        }
+    }
+
     /// Wipe the target bank dir (frees ~1 image worth of space) and remove any
     /// orphaned staged files left in `images_dir` root by previous flashes.
     /// Called at flash-session start so the incoming payload lands in a clean,
@@ -813,6 +890,13 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 }
             }
 
+            // Self-sign the staged bank so external secure boot can
+            // validate it before launch. See `ivd_sign_staged_bank`
+            // for soft-skip policy (no-op when HSM has no
+            // ivd-signing slot yet).
+            let target_bank = self.determine_target_bank()?;
+            self.ivd_sign_staged_bank(target_bank)?;
+
             return Ok(id);
         } else {
             // Manifest-only — wait for separate payload uploads
@@ -944,7 +1028,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
         // Advance session state
         let next = comp_idx + 1;
-        {
+        let all_done = {
             let mut session = self.flash_session.lock().unwrap();
             if next >= total {
                 // All payloads received
@@ -957,6 +1041,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                     t.state = FlashState::AwaitingActivation;
                     t.image_size = image_size as u64;
                 }
+                true
             } else {
                 // Update to next component
                 if let Some(FlashSessionState::AwaitingPayload {
@@ -964,7 +1049,15 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 }) = *session {
                     *next_component = next;
                 }
+                false
             }
+        };
+
+        if all_done {
+            // Bank dir is content-final; IVD-sign before the caller
+            // proceeds to finalize_flash. See `ivd_sign_staged_bank`.
+            let target_bank = self.determine_target_bank()?;
+            self.ivd_sign_staged_bank(target_bank)?;
         }
 
         let id = self.next_id();
@@ -1691,14 +1784,22 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 .map_err(map_ota_error)?;
 
             let transfer_id = self.next_id();
-            let mut ft = self.flash_transfer.lock().unwrap();
-            *ft = Some(FlashTransferState {
-                transfer_id: transfer_id.clone(),
-                package_id: package_id.to_string(),
-                state: FlashState::AwaitingActivation,
-                image_size: 0,
-                verify_baseline_hb_seq: None,
-            });
+            {
+                let mut ft = self.flash_transfer.lock().unwrap();
+                *ft = Some(FlashTransferState {
+                    transfer_id: transfer_id.clone(),
+                    package_id: package_id.to_string(),
+                    state: FlashState::AwaitingActivation,
+                    image_size: 0,
+                    verify_baseline_hb_seq: None,
+                });
+            }
+            // No-op for HSM single-bank (no bank dir under
+            // images_dir; the keystore lives separately) but kept
+            // for uniformity — any future component with content
+            // here gets signed automatically.
+            let target_bank = self.determine_target_bank()?;
+            self.ivd_sign_staged_bank(target_bank)?;
             return Ok(transfer_id);
         }
 
@@ -1775,23 +1876,32 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         }
 
         if !is_crl {
-            let mut ft = self.flash_transfer.lock().unwrap();
-            if let Some(ref mut t) = *ft {
-                // Reuse existing transfer from streaming upload path
-                t.package_id = package_id.to_string();
-                t.state = FlashState::AwaitingActivation;
-                t.image_size = image_size;
-                return Ok(t.transfer_id.clone());
-            }
-            // Buffered path — create new transfer
-            let transfer_id = self.next_id();
-            *ft = Some(FlashTransferState {
-                transfer_id: transfer_id.clone(),
-                package_id: package_id.to_string(),
-                state: FlashState::AwaitingActivation,
-                image_size,
-                verify_baseline_hb_seq: None,
-            });
+            let (transfer_id, target_bank) = {
+                let mut ft = self.flash_transfer.lock().unwrap();
+                let tb = self.determine_target_bank()?;
+                if let Some(ref mut t) = *ft {
+                    // Reuse existing transfer from streaming upload path
+                    t.package_id = package_id.to_string();
+                    t.state = FlashState::AwaitingActivation;
+                    t.image_size = image_size;
+                    (t.transfer_id.clone(), tb)
+                } else {
+                    // Buffered path — create new transfer
+                    let id = self.next_id();
+                    *ft = Some(FlashTransferState {
+                        transfer_id: id.clone(),
+                        package_id: package_id.to_string(),
+                        state: FlashState::AwaitingActivation,
+                        image_size,
+                        verify_baseline_hb_seq: None,
+                    });
+                    (id, tb)
+                }
+            };
+            // Self-sign before returning. `ivd_sign_staged_bank`
+            // no-ops when the bank dir is absent (e.g. HSM
+            // single-bank components).
+            self.ivd_sign_staged_bank(target_bank)?;
             return Ok(transfer_id);
         }
         // CRL: no flash transfer state — floor already applied, nothing to poll/finalize/commit
