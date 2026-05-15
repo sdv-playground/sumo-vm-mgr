@@ -52,6 +52,13 @@ pub struct HealthDetail {
     pub guest_state: Option<u32>,
     /// Heartbeat sequence number — host uses this to detect liveness across polls.
     pub hb_seq: Option<u32>,
+    /// Boot-id randomly generated per guest lifetime. Distinct value across
+    /// stop/start cycles, so flash orchestrators can definitively tell that
+    /// "the heartbeat I'm reading now is from a fresh boot, not stale shmem
+    /// data from the previous lifetime". The qvm-shmem region persists
+    /// across guest lifetimes, so hb_seq alone is NOT a reliable freshness
+    /// signal.
+    pub boot_id: Option<u32>,
 }
 
 #[cfg(test)]

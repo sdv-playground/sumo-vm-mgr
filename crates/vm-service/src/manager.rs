@@ -465,23 +465,25 @@ impl VmManager {
 /// Compute current `HealthDetail`. Pulled out so `health_detail` and `list`
 /// share one mapping and the same liveness-tracker mutation rules.
 fn read_health(vm: &mut ManagedVm) -> HealthDetail {
+    let empty = HealthDetail { status: HealthStatus::Stopped, guest_state: None, hb_seq: None, boot_id: None };
+
     // Process state takes precedence — a Stopped VM has no live heartbeat.
     let handle = match &vm.handle {
         Some(h) => h,
-        None => return HealthDetail { status: HealthStatus::Stopped, guest_state: None, hb_seq: None },
+        None => return empty,
     };
     if !vm.runner.is_running(handle) {
-        return HealthDetail { status: HealthStatus::Stopped, guest_state: None, hb_seq: None };
+        return empty;
     }
 
     // No heartbeat device wired up — process is up, can't say more.
     let Some(ref hb_dev) = vm.heartbeat else {
-        return HealthDetail { status: HealthStatus::Running, guest_state: None, hb_seq: None };
+        return HealthDetail { status: HealthStatus::Running, ..empty };
     };
 
     // Read heartbeat. None = guest hasn't written yet, or wire is bad.
     let Some(hb) = hb_dev.read() else {
-        return HealthDetail { status: HealthStatus::Starting, guest_state: None, hb_seq: None };
+        return HealthDetail { status: HealthStatus::Starting, ..empty };
     };
 
     let stale = vm.liveness.observe(hb.seq, Instant::now());
@@ -500,6 +502,7 @@ fn read_health(vm: &mut ManagedVm) -> HealthDetail {
         status,
         guest_state: Some(hb.state as u32),
         hb_seq: Some(hb.seq),
+        boot_id: Some(hb.boot_id),
     }
 }
 

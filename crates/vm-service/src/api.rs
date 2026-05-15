@@ -169,6 +169,7 @@ async fn health_vm(
             "status": detail.status,
             "guest_state": detail.guest_state,
             "hb_seq": detail.hb_seq,
+            "boot_id": detail.boot_id,
         }))),
         Err(e) => error_response(e),
     }
