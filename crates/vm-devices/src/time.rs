@@ -332,7 +332,16 @@ fn writer_loop_inner(
     interval: Duration,
     cancel: Arc<AtomicBool>,
 ) {
-    use vm_wire::{VtimeCmd, VtimeRegs, VTIME_REGS_SIZE, VTIME_WIRE_SIZE};
+    use vm_wire::{VtimeCmd, VtimeRegs, VTIME_FLAG_SYNC_VALID, VTIME_REGS_SIZE, VTIME_WIRE_SIZE};
+
+    // Threshold for the host self-election step below. Any wall_ns
+    // beyond 2024-01-01 UTC is "obviously not the systemd built-in
+    // epoch / RTC-default 1970"; the host is willing to claim its
+    // own clock as authoritative once it crosses this. Future
+    // refinement: replace the constant with a persisted Roughtime
+    // floor that survives reboots — see "monotonic time floor"
+    // discussion in tasks/time-broker-in-guest.md.
+    const EPOCH_2024_NS: i64 = 1_704_067_200_000_000_000;
 
     let mut st = WriterState::new();
 
@@ -351,6 +360,42 @@ fn writer_loop_inner(
             }
         }
 
+        // 1b. Host self-election. Without this step the publisher
+        //     refuses to advertise SYNC_VALID until a guest issues a
+        //     TIME_ADJUST — but on managed-cvc the host already gets
+        //     its wall time from sntp at boot and is the most natural
+        //     authority. The QNX guest gets the host clock via qvm's
+        //     kernel pass-through and ignores the regs flag entirely;
+        //     Linux guests have no equivalent shortcut and correctly
+        //     refuse to step the clock based on data flagged invalid.
+        //     Self-electing closes that gap.
+        //
+        //     A subsequent TIME_ADJUST from an authorised guest (the
+        //     eventual time-broker daemon in vm1, with Roughtime +
+        //     sntp validation) will overwrite source/quality with
+        //     something more accurate. See tasks/time-broker-in-guest.md.
+        //
+        //     Timing note: guests may not be up yet when we flip this.
+        //     The writer runs every `interval`, so the flag stays
+        //     latched on subsequent iterations — any guest booting
+        //     later reads the already-set state. seqcount_write
+        //     handles read-side atomicity for guests that connect
+        //     mid-write.
+        let now_mono = clock.now_mono_ns();
+        let now_wall_off = clock.wall_offset_ns().saturating_add(st.wall_correction_ns);
+        let now_wall_ns = (now_mono as i64).saturating_add(now_wall_off);
+        if (st.flags & VTIME_FLAG_SYNC_VALID) == 0 && now_wall_ns > EPOCH_2024_NS {
+            st.flags |= VTIME_FLAG_SYNC_VALID;
+            st.sync_source = vm_wire::SyncSource::Sntp;
+            st.sync_quality = vm_wire::SyncQuality::Coarse;
+            st.last_sync_mono_ns = now_mono;
+            tracing::info!(
+                target: "vtime",
+                wall_ns = now_wall_ns,
+                "host clock crossed plausibility threshold — self-electing as SNTP source"
+            );
+        }
+
         // 2. Build host's slot: regs in the top 64 bytes, status reply
         //    in the bottom 64 bytes. The bottom-64 layout matches
         //    VtimeCmd so the guest can decode it as a status reply
@@ -358,8 +403,8 @@ fn writer_loop_inner(
         st.update_seq = st.update_seq.wrapping_add(2);
 
         let regs = VtimeRegs {
-            mono_ns: clock.now_mono_ns(),
-            wall_offset_ns: clock.wall_offset_ns().saturating_add(st.wall_correction_ns),
+            mono_ns: now_mono,
+            wall_offset_ns: now_wall_off,
             last_sync_mono_ns: st.last_sync_mono_ns,
             sync_source: st.sync_source,
             sync_quality: st.sync_quality,
